@@ -1,0 +1,19 @@
+[package]
+name = "ccode-cli"
+version = "0.1.0"
+edition = "2021"
+description = "ccode 命令行入口"
+
+[[bin]]
+name = "ccode"
+path = "src/main.rs"
+
+[dependencies]
+ccore = { path = "../ccore" }
+clap = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+toml = { workspace = true }

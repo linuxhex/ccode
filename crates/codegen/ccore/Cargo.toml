@@ -1,0 +1,56 @@
+[package]
+name = "ccore"
+version = "0.1.0"
+edition = "2021"
+description = "ccode 核心库 - 消息总线驱动的终端 AI 编程代理"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 异步运行时
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = { workspace = true }
+
+# TUI 渲染
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+# 消息总线 - 纯 Rust ZMTP 实现
+zeromq = "0.3"
+
+# 异步 trait
+async-trait = { workspace = true }
+
+# 字节处理
+bytes = { workspace = true }
+
+# HTTP 客户端（Provider 适配器）
+reqwest = { workspace = true }
+
+# 序列化
+rmp-serde = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# 错误处理
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# 日志
+tracing = { workspace = true }
+
+# UUID
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+# 时间
+chrono = { workspace = true, features = ["serde"] }
+
+# 配置
+toml = { workspace = true }
+
+# FFI
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

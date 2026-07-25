@@ -1,0 +1,29 @@
+{
+  "requirement_id": "CCODE-001",
+  "phase": "complete",
+  "multi_service_mode": false,
+  "main_service": "ccode",
+  "created_at": "2026-07-24",
+  "completed_at": "2026-07-25",
+  "tasks_completed": [
+    "T1: ccore crate 骨架",
+    "T2: 消息协议（3帧 + Topic + MessagePack）",
+    "T3: Node trait + TransportHandle",
+    "T4: Kernel Broker + Registry + Transport",
+    "T5: OpenAI SSE 流式解析",
+    "T6: Agent Node 完整循环",
+    "T7: TUI Node ratatui 渲染",
+    "T8: ccode-cli + Kernel 集成 + FFI",
+    "T9: 配置系统",
+    "T10: MVP 集成测试",
+    "T11: Tool Node + Bridge + 22工具定义",
+    "T12: State Node + 持久化",
+    "T13: L1 短期记忆 + 伪向量搜索",
+    "T14: 子 Agent 编排 + DoomLoop",
+    "T15: Claude 适配器 + 多模型 Router/Pool",
+    "T16: Plan-Execute 循环",
+    "T17: Git Checkpoint + 自动验证",
+    "T18: L2 长期记忆 + Dream 整理器",
+    "T19: 安装/卸载脚本"
+  ]
+}
