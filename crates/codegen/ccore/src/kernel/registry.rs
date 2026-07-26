@@ -17,6 +17,12 @@ pub struct Registry {
     nodes: HashMap<NodeId, NodeInfo>,
 }
 
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Registry {
     pub fn new() -> Self {
         Self {

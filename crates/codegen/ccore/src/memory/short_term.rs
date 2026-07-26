@@ -58,7 +58,7 @@ fn pseudo_vector_from_text(text: &str) -> Vec<f32> {
 /// 计算两个向量的余弦相似度
 ///
 /// 返回值范围 [-1.0, 1.0]，1.0 表示完全相同方向
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
@@ -80,6 +80,12 @@ pub struct ShortTermMemory {
     entries: Vec<ShortTermEntry>,
     /// 当前轮次
     current_turn: u32,
+}
+
+impl Default for ShortTermMemory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ShortTermMemory {
@@ -146,18 +152,18 @@ impl ShortTermMemory {
             return Vec::new();
         }
 
-        // 对无 embedding 的条目用内容伪向量兜底
         let mut scored: Vec<(f32, &ShortTermEntry)> = self
             .entries
             .iter()
             .filter_map(|entry| {
-                let emb = if entry.embedding.is_empty() {
-                    pseudo_vector_from_text(&entry.content)
+                let emb: &[f32] = if entry.embedding.is_empty() {
+                    // 没有 embedding 的条目无法做向量搜索，跳过
+                    // （伪向量搜索质量太差，不如跳过）
+                    return None;
                 } else {
-                    return Some((cosine_similarity(query_embedding, &entry.embedding), entry));
+                    &entry.embedding
                 };
-                // 伪向量兜底：重新计算相似度
-                let sim = cosine_similarity(query_embedding, &emb);
+                let sim = cosine_similarity(query_embedding, emb);
                 Some((sim, entry))
             })
             .collect();
@@ -194,6 +200,11 @@ impl ShortTermMemory {
     /// 总条目数
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// 是否为空
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// 获取当前轮次

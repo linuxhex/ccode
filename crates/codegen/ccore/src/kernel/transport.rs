@@ -11,18 +11,20 @@
 //! - ZMQ socket 操作在独立的后台任务中执行
 //! - Broker 通过通道收发消息，无需直接操作 ZMQ socket
 //!
+//! zeromq 0.4 适配：
+//! - RouterSocket 不再支持 split()，使用 tokio::select! 交替收发
+//! - ZmqMessage 从 Vec<Bytes> 构造使用 try_from()
+//!
 //! ROUTER socket 消息格式：
 //! - 接收：[identity, topic, header, payload] — 首帧是发送方 ZMQ identity
 //! - 发送：[identity, topic, header, payload] — 首帧是目标 ZMQ identity
 
 use bytes::Bytes;
-use std::collections::HashMap;
 use tokio::sync::mpsc;
-use zeromq::{PubSocket, RouterRecvHalf, RouterSendHalf, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 use crate::message::frame::FrameCodec;
 use crate::message::Message;
-use crate::node::NodeId;
 
 /// Kernel 端 ZMQ 传输层
 ///
@@ -84,28 +86,22 @@ impl KernelTransport {
         publisher.bind(pub_addr).await?;
         tracing::info!("PUB socket 已绑定：{}", pub_addr);
 
-        // 3. 拆分 ROUTER 为收发两半，实现并发
-        let (router_send, router_recv) = router.split();
-
-        // 4. 创建通道
+        // 3. 创建通道
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingMessage>(256);
         let (router_send_tx, router_send_rx) = mpsc::channel::<RouterSendCommand>(256);
         let (pub_send_tx, pub_send_rx) = mpsc::channel::<Vec<Bytes>>(64);
 
-        // 5. 启动 ROUTER 接收任务
-        let recv_handle = tokio::spawn(Self::router_recv_loop(router_recv, incoming_tx));
+        // 4. 启动 ROUTER 收发任务（zeromq 0.4 不支持 split，用 select! 交替收发）
+        let recv_handle = tokio::spawn(Self::router_loop(router, incoming_tx, router_send_rx));
 
-        // 6. 启动 ROUTER 发送任务
-        let send_handle = tokio::spawn(Self::router_send_loop(router_send, router_send_rx));
-
-        // 7. 启动 PUB 广播任务
+        // 5. 启动 PUB 广播任务
         let pub_handle = tokio::spawn(Self::pub_loop(publisher, pub_send_rx));
 
         Ok(Self {
             incoming_rx,
             router_send_tx,
             pub_send_tx,
-            tasks: vec![recv_handle, send_handle, pub_handle],
+            tasks: vec![recv_handle, pub_handle],
         })
     }
 
@@ -156,84 +152,100 @@ impl KernelTransport {
 
     // ---- 后台任务 ----
 
-    /// ROUTER 接收循环
+    /// ROUTER 收发循环（zeromq 0.4 适配：使用 select! 交替收发）
     ///
-    /// 从 ROUTER socket 读取消息，解码后通过通道发送给 Broker。
-    /// ROUTER 收到的消息首帧是发送方的 ZMQ identity。
-    async fn router_recv_loop(mut recv_half: RouterRecvHalf, tx: mpsc::Sender<IncomingMessage>) {
+    /// zeromq 0.4 的 RouterSocket 不再支持 split()，
+    /// recv 和 send 都需要 &mut self，因此用 tokio::select! 交替处理。
+    async fn router_loop(
+        mut router: RouterSocket,
+        tx: mpsc::Sender<IncomingMessage>,
+        mut cmd_rx: mpsc::Receiver<RouterSendCommand>,
+    ) {
         loop {
-            match recv_half.recv().await {
-                Ok(zmq_msg) => {
-                    // 解析 ZMQ 消息：[identity, topic, header, payload]
-                    let frame_count = zmq_msg.len();
-                    if frame_count < 4 {
-                        tracing::warn!("ROUTER 收到帧数不足的消息：{} 帧（期望 >= 4）", frame_count);
-                        continue;
+            tokio::select! {
+                // 优先处理发送命令（避免接收阻塞发送）
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(RouterSendCommand::Send { identity, frames }) => {
+                            let mut zmq_frames: Vec<Bytes> = vec![identity];
+                            zmq_frames.extend(frames);
+                            match ZmqMessage::try_from(zmq_frames) {
+                                Ok(msg) => {
+                                    if let Err(e) = router.send(msg).await {
+                                        tracing::warn!("ROUTER 发送失败：{}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("ROUTER 消息构造失败：{}", e);
+                                }
+                            }
+                        }
+                        Some(RouterSendCommand::MultiSend { identities, frames }) => {
+                            for identity in identities {
+                                let mut zmq_frames: Vec<Bytes> = vec![identity];
+                                zmq_frames.extend(frames.clone());
+                                match ZmqMessage::try_from(zmq_frames) {
+                                    Ok(msg) => {
+                                        if let Err(e) = router.send(msg).await {
+                                            tracing::warn!("ROUTER 批量发送失败：{}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("ROUTER 消息构造失败：{}", e);
+                                    }
+                                }
+                            }
+                        }
+                        Some(RouterSendCommand::Shutdown) | None => {
+                            tracing::debug!("ROUTER 收发循环退出（收到关闭命令）");
+                            break;
+                        }
                     }
+                }
+                // 接收消息
+                zmq_result = router.recv() => {
+                    match zmq_result {
+                        Ok(zmq_msg) => {
+                            // 解析 ZMQ 消息：[identity, topic, header, payload]
+                            let frame_count = zmq_msg.len();
+                            if frame_count < 4 {
+                                tracing::warn!("ROUTER 收到帧数不足的消息：{} 帧（期望 >= 4）", frame_count);
+                                continue;
+                            }
 
-                    let identity = zmq_msg.get(0).cloned().unwrap_or_default();
-                    let topic_bytes = zmq_msg.get(1).cloned().unwrap_or_default();
-                    let header_bytes = zmq_msg.get(2).cloned().unwrap_or_default();
-                    let payload_bytes = zmq_msg.get(3).cloned().unwrap_or_default();
+                            let identity = zmq_msg.get(0).cloned().unwrap_or_default();
+                            let topic_bytes = zmq_msg.get(1).cloned().unwrap_or_default();
+                            let header_bytes = zmq_msg.get(2).cloned().unwrap_or_default();
+                            let payload_bytes = zmq_msg.get(3).cloned().unwrap_or_default();
 
-                    // 解码 3 帧 Message
-                    let frames = vec![
-                        topic_bytes.to_vec(),
-                        header_bytes.to_vec(),
-                        payload_bytes.to_vec(),
-                    ];
+                            // 解码 3 帧 Message
+                            let frames = vec![
+                                topic_bytes.to_vec(),
+                                header_bytes.to_vec(),
+                                payload_bytes.to_vec(),
+                            ];
 
-                    match FrameCodec::decode(&frames) {
-                        Ok(message) => {
-                            let incoming = IncomingMessage { identity, message };
-                            if tx.send(incoming).await.is_err() {
-                                break; // Broker 已关闭
+                            match FrameCodec::decode(&frames) {
+                                Ok(message) => {
+                                    let incoming = IncomingMessage { identity, message };
+                                    if tx.send(incoming).await.is_err() {
+                                        break; // Broker 已关闭
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("消息解码失败：{}", e);
+                                }
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("消息解码失败：{}", e);
+                            tracing::error!("ROUTER 接收错误：{}", e);
+                            break;
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::error!("ROUTER 接收错误：{}", e);
-                    break;
-                }
             }
         }
-        tracing::debug!("ROUTER 接收循环退出");
-    }
-
-    /// ROUTER 发送循环
-    ///
-    /// 从通道读取发送命令，通过 ROUTER socket 发送到目标 Node。
-    /// ROUTER 发送消息首帧必须是目标的 ZMQ identity。
-    async fn router_send_loop(mut send_half: RouterSendHalf, mut rx: mpsc::Receiver<RouterSendCommand>) {
-        while let Some(cmd) = rx.recv().await {
-            match cmd {
-                RouterSendCommand::Send { identity, frames } => {
-                    // 构造 ZMQ 消息：[identity, topic, header, payload]
-                    let mut zmq_frames: Vec<Bytes> = vec![identity];
-                    zmq_frames.extend(frames);
-                    let msg = ZmqMessage::from(zmq_frames);
-                    if let Err(e) = send_half.send(msg).await {
-                        tracing::warn!("ROUTER 发送失败：{}", e);
-                    }
-                }
-                RouterSendCommand::MultiSend { identities, frames } => {
-                    for identity in identities {
-                        let mut zmq_frames: Vec<Bytes> = vec![identity];
-                        zmq_frames.extend(frames.clone());
-                        let msg = ZmqMessage::from(zmq_frames);
-                        if let Err(e) = send_half.send(msg).await {
-                            tracing::warn!("ROUTER 批量发送失败：{}", e);
-                        }
-                    }
-                }
-                RouterSendCommand::Shutdown => break,
-            }
-        }
-        tracing::debug!("ROUTER 发送循环退出");
+        tracing::debug!("ROUTER 收发循环退出");
     }
 
     /// PUB 广播循环
@@ -242,9 +254,15 @@ impl KernelTransport {
     /// PUB/SUB 模式：Node 的 SUB socket 订阅特定 topic 前缀。
     async fn pub_loop(mut publisher: PubSocket, mut rx: mpsc::Receiver<Vec<Bytes>>) {
         while let Some(frames) = rx.recv().await {
-            let msg = ZmqMessage::from(frames);
-            if let Err(e) = publisher.send(msg).await {
-                tracing::warn!("PUB 广播失败：{}", e);
+            match ZmqMessage::try_from(frames) {
+                Ok(msg) => {
+                    if let Err(e) = publisher.send(msg).await {
+                        tracing::warn!("PUB 广播失败：{}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("PUB 消息构造失败：{}", e);
+                }
             }
         }
         // 关闭 publisher

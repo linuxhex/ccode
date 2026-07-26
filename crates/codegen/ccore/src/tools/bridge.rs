@@ -6,7 +6,7 @@
 //! 3. 权限检查：根据 PermissionMode 决定是否需要用户确认
 //! 4. 执行 + 结果封装：执行工具 → 封装为 ToolCallResult
 //!
-//! 注意：ccode 最终会直接依赖 xai-grok-tools crate，调用其 Tool trait 实现。
+//! 注意：ccode 最终会直接依赖 ccode-tools crate，调用其 Tool trait 实现。
 //! 工具桥接层：定义 22 个工具元数据 + 执行器接口 + 动态注册 + 超时控制
 
 use std::collections::HashMap;
@@ -31,10 +31,16 @@ pub trait ToolExecutor: Send + Sync {
 pub struct ToolBridge {
     /// 已注册的工具条目
     entries: HashMap<String, ToolEntry>,
-    /// 工具执行器（实际执行逻辑，后续集成 grok 工具时填充）
+    /// 工具执行器（实际执行逻辑，后续集成 ccode 工具时填充）
     executors: HashMap<String, Box<dyn ToolExecutor>>,
     /// 工具执行超时（秒）
     execution_timeout_secs: u64,
+}
+
+impl Default for ToolBridge {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolBridge {
@@ -50,7 +56,7 @@ impl ToolBridge {
         bridge
     }
 
-    /// 注册默认工具集（从 grok 迁移的 20 个工具）
+    /// 注册默认工具集（从 ccode 迁移的 20 个工具）
     fn register_defaults(&mut self) {
         // ---- 文件系统 ----
         self.register(ToolEntry {

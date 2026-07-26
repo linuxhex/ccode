@@ -16,8 +16,6 @@ use crate::node::transport::NodeTransportHandle;
 use crate::memory::short_term::ShortTermMemory;
 use crate::memory::long_term::LongTermMemory;
 use crate::memory::window::SlidingWindow;
-use crate::memory::dream::DreamOrganizer;
-use crate::memory::long_term::KnowledgeEntry;
 
 /// 对话持久化格式
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -59,8 +57,10 @@ pub struct StateNode {
     /// L1 短期记忆
     short_term: ShortTermMemory,
     /// L2 长期记忆
+    #[allow(dead_code)]
     long_term: Option<LongTermMemory>,
     /// 滑动窗口更新器
+    #[allow(dead_code)]
     sliding_window: SlidingWindow,
     /// 持久化根目录
     storage_root: PathBuf,
@@ -70,7 +70,7 @@ pub struct StateNode {
 
 impl StateNode {
     pub fn new(id: NodeId) -> Self {
-        let storage_root = dirs();
+        let storage_root = Self::dirs();
         let session_id = uuid::Uuid::new_v4().to_string();
 
         Self {
@@ -209,6 +209,23 @@ impl Node for StateNode {
                     &state,
                 )?;
                 transport.send_message(&reply).await?;
+            }
+            t if t.ends_with("/event") => {
+                // 监听 Agent 状态变化，触发记忆管理
+                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                if let Some(event_type) = payload.get("type").and_then(|v| v.as_str()) {
+                    match event_type {
+                        "thinking" | "outputting" => {
+                            // Agent 正在思考或输出，可以用于滑动窗口预热
+                            tracing::trace!("Agent 状态变化：{}", event_type);
+                        }
+                        "done" | "error" => {
+                            // Agent 完成/出错，触发滑动窗口压缩
+                            tracing::debug!("Agent 状态终态：{}", event_type);
+                        }
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }

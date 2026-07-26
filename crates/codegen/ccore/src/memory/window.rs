@@ -61,7 +61,7 @@ impl SlidingWindow {
         let mut entries = Vec::new();
         let mut used_tokens = 0u32;
 
-        for (heat_score, temp, msg) in &scored {
+        for (_heat_score, temp, msg) in &scored {
             let entry = match temp {
                 Temperature::Hot => WorkingEntry::Hot {
                     role: msg.role.clone(),
@@ -72,7 +72,17 @@ impl SlidingWindow {
                     // 温消息：生成简短摘要
                     // 实际场景中由 LLM 生成摘要，此处用简化逻辑
                     let summary = if msg.content.len() > 100 {
-                        format!("{}...", &msg.content[..100])
+                        // 找到不超过 100 字节的最后一个有效 UTF-8 字符边界
+                        let truncate_at = msg.content.char_indices()
+                            .take_while(|(idx, _)| *idx < 100)
+                            .last()
+                            .map(|(idx, c)| idx + c.len_utf8())
+                            .unwrap_or(0);
+                        if truncate_at > 0 && truncate_at <= msg.content.len() {
+                            format!("{}...", &msg.content[..truncate_at])
+                        } else {
+                            msg.content.clone()
+                        }
                     } else {
                         msg.content.clone()
                     };

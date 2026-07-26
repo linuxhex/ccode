@@ -1,0 +1,32 @@
+[package]
+license = "Apache-2.0"
+name = "ccode-shell-session-support"
+version = "0.1.0"
+edition.workspace = true
+description = "Session-support modules for the ccode shell crate family: managed MCP credential/catalog caching and file-access tracking."
+
+[dependencies]
+agent-client-protocol = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+ccode-fs = { path = "../ccode-fs", optional = true }
+ccode-http = { workspace = true }
+ccode-shell-base = { workspace = true }
+ccode-version = { workspace = true }
+ccode-workspace = { workspace = true }
+
+[features]
+default-bazel = []
+
+[dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -13,7 +13,7 @@ use crate::message::Topic;
 use crate::node::{Node, NodeId, NodeType, NodeContext, PermissionMode};
 use crate::node::transport::NodeTransportHandle;
 use crate::tools::bridge::ToolBridge;
-use crate::tools::{ToolCallRequest, ToolCallResult};
+use crate::tools::ToolCallRequest;
 
 /// Tool Node 实现
 pub struct ToolNode {
@@ -46,10 +46,32 @@ impl ToolNode {
     ) -> anyhow::Result<()> {
         // 权限检查
         if self.bridge.needs_confirmation(&request.tool_name, self.permission_mode) {
-            tracing::info!(
-                "工具 {} 需要确认（当前权限模式 {:?}），自动批准",
-                request.tool_name, self.permission_mode
-            );
+            match self.permission_mode {
+                PermissionMode::Ask => {
+                    // Ask 模式下拒绝未确认的工具调用
+                    let result_msg = FrameCodec::new_message(
+                        Topic::agent_tool_result(&request.agent_id),
+                        self.id.as_str(),
+                        &serde_json::json!({
+                            "tool_call_id": request.tool_call_id,
+                            "output": format!("工具 {} 需要用户确认，当前权限模式为 Ask，已拒绝执行", request.tool_name),
+                            "success": false,
+                            "duration_ms": 0,
+                        }),
+                    )?;
+                    transport.send_message(&result_msg).await?;
+                    return Ok(());
+                }
+                PermissionMode::Trust => {
+                    tracing::info!(
+                        "工具 {} 需要确认（Trust 模式），自动批准",
+                        request.tool_name
+                    );
+                }
+                PermissionMode::Yolo => {
+                    // Yolo 模式下自动批准所有操作
+                }
+            }
         }
 
         // 执行工具

@@ -1,0 +1,55 @@
+[package]
+license = "Apache-2.0"
+name = "ccode-memory"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+# Exposes `#[cfg(test)]`-only helpers (`MemoryStorage::with_paths`,
+# `MockEmbeddingProvider`) to downstream crates' test targets.
+test-support = []
+
+[dependencies]
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+dunce = { workspace = true }
+flate2 = { workspace = true }
+git2 = { version = "0.20", default-features = false, features = [
+    "vendored-libgit2",
+] }
+notify = { workspace = true }
+reqwest = { workspace = true }
+reqwest-middleware = { workspace = true }
+# rusqlite 0.37 + bundled = self-contained SQLite (>= 3.50.2) with FTS5.
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# sqlite-vec: vec0 virtual table for KNN vector search.
+sqlite-vec = "=0.1.7-alpha.2"
+tar = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tracing = { workspace = true }
+ccode-auth = { workspace = true }
+ccode-config-types = { workspace = true }
+ccode-http = { workspace = true }
+ccode-telemetry = { workspace = true }
+ccode-tools = { workspace = true }
+ccode-version = { workspace = true }
+ccode-journal = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
+[dev-dependencies]
+filetime = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

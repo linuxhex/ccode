@@ -139,9 +139,9 @@ async fn test_frame_decode_invalid_length() {
 async fn test_broker_register_and_route() {
     let mut broker = Broker::new("ipc:///tmp/test-router".into(), "ipc:///tmp/test-pub".into());
 
-    let agent_id = NodeId::from_str("agent-1");
-    let tool_id = NodeId::from_str("tool-1");
-    let state_id = NodeId::from_str("state-1");
+    let agent_id: NodeId = "agent-1".parse().unwrap();
+    let tool_id: NodeId = "tool-1".parse().unwrap();
+    let state_id: NodeId = "state-1".parse().unwrap();
 
     // 注册 identity
     broker.register_identity(agent_id.clone(), b"agent-1-id".to_vec());
@@ -176,9 +176,9 @@ async fn test_broker_register_and_route() {
 async fn test_broker_wildcard_multiple_subscribers() {
     let mut broker = Broker::new("ipc:///tmp/test".into(), "ipc:///tmp/test-pub".into());
 
-    let tui1 = NodeId::from_str("tui-1");
-    let tui2 = NodeId::from_str("tui-2");
-    let state = NodeId::from_str("state-1");
+    let tui1: NodeId = "tui-1".parse().unwrap();
+    let tui2: NodeId = "tui-2".parse().unwrap();
+    let state: NodeId = "state-1".parse().unwrap();
 
     // 两个 TUI 都订阅所有 Agent 输出
     broker.register_identity(tui1.clone(), b"tui-1-id".to_vec());
@@ -211,7 +211,7 @@ async fn test_broker_wildcard_multiple_subscribers() {
 async fn test_broker_deregister() {
     let mut broker = Broker::new("ipc:///tmp/test".into(), "ipc:///tmp/test-pub".into());
 
-    let node_id = NodeId::from_str("node-a");
+    let node_id: NodeId = "node-a".parse().unwrap();
     broker.register_identity(node_id.clone(), b"node-a-id".to_vec());
     broker.subscribe(node_id.clone(), "test/topic".into());
 
@@ -231,7 +231,7 @@ async fn test_broker_deregister() {
 async fn test_broker_subscriber_dedup() {
     let mut broker = Broker::new("ipc:///tmp/test".into(), "ipc:///tmp/test-pub".into());
 
-    let node = NodeId::from_str("node-dup");
+    let node: NodeId = "node-dup".parse().unwrap();
     broker.register_identity(node.clone(), b"node-dup-id".to_vec());
     // 同一 Node 订阅了两个匹配同一 topic 的 pattern
     broker.subscribe(node.clone(), "agent/*/output".into());
@@ -446,17 +446,17 @@ async fn test_sliding_window_empty() {
 /// AgentType::from_str 各种输入
 #[test]
 fn test_agent_type_from_str() {
-    assert_eq!(AgentType::from_str("primary"), AgentType::Primary);
-    assert_eq!(AgentType::from_str("general-purpose"), AgentType::GeneralPurpose);
-    assert_eq!(AgentType::from_str("general"), AgentType::GeneralPurpose);
-    assert_eq!(AgentType::from_str("explore"), AgentType::Explore);
-    assert_eq!(AgentType::from_str("plan"), AgentType::Plan);
-    assert_eq!(AgentType::from_str("codex"), AgentType::Codex);
+    assert_eq!("primary".parse::<AgentType>().unwrap(), AgentType::Primary);
+    assert_eq!("general-purpose".parse::<AgentType>().unwrap(), AgentType::GeneralPurpose);
+    assert_eq!("general".parse::<AgentType>().unwrap(), AgentType::GeneralPurpose);
+    assert_eq!("explore".parse::<AgentType>().unwrap(), AgentType::Explore);
+    assert_eq!("plan".parse::<AgentType>().unwrap(), AgentType::Plan);
+    assert_eq!("codex".parse::<AgentType>().unwrap(), AgentType::Codex);
 
     // 未知类型默认为 GeneralPurpose
-    assert_eq!(AgentType::from_str("unknown"), AgentType::GeneralPurpose);
-    assert_eq!(AgentType::from_str(""), AgentType::GeneralPurpose);
-    assert_eq!(AgentType::from_str("Primary"), AgentType::GeneralPurpose, "区分大小写");
+    assert_eq!("unknown".parse::<AgentType>().unwrap(), AgentType::GeneralPurpose);
+    assert_eq!("".parse::<AgentType>().unwrap(), AgentType::GeneralPurpose);
+    assert_eq!("Primary".parse::<AgentType>().unwrap(), AgentType::GeneralPurpose, "区分大小写");
 }
 
 /// PermissionMode 转换测试
@@ -483,14 +483,14 @@ fn test_permission_mode() {
 /// ProviderConfig 模板生成测试
 #[test]
 fn test_provider_config_templates() {
-    // Grok 默认配置
-    let grok = ProviderConfig::default_grok();
-    assert_eq!(grok.name, "grok");
-    assert_eq!(grok.adapter, ProviderAdapter::Grok);
-    assert!(grok.models.contains(&"grok-3".to_string()));
-    assert!(grok.models.contains(&"grok-3-fast".to_string()));
-    assert_eq!(grok.fallback, vec!["deepseek".to_string()]);
-    assert_eq!(grok.rate_limit, Some(60));
+    // Ccode 默认配置
+    let ccode = ProviderConfig::default_ccode();
+    assert_eq!(ccode.name, "ccode");
+    assert_eq!(ccode.adapter, ProviderAdapter::Ccode);
+    assert!(ccode.models.contains(&"ccode-3".to_string()));
+    assert!(ccode.models.contains(&"ccode-3-fast".to_string()));
+    assert_eq!(ccode.fallback, vec!["deepseek".to_string()]);
+    assert_eq!(ccode.rate_limit, Some(60));
 
     // Claude 模板
     let claude = ProviderConfig::claude_template();
@@ -525,28 +525,28 @@ fn test_provider_config_templates() {
 /// ProviderConfig 序列化/反序列化一致性
 #[test]
 fn test_provider_config_serialization() {
-    let grok = ProviderConfig::default_grok();
-    let json = serde_json::to_string(&grok).unwrap();
+    let ccode = ProviderConfig::default_ccode();
+    let json = serde_json::to_string(&ccode).unwrap();
     let decoded: ProviderConfig = serde_json::from_str(&json).unwrap();
-    assert_eq!(decoded.name, grok.name);
-    assert_eq!(decoded.models, grok.models);
-    assert_eq!(decoded.fallback, grok.fallback);
+    assert_eq!(decoded.name, ccode.name);
+    assert_eq!(decoded.models, ccode.models);
+    assert_eq!(decoded.fallback, ccode.fallback);
 }
 
 /// ProviderRouter 模型查找测试
 #[test]
 fn test_provider_router_model_lookup() {
     let configs = vec![
-        ProviderConfig::default_grok(),
+        ProviderConfig::default_ccode(),
         ProviderConfig::deepseek_template(),
     ];
 
     let mut router = ProviderRouter::from_configs(&configs);
 
-    // 精确查找 grok 模型
-    let provider = router.find_provider("grok-3-fast");
-    assert!(provider.is_some(), "应找到 grok-3-fast 对应的 Provider");
-    assert_eq!(provider.unwrap().name(), "grok");
+    // 精确查找 ccode 模型
+    let provider = router.find_provider("ccode-3-fast");
+    assert!(provider.is_some(), "应找到 ccode-3-fast 对应的 Provider");
+    assert_eq!(provider.unwrap().name(), "ccode");
 
     // 查找 deepseek 模型
     let provider = router.find_provider("deepseek-chat");
@@ -562,14 +562,14 @@ fn test_provider_router_model_lookup() {
 #[test]
 fn test_provider_router_available_models() {
     let configs = vec![
-        ProviderConfig::default_grok(),
+        ProviderConfig::default_ccode(),
         ProviderConfig::deepseek_template(),
     ];
 
     let router = ProviderRouter::from_configs(&configs);
     let models = router.available_models();
 
-    assert!(models.contains(&"grok-3".to_string()), "应包含 grok-3");
+    assert!(models.contains(&"ccode-3".to_string()), "应包含 ccode-3");
     assert!(models.contains(&"deepseek-chat".to_string()), "应包含 deepseek-chat");
     assert_eq!(router.provider_count(), 2, "应有 2 个 Provider");
 }

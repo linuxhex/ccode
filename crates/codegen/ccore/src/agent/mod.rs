@@ -24,17 +24,18 @@ pub enum AgentType {
     Codex,
 }
 
-impl AgentType {
-    /// 从字符串解析 Agent 类型
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl std::str::FromStr for AgentType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "primary" => Self::Primary,
             "general-purpose" | "general" => Self::GeneralPurpose,
             "explore" => Self::Explore,
             "plan" => Self::Plan,
             "codex" => Self::Codex,
             _ => Self::GeneralPurpose,
-        }
+        })
     }
 }
 

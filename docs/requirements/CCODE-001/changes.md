@@ -1,7 +1,7 @@
 # ccode 改动简述
 
 ## 改动概述
-将 grok-build 改造为 ccode 终端 AI 编程代理，引入 ZeroMQ 消息总线、冷热分层记忆、多模型后端。
+将 ccode 改造为 ccode 终端 AI 编程代理，引入 ZeroMQ 消息总线、冷热分层记忆、多模型后端。
 
 ## 新增文件
 - ccore 动态库 crate：kernel/broker, node trait, message 协议, memory 三层, sampler 多 Provider, agent 编排, tools 桥接, ffi 导出, config 配置
@@ -11,18 +11,18 @@
 ## 修改文件
 - 根 Cargo.toml：新增 ccore 和 ccode-cli workspace member
 
-## 复用 grok 模块
-- xai-grok-tools → Tool Node 工具桥接
-- xai-grok-sampler → Sampler Node 采样逻辑
-- xai-grok-memory → 记忆系统 embedding/RAG
-- xai-grok-markdown → TUI 渲染
-- xai-grok-hooks → 事件迁移到消息总线
-- xai-grok-mcp → MCP 集成
-- xai-grok-sandbox → 沙箱执行
-- xai-grok-config → 配置系统
-- xai-grok-auth → 认证逻辑
-- xai-fast-worktree → Git worktree
-- xai-circuit-breaker → 熔断器
+## 复用 ccode 模块
+- ccode-tools → Tool Node 工具桥接
+- ccode-sampler → Sampler Node 采样逻辑
+- ccode-memory → 记忆系统 embedding/RAG
+- ccode-markdown → TUI 渲染
+- ccode-hooks → 事件迁移到消息总线
+- ccode-mcp → MCP 集成
+- ccode-sandbox → 沙箱执行
+- ccode-config → 配置系统
+- ccode-auth → 认证逻辑
+- ccode-fast-worktree → Git worktree
+- ccode-circuit-breaker → 熔断器
 - ptyctl → PTY 控制
 
 ## 方案审查

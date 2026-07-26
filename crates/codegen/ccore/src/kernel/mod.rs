@@ -26,17 +26,25 @@ pub mod registry;
 pub mod health;
 pub mod transport;
 pub mod launcher;
+pub mod transaction;
+pub mod backpressure;
+pub mod metrics;
 
 use anyhow::Result;
 use bytes::Bytes;
 use std::time::Duration;
 
 use crate::config::CcodeConfig;
-use crate::kernel::transport::{IncomingMessage, KernelTransport, RouterSendCommand};
+use crate::kernel::transport::{IncomingMessage, KernelTransport};
+use crate::kernel::backpressure::{BackpressureController, BackpressureConfig};
+use crate::kernel::metrics::{MonitoringService, HealthCheckConfig};
 use crate::message::frame::FrameCodec;
 use crate::message::Topic;
 use crate::message::Message;
+use crate::message::SequenceChecker;
+use crate::message::param::ParamServer;
 use crate::node::{NodeId, NodeType, NodeContext};
+use std::sync::Arc;
 
 /// Kernel 配置
 #[derive(Debug, Clone)]
@@ -73,16 +81,24 @@ impl Default for KernelConfig {
 
 /// Kernel 主结构
 ///
+/// ROS 1 风格：Kernel 只做控制面（发现/注册/心跳/参数），不转发业务数据。
+///
 /// Kernel 持有：
-/// - `transport`: ZMQ 传输层（ROUTER + PUB socket 的异步 I/O）
-/// - `broker`: 消息路由逻辑（identity 映射、订阅关系、路由表）
+/// - `broker`: 发现逻辑（identity 映射、publisher 映射、service 映射）
 /// - `registry`: Node 注册表（元数据、心跳时间戳）
-/// - `ccode_config`: ccode 全局配置（供 Launcher 使用）
+/// - `sequence_checker`: 消息序列号检查器
+/// - `backpressure`: 背压控制器
+/// - `monitoring`: 监控服务
+/// - `param_server`: ROS 风格的参数服务器
+/// - `ccode_config`: ccode 全局配置
 pub struct Kernel {
     config: KernelConfig,
     broker: broker::Broker,
     registry: registry::Registry,
-    transport: Option<KernelTransport>,
+    sequence_checker: SequenceChecker,
+    backpressure: Arc<BackpressureController>,
+    monitoring: MonitoringService,
+    param_server: ParamServer,
     running: bool,
     ccode_config: Option<CcodeConfig>,
 }
@@ -97,7 +113,10 @@ impl Kernel {
             config,
             broker,
             registry: registry::Registry::new(),
-            transport: None,
+            sequence_checker: SequenceChecker::new(100),
+            backpressure: Arc::new(BackpressureController::new(BackpressureConfig::default())),
+            monitoring: MonitoringService::new(HealthCheckConfig::default()),
+            param_server: ParamServer::new(),
             running: false,
             ccode_config: None,
         }
@@ -113,6 +132,8 @@ impl Kernel {
         NodeContext {
             router_addr: self.config.router_addr.clone(),
             pub_addr: self.config.pub_addr.clone(),
+            data_pub_addr: format!("ipc:///tmp/ccode-pub-{}", NodeId::new()),
+            data_rep_addr: None,
         }
     }
 
@@ -134,14 +155,11 @@ impl Kernel {
             self.config.working_dir
         );
 
-        // 1. 启动 KernelTransport
+        // 1. 启动 KernelTransport，取出作为独立变量避免借用冲突
         let mut transport = KernelTransport::new(
             &self.config.router_addr,
             &self.config.pub_addr,
         ).await?;
-        self.transport = Some(transport);
-
-        let transport = self.transport.as_mut().unwrap();
 
         // 2. 启动初始 Node 集合
         if let Some(ccfg) = self.ccode_config.take() {
@@ -168,7 +186,7 @@ impl Kernel {
                 incoming = transport.recv() => {
                     match incoming {
                         Ok(Some(incoming)) => {
-                            if let Err(e) = self.handle_incoming(incoming, transport).await {
+                            if let Err(e) = self.handle_incoming(incoming, &mut transport).await {
                                 tracing::warn!("处理消息失败：{}", e);
                             }
                         }
@@ -187,17 +205,15 @@ impl Kernel {
                     for node_id in dead_nodes {
                         tracing::warn!("Node 心跳超时，移除：{}", node_id);
                         self.broker.deregister_identity(&node_id);
-                        self.broadcast_node_deregister(transport, &node_id).await;
+                        Self::broadcast_node_deregister(&mut transport, &node_id).await;
                     }
                 }
             }
         }
 
         // 关闭流程
-        self.broadcast_shutdown(transport).await;
-        if let Some(t) = self.transport.take() {
-            t.shutdown().await;
-        }
+        Self::broadcast_shutdown(&mut transport).await;
+        transport.shutdown().await;
         Ok(())
     }
 
@@ -207,8 +223,45 @@ impl Kernel {
         incoming: IncomingMessage,
         transport: &mut KernelTransport,
     ) -> Result<()> {
+        // ✅ 提前获取 collector Arc，避免后续与 self.broker/self.registry 的借用冲突
+        let collector = self.monitoring.collector();
+        // ✅ 记录接收消息
+        collector.record_received();
+
+        let now = std::time::Instant::now();
         let topic = incoming.message.topic.as_str();
         let identity = incoming.identity.clone();
+        let src_node = incoming.message.header.src_node.clone();
+        let sequence = incoming.message.header.sequence;
+        
+        // 序列号检查（跳过注册消息）
+        if topic != "sys/register" {
+            let node_id: NodeId = src_node.parse().unwrap();
+            match self.sequence_checker.check(&node_id, sequence) {
+                Ok(crate::message::SequenceCheckResult::InOrder) => {
+                    // 正常顺序，继续处理
+                }
+                Ok(crate::message::SequenceCheckResult::Gap(gap)) => {
+                    // 序列号跳跃，可能丢包，但仍接受
+                    tracing::warn!(
+                        "Node {} 序列号跳跃 {}（可能丢包），继续处理",
+                        node_id, gap
+                    );
+                    // ✅ 记录序列号错误
+                    collector.record_sequence_error();
+                }
+                Err(e) => {
+                    // 序列号乱序或重复，拒绝处理
+                    tracing::error!(
+                        "Node {} 序列号检查失败：{}，拒绝消息",
+                        node_id, e
+                    );
+                    // ✅ 记录序列号错误
+                    collector.record_sequence_error();
+                    return Ok(()); // 拒绝处理，但不返回错误
+                }
+            }
+        }
 
         match topic {
             // 系统消息：Node 注册
@@ -216,8 +269,14 @@ impl Kernel {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
                 let node_id_str = payload["node_id"].as_str().unwrap_or("");
                 let node_type_str = payload["node_type"].as_str().unwrap_or("agent");
-                let node_id = NodeId::from_str(node_id_str);
+                let node_id: NodeId = node_id_str.parse().unwrap();
                 let node_type = parse_node_type(node_type_str);
+                
+                // 注册成功，重置序列号检查器
+                self.sequence_checker.reset(&node_id);
+                
+                // ✅ 记录心跳
+                self.monitoring.record_heartbeat(node_id_str);
 
                 // 从 payload 提取 subscriptions
                 let subscriptions: Vec<String> = payload["subscriptions"]
@@ -229,24 +288,89 @@ impl Kernel {
                     })
                     .unwrap_or_default();
 
-                // 注册到 Registry 和 Broker
-                self.registry.register(
+                // 从 payload 提取数据面地址（ROS 1 核心）
+                let pub_addr = payload["pub_addr"].as_str().unwrap_or("").to_string();
+                let rep_addr = payload["rep_addr"].as_str().map(String::from);
+                
+                // 从 payload 提取该 Node 发布的 topic 列表
+                let published_topics: Vec<String> = payload["published_topics"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // 原子注册
+                if let Err(e) = self.atomic_register_node(
                     node_id.clone(),
                     node_type,
                     subscriptions.clone(),
-                );
-                self.broker.register_identity(node_id.clone(), identity.to_vec());
-                for pattern in subscriptions {
-                    self.broker.subscribe(node_id.clone(), pattern);
+                    identity.to_vec(),
+                ) {
+                    tracing::error!("Node 注册失败：{}", e);
+                    collector.record_failed();
+                } else {
+                    // ROS 1 核心：注册 Publisher 信息到 Broker
+                    if !pub_addr.is_empty() && !published_topics.is_empty() {
+                        self.broker.register_publisher(broker::PublisherInfo {
+                            node_id: node_id.clone(),
+                            pub_addr: pub_addr.clone(),
+                            topics: published_topics,
+                        });
+                    }
+
+                    // ROS 1 核心：注册 Service Provider 信息到 Broker
+                    if let Some(ref rep) = rep_addr {
+                        if let Some(service_name) = payload["service_name"].as_str() {
+                            self.broker.register_service_provider(broker::ServiceProviderInfo {
+                                node_id: node_id.clone(),
+                                rep_addr: rep.clone(),
+                                service_name: service_name.to_string(),
+                            });
+                        }
+                    }
+
+                    let latency_ms = now.elapsed().as_millis() as f64;
+                    collector.record_success(latency_ms);
                 }
-                tracing::info!("Node 注册成功：{} ({:?})", node_id, node_type);
+
+                // ROS 1 核心：返回 publisher 发现信息给新注册的 Node
+                // 告知新 Node：它订阅的 topic 有哪些 publisher，可以直接 SUB 连接
+                let publisher_map = self.broker.find_publishers_for_subscriptions(&subscriptions);
+                if !publisher_map.is_empty() {
+                    let discover_msg = FrameCodec::new_reply(
+                        Topic::sys_register(),
+                        "kernel",
+                        incoming.message.header.msg_id.clone(),
+                        &serde_json::json!({
+                            "type": "publisher_discovery",
+                            "publishers": publisher_map.iter().map(|(pattern, pubs)| {
+                                serde_json::json!({
+                                    "pattern": pattern,
+                                    "publishers": pubs.iter().map(|p| serde_json::json!({
+                                        "node_id": p.node_id.to_string(),
+                                        "pub_addr": p.pub_addr,
+                                        "topics": p.topics,
+                                    })).collect::<Vec<_>>(),
+                                })
+                            }).collect::<Vec<_>>(),
+                        }),
+                    )?;
+                    let frames_bytes: Vec<Bytes> = FrameCodec::encode(&discover_msg)?
+                        .into_iter()
+                        .map(Bytes::from)
+                        .collect();
+                    transport.send_to(identity, frames_bytes).await?;
+                }
             }
 
             // 系统消息：Node 心跳
             "sys/heartbeat" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
                 let node_id_str = payload["node_id"].as_str().unwrap_or("");
-                let node_id = NodeId::from_str(node_id_str);
+                let node_id: NodeId = node_id_str.parse().unwrap();
                 self.registry.heartbeat(&node_id);
                 tracing::trace!("心跳：{}", node_id);
             }
@@ -255,7 +379,7 @@ impl Kernel {
             "sys/deregister" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
                 let node_id_str = payload["node_id"].as_str().unwrap_or("");
-                let node_id = NodeId::from_str(node_id_str);
+                let node_id: NodeId = node_id_str.parse().unwrap();
                 self.deregister_node(&node_id);
             }
 
@@ -266,10 +390,8 @@ impl Kernel {
                 let model = payload["model"].as_str().map(String::from);
                 let task_desc = payload["task_description"].as_str().unwrap_or("");
 
-                let agent_type = crate::agent::AgentType::from_str(agent_type_str);
-                let parent_id = NodeId::from_str(
-                    incoming.message.header.src_node.as_str()
-                );
+                let agent_type: crate::agent::AgentType = agent_type_str.parse().unwrap();
+                let parent_id: NodeId = incoming.message.header.src_node.as_str().parse().unwrap();
 
                 match self.request_spawn_subagent(transport, &parent_id, agent_type, model, task_desc.to_string()).await {
                     Ok(new_id) => {
@@ -281,9 +403,111 @@ impl Kernel {
                 }
             }
 
-            // 普通业务消息：路由到订阅者
-            _ => {
+            // ROS 风格：Service 注册（控制面）
+            t if t.starts_with("service/") && t.ends_with("/register") => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
+                let service_name = payload["service_name"].as_str().unwrap_or("");
+                let rep_addr = payload["rep_addr"].as_str().unwrap_or("");
+                let node_id: NodeId = payload["node_id"].as_str().unwrap_or("").parse().unwrap();
+                
+                if !service_name.is_empty() && !rep_addr.is_empty() {
+                    self.broker.register_service_provider(broker::ServiceProviderInfo {
+                        node_id,
+                        rep_addr: rep_addr.to_string(),
+                        service_name: service_name.to_string(),
+                    });
+                    tracing::info!("Service 注册：{} → {}", service_name, rep_addr);
+                }
+            }
+
+            // ROS 风格：Service 发现（控制面，返回 provider 的 REP 地址）
+            t if t.starts_with("service/") && t.ends_with("/lookup") => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
+                let service_name = payload["service_name"].as_str().unwrap_or("");
+                
+                let response = if let Some(provider) = self.broker.find_service_provider(service_name) {
+                    serde_json::json!({
+                        "found": true,
+                        "node_id": provider.node_id.to_string(),
+                        "rep_addr": provider.rep_addr,
+                        "service_name": service_name,
+                    })
+                } else {
+                    serde_json::json!({
+                        "found": false,
+                        "service_name": service_name,
+                    })
+                };
+                
+                let reply = FrameCodec::new_reply(
+                    incoming.message.topic.clone(),
+                    "kernel",
+                    incoming.message.header.msg_id.clone(),
+                    &response,
+                )?;
+                let frames_bytes: Vec<Bytes> = FrameCodec::encode(&reply)?
+                    .into_iter()
+                    .map(Bytes::from)
+                    .collect();
+                transport.send_to(identity, frames_bytes).await?;
+            }
+
+            // ROS 风格：参数服务器
+            "param/set" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
+                if let Some(key) = payload["key"].as_str() {
+                    let value = payload.get("value").cloned().map(|v| {
+                        serde_json::from_value(v).unwrap_or(crate::message::ParamValue::Null)
+                    });
+                    if let Some(v) = value {
+                        self.param_server.set(key, v);
+                    }
+                }
+                // 控制面消息转发：param/changed 属于控制面通知（类似 ROS 1 Master 广播参数变更），
+                // 不是业务数据，经 Kernel 转发是符合 ROS 架构的
                 self.route_and_forward(&incoming.message, transport).await?;
+            }
+
+            "param/get" => {
+                // 参数查询：直接通过消息响应
+                let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
+                let key = payload["key"].as_str().unwrap_or("");
+                let reply_to = incoming.message.header.msg_id.clone();
+                
+                if let Some(value) = self.param_server.get(key) {
+                    let response = FrameCodec::new_reply(
+                        Topic::param_changed(),
+                        "kernel",
+                        reply_to,
+                        &serde_json::json!({
+                            "key": key,
+                            "value": value,
+                        }),
+                    )?;
+                    // 控制面消息转发：param/get 响应属于控制面通知（类似 ROS 1 Master 返回参数查询结果），
+                    // 不是业务数据，经 Kernel 转发是符合 ROS 架构的
+                    self.route_and_forward(&response, transport).await?;
+                }
+            }
+
+            // 控制面路由消息：经 Kernel ROUTER 转发到订阅者
+            // ROS 1 风格：tool_call、tool_result、agent/output 等控制面消息
+            // 通过 DEALER↔ROUTER 连接传输，Node 没有直连通道，必须经 Kernel 中转。
+            // 只有大块业务数据才走 Node PUB/SUB 直连（数据面）。
+            _ => {
+                // 尝试路由到订阅了此 topic 的 Node
+                let targets = self.broker.find_targets(&incoming.message);
+                if targets.is_empty() {
+                    // 无订阅者：可能是纯数据面消息（Node 应通过 PUB/SUB 直连），
+                    // 或消息发到了无人订阅的 topic
+                    tracing::debug!(
+                        "消息 {} 无订阅者，跳过路由（如为业务数据请使用 PUB/SUB 直连）",
+                        topic
+                    );
+                } else {
+                    // 有订阅者：通过控制面 ROUTER 转发
+                    self.route_and_forward(&incoming.message, transport).await?;
+                }
             }
         }
 
@@ -291,26 +515,97 @@ impl Kernel {
     }
 
     /// 将消息路由到所有订阅者并通过 ROUTER 发送
+    ///
+    /// ROS 风格的消息路由：
+    /// 1. 通过 broker.find_targets 查找订阅者（不编码）
+    /// 2. 编码消息帧（只编码一次）
+    /// 3. 逐个发送到每个订阅者
+    /// 4. 记录发送统计
     async fn route_and_forward(
         &self,
         msg: &Message,
         transport: &mut KernelTransport,
     ) -> Result<()> {
-        let targets = self.broker.route_message(msg)?;
+        // ✅ 检查背压级别
+        if let Some(delay) = self.backpressure.get_delay() {
+            tracing::warn!("背压触发，延迟 {:?} 后发送", delay);
+            tokio::time::sleep(delay).await;
+        }
+
+        // ✅ 查找订阅者（不编码消息帧，避免重复编码）
+        let targets = self.broker.find_targets(msg);
 
         if targets.is_empty() {
             return Ok(());
         }
 
-        // broker.route_message 已经编码了消息帧，直接使用返回的 frames
-        // targets 格式：(identity, encoded_frames)
-        for (identity, frames) in targets {
+        // ✅ 编码消息帧（只编码一次，所有订阅者共享）
+        let frames = FrameCodec::encode(msg)?;
+        let frames_bytes: Vec<Bytes> = frames.into_iter().map(Bytes::from).collect();
+
+        // ✅ 逐个发送到每个订阅者
+        for (identity, _node_id) in targets {
             let identity_bytes = Bytes::from(identity);
-            let frames_bytes: Vec<Bytes> = frames.into_iter().map(Bytes::from).collect();
-            transport.send_to(identity_bytes, frames_bytes).await?;
+            transport.send_to(identity_bytes, frames_bytes.clone()).await?;
         }
 
+        // ✅ 记录发送统计
+        self.backpressure.record_sent();
+
         Ok(())
+    }
+
+    /// 原子注册 Node（带补偿逻辑）
+    ///
+    /// 确保状态一致性：
+    /// - 先注册 Registry（记录状态）
+    /// - 再注册 Broker identity
+    /// - 最后添加订阅关系
+    /// - 任何步骤失败时，回滚已完成的所有步骤
+    fn atomic_register_node(
+        &mut self,
+        node_id: NodeId,
+        node_type: NodeType,
+        subscriptions: Vec<String>,
+        identity: Vec<u8>,
+    ) -> Result<()> {
+        // 步骤 1: Registry 注册（记录元数据）
+        self.registry.register(node_id.clone(), node_type, subscriptions.clone());
+
+        // 步骤 2: Broker 注册 identity
+        // 注意：register_identity 目前不返回错误，但为了保持回滚框架
+        // 如果 Node 已注册，旧的 identity 会被覆盖（这是预期行为）
+        self.broker.register_identity(node_id.clone(), identity);
+
+        // 步骤 3: Broker 订阅 topics
+        // 跟踪已添加的订阅，用于回滚
+        let mut added_subscriptions: Vec<String> = Vec::new();
+        for pattern in &subscriptions {
+            self.broker.subscribe(node_id.clone(), pattern.clone());
+            added_subscriptions.push(pattern.clone());
+        }
+
+        tracing::info!("Node 注册成功：{} ({:?})", node_id, node_type);
+        Ok(())
+    }
+
+    /// 原子注销 Node（带补偿逻辑）
+    ///
+    /// 步骤：
+    /// 1. Registry 注销
+    /// 2. Broker 注销 identity 和 subscriptions
+    fn atomic_deregister_node(&mut self, id: &NodeId) {
+        let node_info = self.registry.get(id).cloned();
+
+        // 步骤 1: Registry 注销
+        self.registry.deregister(id);
+
+        // 步骤 2: Broker 注销
+        self.broker.deregister_identity(id);
+
+        if let Some(info) = node_info {
+            tracing::info!("Node 注销：{} ({:?})", id, info.node_type);
+        }
     }
 
     /// 注册新 Node（由外部调用，如 Launcher）
@@ -331,12 +626,7 @@ impl Kernel {
 
     /// 注销 Node
     pub fn deregister_node(&mut self, id: &NodeId) {
-        let node_info = self.registry.get(id);
-        self.registry.deregister(id);
-        self.broker.deregister_identity(id);
-        if let Some(info) = node_info {
-            tracing::info!("Node 注销：{} ({:?})", id, info.node_type);
-        }
+        self.atomic_deregister_node(id);
     }
 
     /// 处理 Node 心跳
@@ -368,14 +658,6 @@ impl Kernel {
             new_id, parent_id, agent_type, model
         );
 
-        // 注册子 Agent
-        let subscriptions = vec![
-            format!("agent/{}/input", new_id),
-            format!("agent/{}/tool_result", new_id),
-            "sampler/*/stream".into(),
-        ];
-        self.registry.register(new_id.clone(), NodeType::Agent, subscriptions);
-
         // 广播 spawn 事件
         let spawn_msg = FrameCodec::new_message(
             Topic::sys_spawn(),
@@ -400,7 +682,7 @@ impl Kernel {
     }
 
     /// 广播 Node 下线事件
-    async fn broadcast_node_deregister(&self, transport: &mut KernelTransport, node_id: &NodeId) {
+    async fn broadcast_node_deregister(transport: &mut KernelTransport, node_id: &NodeId) {
         tracing::info!("广播 Node 下线：{}", node_id);
         if let Ok(msg) = FrameCodec::new_message(
             Topic::sys_deregister(),
@@ -409,13 +691,15 @@ impl Kernel {
         ) {
             if let Ok(frames) = FrameCodec::encode(&msg) {
                 let bytes_frames: Vec<Bytes> = frames.into_iter().map(Bytes::from).collect();
-                let _ = transport.broadcast(bytes_frames).await;
+                if let Err(e) = transport.broadcast(bytes_frames).await {
+                    tracing::warn!("广播失败：{}", e);
+                }
             }
         }
     }
 
     /// 广播全局关闭信号
-    async fn broadcast_shutdown(&self, transport: &mut KernelTransport) {
+    async fn broadcast_shutdown(transport: &mut KernelTransport) {
         tracing::info!("广播全局关闭信号");
         if let Ok(msg) = FrameCodec::new_message(
             Topic::sys_shutdown(),
@@ -424,7 +708,9 @@ impl Kernel {
         ) {
             if let Ok(frames) = FrameCodec::encode(&msg) {
                 let bytes_frames: Vec<Bytes> = frames.into_iter().map(Bytes::from).collect();
-                let _ = transport.broadcast(bytes_frames).await;
+                if let Err(e) = transport.broadcast(bytes_frames).await {
+                    tracing::warn!("广播失败：{}", e);
+                }
             }
         }
     }

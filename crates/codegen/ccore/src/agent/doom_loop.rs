@@ -1,6 +1,6 @@
 //! Doom Loop 检测 - 检测 Agent 是否陷入重复循环
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use serde::{Deserialize, Serialize};
 
 /// 工具调用的签名，用于检测重复
@@ -13,7 +13,7 @@ pub struct ToolCallSignature {
 /// Doom Loop 检测器
 pub struct DoomLoopDetector {
     /// 最近的工具调用签名历史
-    history: Vec<ToolCallSignature>,
+    history: VecDeque<ToolCallSignature>,
     /// 检测窗口大小
     window_size: usize,
     /// 重复阈值：在窗口内同一签名出现 N 次则判定为 doom loop
@@ -31,7 +31,7 @@ pub struct DoomLoopResult {
 impl DoomLoopDetector {
     pub fn new(window_size: usize, repeat_threshold: usize) -> Self {
         Self {
-            history: Vec::new(),
+            history: VecDeque::new(),
             window_size,
             repeat_threshold,
         }
@@ -39,10 +39,10 @@ impl DoomLoopDetector {
 
     /// 记录一次工具调用
     pub fn record(&mut self, tool_name: String, args_hash: u64) {
-        self.history.push(ToolCallSignature { tool_name, args_hash });
+        self.history.push_back(ToolCallSignature { tool_name, args_hash });
         // 只保留窗口大小的历史
         if self.history.len() > self.window_size {
-            self.history.remove(0);
+            self.history.pop_front();
         }
     }
 

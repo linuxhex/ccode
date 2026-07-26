@@ -1,10 +1,10 @@
 # 需求分析（ccode 视角）
 
 ## 需求概述
-> 基于 grok-build 开源项目，改造为名为 ccode 的终端 AI 编程代理，引入 ROS 式消息总线架构、冷热分层记忆系统、多模型后端支持，实现超越 Claude Code 和 Codex 的能力。
+> 基于 ccode 开源项目，改造为名为 ccode 的终端 AI 编程代理，引入 ROS 式消息总线架构、冷热分层记忆系统、多模型后端支持，实现超越 Claude Code 和 Codex 的能力。
 
 ## 业务背景
-- grok-build 是 SpaceXAI 开源的终端 AI 编程代理，功能完整但架构为单进程 monolith
+- ccode 是 ccode-org 开源的终端 AI 编程代理，功能完整但架构为单进程 monolith
 - 用户希望改造为类似 Claude Code 的终端交互式 Agent，但不暴露源码
 - 核心改造思想：将 ROS 的消息总线发布订阅思想引入 Agent 架构，实现多进程并行、容错、可扩展
 - 需要 CLI 脚本安装，核心逻辑以动态库形式分发
@@ -16,7 +16,7 @@
 | 消息总线架构 | ZeroMQ 为核心，Kernel 作为 broker，所有功能模块作为独立 Node 进程 |
 | 源码保护 | CLI 开源，核心逻辑编译为 libccore.dylib/.so 闭源分发 |
 | 记忆系统 | 冷热分层 + 滑动窗口，不做压缩丢弃，用内存级向量库实现 |
-| 多模型后端 | 统一 OpenAI Chat Completions 兼容接口，支持 Claude/GPT/GLM/Grok/DeepSeek/Kimi/Qianwen/Qoder 等 |
+| 多模型后端 | 统一 OpenAI Chat Completions 兼容接口，支持 Claude/GPT/GLM/DeepSeek/DeepSeek/Kimi/Qianwen/Qoder 等 |
 | 多 Agent 编排 | 主 agent 和子 agent 均通过消息总线通信，支持真正进程级并行 |
 | 能力整合 | 从 Claude Code 整合 Plan-Execute 循环、Git Checkpoint、Skill 系统；从 Codex 整合 Patch 编辑、沙箱回滚、自动验证循环 |
 
@@ -99,7 +99,7 @@ Dream 整理：空闲时自动对 L2 知识去重、合并、建立关联
 |------|------|------|
 | 原生兼容 | OpenAI, DeepSeek, Qoder | 直接用 /v1/chat/completions |
 | 兼容适配 | Claude, GLM, Kimi, Qianwen | 需请求/响应格式转换 |
-| xAI 原生 | Grok | 保留 Responses API 支持 |
+| API 原生 | DeepSeek | 保留 Responses API 支持 |
 
 多模型混排策略：不同子 agent 可用不同模型
 - Primary Agent → 强推理模型（如 claude-opus）
@@ -113,7 +113,7 @@ Dream 整理：空闲时自动对 L2 知识去重、合并、建立关联
 ```
 ccode-cli (开源 Rust bin)           → 仅做参数解析 + spawn kernel
   └── libccore.dylib/.so (闭源)     → Kernel + Node 框架 + 所有核心逻辑
-      └── 复用 grok 的工具实现、采样逻辑、markdown 渲染等
+      └── 复用 ccode 的工具实现、采样逻辑、markdown 渲染等
 ```
 
 ### 能力整合清单
@@ -134,32 +134,32 @@ ccode 独创：
 - 消息总线原生并行（进程级，非线程级）
 - 多模型混排
 - 外部 Node 插件生态
-- Doom Loop 检测（Grok 已有）
+- Doom Loop 检测（ccode 已有）
 - 分布式推理（Sampler Node 可跑在远程 GPU 机器）
 
-## 复用 grok-build 的现有模块
+## 复用 ccode 的现有模块
 
-| grok 模块 | ccode 复用方式 |
+| ccode 模块 | ccode 复用方式 |
 |-----------|---------------|
-| xai-grok-tools | 工具实现迁移到 Tool Node，保留 bash/grep/read/write 等全部工具 |
-| xai-grok-sampler | 采样逻辑迁移到 Sampler Node，扩展为多 Provider |
-| xai-grok-memory | 嵌入和 RAG 逻辑复用，重构为冷热分层架构 |
-| xai-grok-markdown | TUI 渲染复用 |
-| xai-grok-hooks | 事件系统迁移到消息总线 topic |
-| xai-grok-mcp | MCP 集成作为 Tool Node 的子模块 |
-| xai-grok-sandbox | 沙箱执行逻辑复用 |
-| xai-grok-compaction | 替换为冷热分层 + 滑动窗口，不使用压缩 |
-| xai-grok-config | 配置系统复用，扩展多 Provider 配置 |
-| xai-grok-auth | 认证逻辑复用，扩展多 Provider 认证 |
-| xai-fast-worktree | Git worktree 复用 |
-| xai-grok-shell | ACP 协议和 agent 编排逻辑参考 |
-| xai-tool-types | 工具类型定义复用 |
-| xai-tool-runtime | 工具运行时复用 |
-| xai-tool-protocol | 工具协议参考 |
-| xai-circuit-breaker | 熔断器复用，用于 Provider 限流和 fallback |
-| xai-chat-state | 对话状态管理参考，重构为 State Node |
+| ccode-tools | 工具实现迁移到 Tool Node，保留 bash/grep/read/write 等全部工具 |
+| ccode-sampler | 采样逻辑迁移到 Sampler Node，扩展为多 Provider |
+| ccode-memory | 嵌入和 RAG 逻辑复用，重构为冷热分层架构 |
+| ccode-markdown | TUI 渲染复用 |
+| ccode-hooks | 事件系统迁移到消息总线 topic |
+| ccode-mcp | MCP 集成作为 Tool Node 的子模块 |
+| ccode-sandbox | 沙箱执行逻辑复用 |
+| ccode-compaction | 替换为冷热分层 + 滑动窗口，不使用压缩 |
+| ccode-config | 配置系统复用，扩展多 Provider 配置 |
+| ccode-auth | 认证逻辑复用，扩展多 Provider 认证 |
+| ccode-fast-worktree | Git worktree 复用 |
+| ccode-shell | ACP 协议和 agent 编排逻辑参考 |
+| ccode-tool-types | 工具类型定义复用 |
+| ccode-tool-runtime | 工具运行时复用 |
+| ccode-tool-protocol | 工具协议参考 |
+| ccode-circuit-breaker | 熔断器复用，用于 Provider 限流和 fallback |
+| ccode-chat-state | 对话状态管理参考，重构为 State Node |
 | ptyctl | PTY 控制复用 |
-| xai-grok-secrets | 密钥脱敏复用 |
+| ccode-secrets | 密钥脱敏复用 |
 
 ## 技术选型
 
@@ -170,8 +170,8 @@ ccode 独创：
 | 向量库 (L1) | hora | 纯 Rust HNSW，SIMD 加速，零依赖 |
 | 向量库 (L2) | qdrant-client | 持久化向量库，支持混合检索 |
 | 嵌入模型 | 本地 ONNX / 远程 API | 语义检索用 |
-| 异步运行时 | tokio | grok 已用，继续沿用 |
-| 终端渲染 | ratatui + 复用 xai-grok-markdown | grok 已有成熟 TUI |
+| 异步运行时 | tokio | ccode 已用，继续沿用 |
+| 终端渲染 | ratatui + 复用 ccode-markdown | ccode 已有成熟 TUI |
 | 动态库 | cdylib | Rust 编译为 C 动态库，CLI 通过 FFI 调用 |
 
 ## 风险与注意

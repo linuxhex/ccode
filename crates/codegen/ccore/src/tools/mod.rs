@@ -2,7 +2,7 @@
 //!
 //! 工具系统架构：
 //! - Agent 通过消息总线发送 ToolCallRequest 到 Tool Node
-//! - Tool Node 通过 Bridge 层将请求转换为 grok Tool trait 的调用
+//! - Tool Node 通过 Bridge 层将请求转换为 ccode Tool trait 的调用
 //! - 工具执行结果（可能是流式）封装为 ToolCallResult 返回
 //!
 //! ccode 的工具调用在消息总线上是异步的：
@@ -24,7 +24,7 @@ pub struct ToolCallRequest {
     pub tool_call_id: String,
     /// 工具名称
     pub tool_name: String,
-    /// 工具参数（JSON 格式，与 grok 工具的 Input 结构体对应）
+    /// 工具参数（JSON 格式，与 ccode 工具的 Input 结构体对应）
     pub arguments: serde_json::Value,
     /// 发起方 Agent ID
     pub agent_id: String,

@@ -88,8 +88,11 @@ impl LongTermMemory {
             let path = item.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 let content = fs::read_to_string(&path).await?;
-                if let Ok(knowledge) = serde_json::from_str::<KnowledgeEntry>(&content) {
-                    entries.push(knowledge);
+                match serde_json::from_str::<KnowledgeEntry>(&content) {
+                    Ok(knowledge) => entries.push(knowledge),
+                    Err(e) => {
+                        tracing::warn!("知识条目文件 {} 反序列化失败：{}", path.display(), e);
+                    }
                 }
             }
         }

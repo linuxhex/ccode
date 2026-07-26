@@ -175,7 +175,7 @@ init_config() {
 
 [general]
 # 默认模型
-default_model = "grok-3"
+default_model = "ccode-3"
 # 默认 Agent 类型：primary / explore / plan / general
 default_agent_type = "primary"
 # 权限模式：yolo / trust / ask

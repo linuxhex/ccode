@@ -5,6 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Topic 最大深度限制（防止栈溢出）
+const MAX_TOPIC_DEPTH: usize = 100;
+
+/// Topic 最大段长度
+const MAX_SEGMENT_LENGTH: usize = 100;
+
 /// 消息 Topic，标识消息的路由目的地
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Topic(String);
@@ -17,6 +23,11 @@ impl Topic {
     pub fn new(topic: impl Into<String>) -> Self {
         let t = topic.into();
         debug_assert!(!t.is_empty(), "topic 不能为空");
+        debug_assert!(
+            t.split('/').all(|seg| seg.len() <= MAX_SEGMENT_LENGTH),
+            "topic 段长度超过 {} 限制",
+            MAX_SEGMENT_LENGTH
+        );
         Self(t)
     }
 
@@ -118,6 +129,35 @@ impl Topic {
     pub fn tool_register() -> Self {
         Self::new("tool/register")
     }
+
+    // ---- Service Topic (ROS 风格) ----
+
+    /// 服务请求
+    pub fn service_request(service_name: &str) -> Self {
+        Self::new(format!("service/{service_name}/request"))
+    }
+
+    /// 服务响应
+    pub fn service_response(service_name: &str) -> Self {
+        Self::new(format!("service/{service_name}/response"))
+    }
+
+    // ---- Param Topic (ROS 风格参数服务器) ----
+
+    /// 设置参数
+    pub fn param_set() -> Self {
+        Self::new("param/set")
+    }
+
+    /// 获取参数
+    pub fn param_get() -> Self {
+        Self::new("param/get")
+    }
+
+    /// 参数变更通知
+    pub fn param_changed() -> Self {
+        Self::new("param/changed")
+    }
 }
 
 impl TopicPattern {
@@ -147,22 +187,41 @@ impl TopicPattern {
 }
 
 /// 通配符匹配：* 匹配单段，** 匹配多段
-fn topic_matches(pattern: &str, topic: &str) -> bool {
+/// 带深度限制（防止栈溢出）
+pub fn topic_matches(pattern: &str, topic: &str) -> bool {
     let pattern_parts: Vec<&str> = pattern.split('/').collect();
     let topic_parts: Vec<&str> = topic.split('/').collect();
-    match_parts(&pattern_parts, &topic_parts)
+    
+    // ✅ 检查深度
+    if pattern_parts.len() > MAX_TOPIC_DEPTH || topic_parts.len() > MAX_TOPIC_DEPTH {
+        tracing::warn!(
+            "Topic 深度超过限制：pattern={}, topic={}, max={}",
+            pattern_parts.len(),
+            topic_parts.len(),
+            MAX_TOPIC_DEPTH
+        );
+        return false;
+    }
+    
+    match_parts(&pattern_parts, &topic_parts, 0)
 }
 
-fn match_parts(pattern: &[&str], topic: &[&str]) -> bool {
+/// 递归匹配（带深度检查）
+fn match_parts(pattern: &[&str], topic: &[&str], depth: usize) -> bool {
+    // ✅ 深度检查
+    if depth > MAX_TOPIC_DEPTH {
+        return false;
+    }
+    
     match (pattern.first(), topic.first()) {
         (None, None) => true,
-        (Some("**"), _) => {
+        (Some(&"**"), _) => {
             // ** 匹配零或多个段
-            match_parts(&pattern[1..], topic)
-                || (!topic.is_empty() && match_parts(pattern, &topic[1..]))
+            match_parts(&pattern[1..], topic, depth + 1)
+                || (!topic.is_empty() && match_parts(pattern, &topic[1..], depth + 1))
         }
-        (Some("*"), Some(_)) => match_parts(&pattern[1..], &topic[1..]),
-        (Some(p), Some(t)) if p == t => match_parts(&pattern[1..], &topic[1..]),
+        (Some(&"*"), Some(_)) => match_parts(&pattern[1..], &topic[1..], depth + 1),
+        (Some(p), Some(t)) if p == t => match_parts(&pattern[1..], &topic[1..], depth + 1),
         _ => false,
     }
 }

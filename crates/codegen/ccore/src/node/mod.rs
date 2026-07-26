@@ -18,13 +18,23 @@ use crate::node::transport::NodeTransportHandle;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(String);
 
+impl Default for NodeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::str::FromStr for NodeId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
 impl NodeId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())
-    }
-
-    pub fn from_str(s: impl Into<String>) -> Self {
-        Self(s.into())
     }
 
     pub fn as_str(&self) -> &str {
@@ -93,12 +103,23 @@ pub enum PermissionMode {
 }
 
 /// Node 运行上下文，提供消息总线连接信息
+///
+/// ROS 1 风格双面架构：
+/// - 控制面：Node ↔ Kernel（注册、发现、心跳、参数）
+/// - 数据面：Node ↔ Node（Topic 发布/订阅、Service 请求/响应，不经 Kernel）
 #[derive(Debug, Clone)]
 pub struct NodeContext {
-    /// Kernel 的 ROUTER socket 地址
+    /// Kernel 的 ROUTER socket 地址（控制面）
     pub router_addr: String,
-    /// Kernel 的 PUB socket 地址
+    /// Kernel 的 PUB socket 地址（控制面广播）
     pub pub_addr: String,
+    /// 本 Node 的 PUB socket 绑定地址（数据面，其他 Node 直连订阅）
+    /// 格式：ipc:///tmp/ccode-pub-{node_id} 或 tcp://*:port
+    pub data_pub_addr: String,
+    /// 本 Node 的 REP socket 绑定地址（数据面，Service 请求端直连）
+    /// 格式：ipc:///tmp/ccode-rep-{node_id} 或 tcp://*:port
+    /// 仅 Service 提供者需要设置
+    pub data_rep_addr: Option<String>,
 }
 
 /// Node trait - 所有 Node 进程必须实现

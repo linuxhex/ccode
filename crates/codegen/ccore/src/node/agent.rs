@@ -12,6 +12,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::message::frame::FrameCodec;
 use crate::message::Message;
@@ -54,6 +56,7 @@ pub struct AgentNode {
     /// Doom Loop 检测器
     doom_loop_detector: DoomLoopDetector,
     /// 滑动窗口更新器
+    #[allow(dead_code)]
     sliding_window: SlidingWindow,
     /// 等待中的工具调用（tool_call_id → PendingToolCall）
     /// 在收到 stream done 时，这些被发送给 ToolNode 执行
@@ -63,6 +66,7 @@ pub struct AgentNode {
     /// 当前 LLM 采样请求 ID
     current_sample_request_id: Option<String>,
     /// 已使用的 token 数
+    #[allow(dead_code)]
     tokens_used: u32,
     /// 已执行轮次
     turns_executed: u32,
@@ -174,6 +178,11 @@ impl AgentNode {
                             arguments: serde_json::Value::Null,
                         })
                 };
+
+                // 记录工具调用到 Doom Loop 检测器
+                let args_hash = Self::hash_tool_args(&tool_call.arguments);
+                self.doom_loop_detector.record(tool_call.tool_name.clone(), args_hash);
+
                 self.pending_tool_calls.insert(tool_call.tool_call_id.clone(), tool_call);
             }
         }
@@ -228,6 +237,13 @@ impl AgentNode {
     fn estimate_tokens(text: &str) -> u32 {
         (text.len() as f32 / 4.0).ceil() as u32
     }
+
+    /// 计算工具参数的哈希值，用于 Doom Loop 检测
+    fn hash_tool_args(args: &serde_json::Value) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        args.to_string().hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 #[async_trait]
@@ -279,7 +295,7 @@ impl Node for AgentNode {
                 if raw_value.get("type").and_then(|v| v.as_str()) == Some("done") {
                     // 只处理自己发起的采样请求
                     if let Some(req_id) = raw_value.get("request_id").and_then(|v| v.as_str()) {
-                        if Some(req_id) != self.current_sample_request_id.as_ref() {
+                        if Some(req_id) != self.current_sample_request_id.as_deref() {
                             return Ok(());
                         }
                     }

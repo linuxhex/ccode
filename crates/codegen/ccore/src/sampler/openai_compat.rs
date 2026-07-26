@@ -1,6 +1,6 @@
 //! OpenAI Chat Completions 兼容适配器
 //!
-//! 适用于：OpenAI、DeepSeek、Qoder、xAI Grok 等原生兼容 /v1/chat/completions 的后端
+//! 适用于：OpenAI、DeepSeek、Qoder、ccode Ccode 等原生兼容 /v1/chat/completions 的后端
 //!
 //! 流式解析基于 SSE (Server-Sent Events) 协议：
 //! - 每行以 "data: " 开头
@@ -23,7 +23,7 @@
 use anyhow::{Result, anyhow};
 use futures::stream::StreamExt;
 use futures::Stream;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::pin::Pin;
 
 use super::provider::{
@@ -125,10 +125,7 @@ impl OpenAICompatProvider {
         };
 
         // 提取第一个 choice 的 delta
-        let choice = match chunk.choices.first() {
-            Some(c) => c,
-            None => return None,
-        };
+        let choice = chunk.choices.first()?;
 
         // 转换 delta 为 StreamChunk
         let delta = &choice.delta;
@@ -192,12 +189,14 @@ impl OpenAICompatProvider {
 
 /// OpenAI 流式 chunk 原始格式
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIStreamChunk {
     choices: Vec<OpenAIChoice>,
     usage: Option<OpenAIUsage>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIChoice {
     index: u32,
     delta: OpenAIDelta,
@@ -205,6 +204,7 @@ struct OpenAIChoice {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIDelta {
     role: Option<String>,
     content: Option<String>,
@@ -214,6 +214,7 @@ struct OpenAIDelta {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIToolCallDelta {
     index: u32,
     id: Option<String>,
@@ -223,12 +224,14 @@ struct OpenAIToolCallDelta {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIFunctionDelta {
     name: String,
     arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -237,6 +240,7 @@ struct OpenAIUsage {
 
 /// OpenAI 非流式响应
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIResponse {
     id: String,
     choices: Vec<OpenAIResponseChoice>,
@@ -244,6 +248,7 @@ struct OpenAIResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIResponseChoice {
     index: u32,
     message: OpenAIResponseMessage,
@@ -251,6 +256,7 @@ struct OpenAIResponseChoice {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIResponseMessage {
     role: String,
     content: Option<String>,
@@ -258,6 +264,7 @@ struct OpenAIResponseMessage {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIResponseToolCall {
     id: String,
     r#type: String,
@@ -265,6 +272,7 @@ struct OpenAIResponseToolCall {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIResponseFunction {
     name: String,
     arguments: String,
@@ -300,7 +308,7 @@ impl Provider for OpenAICompatProvider {
         // 使用 buffer + 行分割解析 SSE
         let rid = request_id.clone();
         let stream = byte_stream
-            .scan(String::new(), |buffer, chunk_result| {
+            .scan(String::new(), move |buffer, chunk_result| {
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
@@ -324,7 +332,7 @@ impl Provider for OpenAICompatProvider {
 
                 std::future::ready(Some(results))
             })
-            .flat_map(|chunks| futures::stream::iter(chunks));
+            .flat_map(futures::stream::iter);
 
         Ok(Box::pin(stream))
     }
@@ -416,15 +424,15 @@ mod tests {
         let config = OpenAICompatConfig {
             name: "test".into(),
             api_key: "key".into(),
-            base_url: "https://api.x.ai/v1".into(),
-            models: vec!["grok-3".into()],
+            base_url: "https://api.ccode.dev/v1".into(),
+            models: vec!["ccode-3".into()],
         };
         let provider = OpenAICompatProvider::new(config);
 
         let request = SampleRequest {
             request_id: "req-1".into(),
             agent_id: "agent-1".into(),
-            model: "grok-3".into(),
+            model: "ccode-3".into(),
             messages: vec![
                 super::super::provider::ChatMessage {
                     role: "user".into(),
@@ -439,7 +447,7 @@ mod tests {
         };
 
         let body = provider.build_request_body(&request);
-        assert_eq!(body["model"], "grok-3");
+        assert_eq!(body["model"], "ccode-3");
         assert_eq!(body["stream"], true);
     }
 }

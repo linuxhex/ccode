@@ -1,6 +1,6 @@
 //! recall 工具 - 从 L1/L2 按需取回冷记忆
 
-use crate::memory::short_term::ShortTermMemory;
+use crate::memory::short_term::{ShortTermMemory, cosine_similarity};
 use crate::memory::long_term::LongTermMemory;
 
 /// recall 请求
@@ -53,12 +53,19 @@ pub async fn recall(
 
     let mut entries: Vec<RecalledEntry> = l1_results
         .iter()
-        .map(|e| RecalledEntry {
-            id: e.id.clone(),
-            role: e.role.clone(),
-            content: e.content.clone(),
-            turn: Some(e.turn),
-            score: 0.0, // 实际分数由 hora 返回
+        .map(|e| {
+            let score = if e.embedding.is_empty() {
+                0.0
+            } else {
+                cosine_similarity(&request.query_embedding, &e.embedding) as f64
+            };
+            RecalledEntry {
+                id: e.id.clone(),
+                role: e.role.clone(),
+                content: e.content.clone(),
+                turn: Some(e.turn),
+                score,
+            }
         })
         .collect();
 

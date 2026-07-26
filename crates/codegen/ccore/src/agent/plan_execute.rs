@@ -16,7 +16,7 @@ pub struct PlanStep {
 }
 
 /// Plan 步骤状态
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PlanStepStatus {
     Pending,
     Approved,
@@ -198,14 +198,11 @@ impl PlanExecutor {
     /// 4. 所有步骤完成后更新 Plan 状态为 Completed
     pub async fn execute(&self, plan: &mut Plan) -> PlanResult {
         let mut step_results = Vec::new();
-        let mut replan_count = 0u32;
+        let mut _replan_count = 0u32;
 
-        loop {
+        while let Some(id) = plan.next_step_id() {
             // 获取下一个待执行步骤
-            let next_step_id = match plan.next_step_id() {
-                Some(id) => id.to_string(),
-                None => break, // 没有更多步骤可执行
-            };
+            let next_step_id = id.to_string();
 
             // 执行单步
             let result = plan
@@ -236,8 +233,8 @@ impl PlanExecutor {
             }
 
             // 检查是否需要重新规划
-            if needs_replan && replan_count < self.max_replan_count {
-                replan_count += 1;
+            if needs_replan && _replan_count < self.max_replan_count {
+                _replan_count += 1;
                 plan.status = PlanStatus::Replanning;
                 // 返回结果，由调用方决定是否调用 replan 生成新步骤
                 return PlanResult {
@@ -319,6 +316,12 @@ impl PlanExecutor {
 /// Plan-Execute 控制器
 pub struct PlanExecuteController {
     current_plan: Option<Plan>,
+}
+
+impl Default for PlanExecuteController {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PlanExecuteController {

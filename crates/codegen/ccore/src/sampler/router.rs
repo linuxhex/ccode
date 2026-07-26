@@ -7,12 +7,9 @@
 //! 4. 速率限制与重试
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
-
-use super::provider::{Provider, SampleRequest, SampleResponse, StreamChunk};
+use super::provider::Provider;
 use super::openai_compat::OpenAICompatProvider;
 use super::claude_compat::ClaudeCompatProvider;
 
@@ -84,7 +81,7 @@ impl ProviderRouter {
 
         for config in configs {
             let provider: Box<dyn Provider> = match config.provider_type.as_str() {
-                "openai" | "openai-compat" | "xai" | "deepseek" => {
+                "openai" | "openai-compat" | "ccode" | "deepseek" => {
                     Box::new(OpenAICompatProvider::new(super::openai_compat::OpenAICompatConfig {
                         name: config.name.clone(),
                         api_key: config.api_key.clone(),
@@ -133,25 +130,33 @@ impl ProviderRouter {
         router
     }
 
-    /// 根据模型名查找 Provider
-    pub fn find_provider(&mut self, model: &str) -> Option<&mut dyn Provider> {
+    /// 根据模型名查找可用的 Provider 名称
+    ///
+    /// 返回 Provider 名称而非引用，避免借用冲突。
+    /// 调用方需通过 `get_provider_mut` 获取可变引用。
+    pub fn find_provider_name(&mut self, model: &str) -> Option<String> {
         // 先精确匹配模型名
-        if let Some(provider_name) = self.model_to_provider.get(model) {
-            if let Some(entry) = self.providers.get_mut(provider_name) {
+        let provider_name = self.model_to_provider.get(model).cloned();
+        if let Some(provider_name) = provider_name {
+            if let Some(entry) = self.providers.get_mut(&provider_name) {
                 if entry.rate_limit.try_acquire() {
-                    return Some(entry.provider.as_mut());
+                    return Some(provider_name);
                 }
                 tracing::warn!("Provider {} 速率限制，尝试 fallback", provider_name);
-                // 尝试 fallback
-                return self.find_fallback(provider_name, model);
+                return self.find_fallback_name(&provider_name, model);
             }
         }
 
-        // 模糊匹配：检查模型前缀
-        for (provider_name, entry) in &mut self.providers {
-            if entry.models.iter().any(|m| model.starts_with(m.split(':').next().unwrap_or(m))) {
+        // 模糊匹配：先收集候选 Provider 名称
+        let candidates: Vec<String> = self.providers.iter()
+            .filter(|(_, entry)| entry.models.iter().any(|m| model.starts_with(m.split(':').next().unwrap_or(m))))
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        for name in candidates {
+            if let Some(entry) = self.providers.get_mut(&name) {
                 if entry.rate_limit.try_acquire() {
-                    return Some(entry.provider.as_mut());
+                    return Some(name);
                 }
             }
         }
@@ -159,8 +164,14 @@ impl ProviderRouter {
         None
     }
 
-    /// 查找 fallback Provider
-    fn find_fallback(&mut self, failed_provider: &str, model: &str) -> Option<&mut dyn Provider> {
+    /// 根据名称获取 Provider 的可变引用
+    pub fn get_provider_mut(&mut self, name: &str) -> Option<&mut dyn Provider> {
+        let entry = self.providers.get_mut(name)?;
+        Some(entry.provider.as_mut())
+    }
+
+    /// 查找 fallback Provider 名称
+    pub fn find_fallback_name(&mut self, failed_provider: &str, model: &str) -> Option<String> {
         let fallback_chain = self.providers.get(failed_provider)
             .map(|e| e.fallback_chain.clone())
             .unwrap_or_default();
@@ -169,19 +180,25 @@ impl ProviderRouter {
             if let Some(entry) = self.providers.get_mut(fb_name) {
                 if entry.rate_limit.try_acquire() {
                     tracing::info!("Fallback 到 Provider：{}", fb_name);
-                    return Some(entry.provider.as_mut());
+                    return Some(fb_name.clone());
                 }
             }
         }
 
         // 最后尝试任意支持该模型的 Provider
-        for (name, entry) in &mut self.providers {
-            if name == failed_provider {
-                continue;
-            }
-            if entry.models.iter().any(|m| m == model) && entry.rate_limit.try_acquire() {
-                tracing::info!("Fallback 到任意 Provider：{}", name);
-                return Some(entry.provider.as_mut());
+        let candidates: Vec<String> = self.providers.iter()
+            .filter(|(name, entry)| {
+                *name != failed_provider && entry.models.iter().any(|m| m == model)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        for name in candidates {
+            if let Some(entry) = self.providers.get_mut(&name) {
+                if entry.rate_limit.try_acquire() {
+                    tracing::info!("Fallback 到任意 Provider：{}", name);
+                    return Some(name);
+                }
             }
         }
 

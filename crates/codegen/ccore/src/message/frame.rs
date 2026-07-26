@@ -6,9 +6,7 @@
 //! Frame 3: payload (MessagePack) — 业务数据
 
 use anyhow::{Result, anyhow};
-use rmp_serde::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
 use uuid::Uuid;
 use chrono::Utc;
 
@@ -31,40 +29,66 @@ pub struct MessageHeader {
     pub src_node: String,
     /// 回复目标 msg_id（用于 REQ/REP 关联）
     pub reply_to: Option<String>,
+    /// 序列号（用于顺序检查，每个 Node 独立递增）
+    #[serde(default)]
+    pub sequence: u64,
 }
 
 /// 消息帧编解码器
 pub struct FrameCodec;
 
 impl FrameCodec {
-    /// 创建新消息
+    /// 创建新消息（自动序列号）
     pub fn new_message(
         topic: super::Topic,
         src_node: impl Into<String>,
         payload: &impl Serialize,
+    ) -> Result<Message> {
+        Self::new_message_with_sequence(topic, src_node, payload, 0)
+    }
+
+    /// 创建新消息（指定序列号）
+    pub fn new_message_with_sequence(
+        topic: super::Topic,
+        src_node: impl Into<String>,
+        payload: &impl Serialize,
+        sequence: u64,
     ) -> Result<Message> {
         let header = MessageHeader {
             msg_id: Uuid::new_v4().to_string(),
             timestamp: Utc::now().to_rfc3339(),
             src_node: src_node.into(),
             reply_to: None,
+            sequence,
         };
         let payload = rmp_serde::to_vec(payload)?;
         Ok(Message { topic, header, payload })
     }
 
-    /// 创建回复消息
+    /// 创建回复消息（自动序列号）
     pub fn new_reply(
         topic: super::Topic,
         src_node: impl Into<String>,
         reply_to_msg_id: impl Into<String>,
         payload: &impl Serialize,
     ) -> Result<Message> {
+        Self::new_reply_with_sequence(topic, src_node, reply_to_msg_id, payload, 0)
+    }
+
+    /// 创建回复消息（指定序列号）
+    pub fn new_reply_with_sequence(
+        topic: super::Topic,
+        src_node: impl Into<String>,
+        reply_to_msg_id: impl Into<String>,
+        payload: &impl Serialize,
+        sequence: u64,
+    ) -> Result<Message> {
         let header = MessageHeader {
             msg_id: Uuid::new_v4().to_string(),
             timestamp: Utc::now().to_rfc3339(),
             src_node: src_node.into(),
             reply_to: Some(reply_to_msg_id.into()),
+            sequence,
         };
         let payload = rmp_serde::to_vec(payload)?;
         Ok(Message { topic, header, payload })
@@ -91,7 +115,7 @@ impl FrameCodec {
     }
 
     /// 解码 payload 为具体类型
-    pub fn decode_payload<T: Deserialize<'static>>(msg: &Message) -> Result<T> {
+    pub fn decode_payload<T: serde::de::DeserializeOwned>(msg: &Message) -> Result<T> {
         Ok(rmp_serde::from_read(&msg.payload[..])?)
     }
 }

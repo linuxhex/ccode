@@ -1,0 +1,20 @@
+[package]
+license = "Apache-2.0"
+name = "ccode-http"
+version = "0.1.0"
+edition.workspace = true
+description = "Shared reqwest HTTP clients and User-Agent construction for the ccode CLI."
+
+[dependencies]
+reqwest = { workspace = true, features = ["blocking"] }
+reqwest-middleware = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+ccode-auth = { workspace = true, features = ["middleware"] }
+ccode-sampler = { path = "../ccode-sampler" }
+ccode-telemetry = { workspace = true }
+ccode-version = { workspace = true }
+ccode-workspace = { workspace = true }
+
+[lints]
+workspace = true

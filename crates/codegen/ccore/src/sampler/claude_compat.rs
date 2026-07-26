@@ -207,12 +207,14 @@ struct ActiveToolCall {
 
 /// content_block_delta 事件
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeContentBlockDelta {
     delta: ClaudeDelta,
 }
 
 /// 增量内容
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeDelta {
     r#type: String,
     /// 文本增量
@@ -228,12 +230,14 @@ struct ClaudeDelta {
 
 /// content_block_start 事件
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeContentBlockStart {
     content_block: ClaudeContentBlock,
 }
 
 /// 内容块
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeContentBlock {
     r#type: String,
     /// 工具调用 ID（tool_use 类型）
@@ -246,12 +250,14 @@ struct ClaudeContentBlock {
 
 /// message_start 事件
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeMessageStart {
     message: ClaudeMessage,
 }
 
 /// Anthropic Message 对象
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeMessage {
     id: String,
     r#type: String,
@@ -264,6 +270,7 @@ struct ClaudeMessage {
 
 /// Token 使用量
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeUsage {
     input_tokens: u32,
     output_tokens: u32,
@@ -271,23 +278,27 @@ struct ClaudeUsage {
 
 /// message_delta 事件
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeMessageDelta {
     delta: ClaudeMessageDeltaData,
     usage: ClaudeMessageDeltaUsage,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeMessageDeltaData {
     stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeMessageDeltaUsage {
     output_tokens: u32,
 }
 
 /// Anthropic 非流式响应
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeResponse {
     id: String,
     r#type: String,
@@ -300,6 +311,7 @@ struct ClaudeResponse {
 
 /// 非流式响应内容块
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClaudeResponseContentBlock {
     r#type: String,
     /// text 类型的文本内容
@@ -356,7 +368,7 @@ impl Provider for ClaudeCompatProvider {
         let stream = byte_stream
             .scan(
                 SseParserState::default(),
-                |state, chunk_result| {
+                move |state, chunk_result| {
                     let chunk = match chunk_result {
                         Ok(c) => c,
                         Err(e) => {
@@ -376,10 +388,10 @@ impl Provider for ClaudeCompatProvider {
                         let line = state.buffer[..pos].trim().to_string();
                         state.buffer.drain(..=pos);
 
-                        if line.starts_with("event: ") {
-                            state.current_event = line[7..].to_string();
-                        } else if line.starts_with("data: ") {
-                            state.current_data = line[6..].to_string();
+                        if let Some(stripped) = line.strip_prefix("event: ") {
+                            state.current_event = stripped.to_string();
+                        } else if let Some(stripped) = line.strip_prefix("data: ") {
+                            state.current_data = stripped.to_string();
 
                             // event + data 都已收到，解析事件
                             if !state.current_event.is_empty() {
@@ -393,20 +405,17 @@ impl Provider for ClaudeCompatProvider {
                                 state.current_event.clear();
                                 state.current_data.clear();
                             }
-                        } else if line.starts_with("data: ") {
-                            // data 后无内容
-                        }
+                        } else if line.is_empty() {
                         // 空行表示事件结束，重置状态
-                        else if line.is_empty() {
-                            state.current_event.clear();
-                            state.current_data.clear();
+                        state.current_event.clear();
+                        state.current_data.clear();
                         }
                     }
 
                     std::future::ready(Some(results))
                 },
             )
-            .flat_map(|chunks| futures::stream::iter(chunks));
+            .flat_map(futures::stream::iter);
 
         Ok(Box::pin(stream))
     }

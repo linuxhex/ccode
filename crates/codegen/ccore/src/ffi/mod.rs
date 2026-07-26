@@ -6,7 +6,11 @@ use crate::config::CcodeConfig;
 use crate::kernel::{Kernel, KernelConfig};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::ptr;
+use std::sync::OnceLock;
+
+/// 全局 shutdown 信号，ccore_start 时设置，ccore_stop 时触发
+/// 使用 Mutex 包装以允许 take() 消费 Sender（oneshot::send 需要 ownership）
+static SHUTDOWN_TX: OnceLock<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>> = OnceLock::new();
 
 /// FFI 启动 ccode kernel
 ///
@@ -34,13 +38,16 @@ pub unsafe extern "C" fn ccore_start(config_json: *const c_char) -> i32 {
         Err(_) => return -4,
     };
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let _ = SHUTDOWN_TX.set(std::sync::Mutex::new(Some(shutdown_tx)));
+
     let kernel_config = KernelConfig::default();
     rt.block_on(async {
         let mut kernel = Kernel::new(kernel_config);
         kernel.set_ccode_config(config);
-        match kernel.run().await {
-            Ok(_) => 0,
-            Err(_) => -5,
+        tokio::select! {
+            result = kernel.run() => result.map(|_| 0).unwrap_or(-5),
+            _ = shutdown_rx => 0,
         }
     })
 }
@@ -48,7 +55,13 @@ pub unsafe extern "C" fn ccore_start(config_json: *const c_char) -> i32 {
 /// FFI 停止 ccode kernel
 #[no_mangle]
 pub extern "C" fn ccore_stop() {
-    // 通过消息总线发送 shutdown 信号
+    if let Some(mutex) = SHUTDOWN_TX.get() {
+        if let Ok(mut guard) = mutex.lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
 }
 
 /// FFI 获取 ccode 版本

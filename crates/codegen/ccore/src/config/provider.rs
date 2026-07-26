@@ -11,7 +11,7 @@ pub struct ProviderConfig {
     pub api_key: String,
     /// API Base URL
     pub base_url: String,
-    /// 适配器类型（openai / claude / glm / kimi / qianwen / xai / deepseek）
+    /// 适配器类型（openai / claude / glm / kimi / qianwen / ccode / deepseek）
     pub provider_type: String,
     /// 适配器枚举（兼容旧字段）
     pub adapter: ProviderAdapter,
@@ -41,23 +41,23 @@ pub enum ProviderAdapter {
     Kimi,
     /// 千问适配器
     Qianwen,
-    /// xAI Grok 原生
-    Grok,
+    /// ccode Ccode 原生
+    Ccode,
 }
 
 impl ProviderConfig {
-    /// 默认 Grok Provider
-    pub fn default_grok() -> Self {
+    /// 默认 Ccode Provider
+    pub fn default_ccode() -> Self {
         Self {
-            name: "grok".into(),
+            name: "ccode".into(),
             api_key: String::new(),
-            base_url: "https://api.x.ai/v1".into(),
+            base_url: "https://api.ccode.dev/v1".into(),
             provider_type: "openai".into(),
-            adapter: ProviderAdapter::Grok,
+            adapter: ProviderAdapter::Ccode,
             models: vec![
-                "grok-3".into(),
-                "grok-3-fast".into(),
-                "grok-3-mini".into(),
+                "ccode-3".into(),
+                "ccode-3-fast".into(),
+                "ccode-3-mini".into(),
             ],
             fallback: vec!["deepseek".into()],
             rate_limit: Some(60),
@@ -77,7 +77,7 @@ impl ProviderConfig {
                 "claude-sonnet-4-20250514".into(),
                 "claude-opus-4-20250514".into(),
             ],
-            fallback: vec!["grok".into()],
+            fallback: vec!["ccode".into()],
             rate_limit: Some(50),
             api_version: Some("2023-06-01".into()),
         }

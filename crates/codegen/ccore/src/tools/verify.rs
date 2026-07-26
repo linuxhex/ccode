@@ -1,6 +1,6 @@
 //! 自动验证循环 - 编辑后自动编译/测试验证
 
-use std::process::Command;
+use tokio::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +64,7 @@ pub struct VerifyAttempt {
 
 /// 自动验证控制器
 pub struct VerifyController {
+    #[allow(dead_code)]
     max_retries: u32,
 }
 
@@ -83,7 +84,7 @@ impl VerifyController {
         let mut last_output = String::new();
 
         for attempt in 1..=request.max_retries.max(1) {
-            let result = self.run_verify_command(request)?;
+            let result = self.run_verify_command(request).await?;
             last_success = result.success;
             last_output = result.output.clone();
 
@@ -118,7 +119,7 @@ impl VerifyController {
     }
 
     /// 执行单次验证命令
-    fn run_verify_command(&self, request: &VerifyRequest) -> anyhow::Result<VerifyAttempt> {
+    async fn run_verify_command(&self, request: &VerifyRequest) -> anyhow::Result<VerifyAttempt> {
         let start = std::time::Instant::now();
 
         let (program, args) = match request.verify_type {
@@ -131,7 +132,7 @@ impl VerifyController {
                 let cmd = request.custom_command.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("Custom 验证类型需要提供 custom_command"))?;
                 let cmd_args = request.custom_args.as_deref().unwrap_or(&[]);
-                (cmd, cmd_args.iter().cloned().collect())
+                (cmd, cmd_args.to_vec())
             }
         };
 
@@ -140,7 +141,8 @@ impl VerifyController {
             .args(&args)
             .current_dir(&request.working_dir)
             .env("TERM", "dumb") // 避免终端颜色码干扰输出解析
-            .output()?;
+            .output()
+            .await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let success = output.status.success();

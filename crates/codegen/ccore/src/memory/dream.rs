@@ -3,6 +3,8 @@
 //! 从 L1 短期记忆中提取冷条目，总结为知识条目存入 L2 长期记忆，
 //! 整理后从 L1 中移除原条目，释放短期记忆空间
 
+use std::collections::HashSet;
+
 use crate::memory::long_term::{KnowledgeCategory, KnowledgeEntry, LongTermMemory};
 use crate::memory::short_term::ShortTermMemory;
 
@@ -78,12 +80,15 @@ impl DreamOrganizer {
             });
         }
 
+        // 构建 HashSet 用于 O(1) 查找
+        let cold_id_set: HashSet<String> = cold_ids.iter().cloned().collect();
+
         // 将冷条目转化为知识条目存入 L2
         let mut consolidated = 0usize;
         let now = chrono::Utc::now().to_rfc3339();
 
         for entry in all_entries.iter() {
-            if !cold_ids.contains(&entry.id) {
+            if !cold_id_set.contains(&entry.id) {
                 continue;
             }
 
@@ -130,7 +135,7 @@ impl DreamOrganizer {
     }
 
     /// 根据条目的角色和内容推断知识分类
-    fn infer_category(role: &str, content: &str) -> KnowledgeCategory {
+    fn infer_category(_role: &str, content: &str) -> KnowledgeCategory {
         let lower = content.to_lowercase();
         if lower.contains("架构") || lower.contains("architecture") || lower.contains("模块") {
             KnowledgeCategory::Architecture

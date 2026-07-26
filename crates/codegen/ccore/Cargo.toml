@@ -17,7 +17,7 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 
 # 消息总线 - 纯 Rust ZMTP 实现
-zeromq = "0.3"
+zeromq = { version = "0.4", features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
 
 # 异步 trait
 async-trait = { workspace = true }

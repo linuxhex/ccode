@@ -10,13 +10,13 @@
 
 use async_trait::async_trait;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -63,13 +63,21 @@ pub async fn run_tui_node(
     let node_id = node.node_id().clone();
     let subscriptions = node.subscriptions();
 
+    // 构建连接信息
+    let connect_info = crate::node::transport::NodeConnectInfo {
+        router_addr: ctx.router_addr.clone(),
+        pub_addr: ctx.pub_addr.clone(),
+        node_id: node_id.clone(),
+        node_type: node.node_type().as_str().to_string(),
+        subscriptions,
+        data_pub_addr: ctx.data_pub_addr.clone(),
+        published_topics: Vec::new(),
+        data_rep_addr: None,
+        service_name: None,
+    };
+
     // 连接消息总线
-    let mut transport = crate::node::transport::NodeTransport::connect(
-        &ctx.router_addr,
-        &ctx.pub_addr,
-        &node_id,
-        &subscriptions,
-    )
+    let mut transport = crate::node::transport::NodeTransport::connect(&connect_info)
     .await?;
 
     let handle = transport.handle().clone();
@@ -80,6 +88,10 @@ pub async fn run_tui_node(
 
     // 输入缓冲区
     let mut input_buffer = String::new();
+
+    // 心跳定时器：每 10 秒发送一次心跳
+    let mut heartbeat_timer = tokio::time::interval(std::time::Duration::from_secs(10));
+    heartbeat_timer.tick().await; // 消耗首次立即触发
 
     // 交互循环：同时等待消息和键盘输入
     loop {
@@ -117,6 +129,17 @@ pub async fn run_tui_node(
                         tracing::error!("TUI 传输层错误：{}", e);
                         break;
                     }
+                }
+            }
+            // 定期发送心跳
+            _ = heartbeat_timer.tick() => {
+                let heartbeat_msg = FrameCodec::new_message(
+                    Topic::sys_heartbeat(),
+                    node_id.as_str(),
+                    &serde_json::json!({ "node_id": node_id.to_string() }),
+                )?;
+                if let Err(e) = handle.send_message(&heartbeat_msg).await {
+                    tracing::warn!("TUI 心跳发送失败：{}", e);
                 }
             }
             // 键盘输入
@@ -212,7 +235,7 @@ impl TUINode {
 
     /// 恢复终端
     fn restore_terminal(&mut self) -> anyhow::Result<()> {
-        if let Some(terminal) = self.terminal.take() {
+        if let Some(mut terminal) = self.terminal.take() {
             disable_raw_mode()?;
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         }
@@ -227,7 +250,7 @@ impl TUINode {
         };
 
         terminal.draw(|f| {
-            let size = f.size();
+            let size = f.area();
 
             // 布局：上方状态栏 + 中间输出区 + 下方输入区
             let chunks = Layout::default()
@@ -305,7 +328,7 @@ impl Node for TUINode {
         Ok(())
     }
 
-    async fn handle_message(&mut self, msg: Message, transport: &NodeTransportHandle) -> anyhow::Result<()> {
+    async fn handle_message(&mut self, msg: Message, _transport: &NodeTransportHandle) -> anyhow::Result<()> {
         match msg.topic.as_str() {
             t if t.ends_with("/output") => {
                 // 渲染 agent 输出到终端

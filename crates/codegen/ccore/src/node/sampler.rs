@@ -15,7 +15,7 @@ use crate::message::Message;
 use crate::message::Topic;
 use crate::node::{Node, NodeId, NodeType, NodeContext};
 use crate::node::transport::NodeTransportHandle;
-use crate::sampler::provider::{Provider, SampleRequest, StreamChunk};
+use crate::sampler::provider::{SampleRequest, StreamChunk};
 use crate::sampler::router::ProviderRouter;
 use crate::config::provider::ProviderConfig;
 
@@ -48,24 +48,32 @@ impl SamplerNode {
     ) -> anyhow::Result<(std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamChunk>> + Send>>, String)> {
         // 第一次尝试：主 Provider
         let model = &request.model;
-        if let Some(provider) = self.router.find_provider(model) {
-            let name = provider.name().to_string();
+        let mut failed_provider_name: Option<String> = None;
+        if let Some(provider_name) = self.router.find_provider_name(model) {
+            let name = provider_name.clone();
+            let provider = self.router.get_provider_mut(&provider_name)
+                .ok_or_else(|| anyhow::anyhow!("Provider {} 不存在", provider_name))?;
             match provider.stream(request.clone()).await {
                 Ok(stream) => return Ok((stream, name)),
                 Err(e) => {
                     tracing::warn!("Provider {} 采样失败：{}, 尝试 fallback", name, e);
+                    failed_provider_name = Some(name);
                 }
             }
         }
 
-        // 第二次尝试：fallback Provider
-        if let Some(provider) = self.router.find_provider(model) {
-            let name = provider.name().to_string();
-            tracing::info!("Fallback 到 Provider：{}", name);
-            match provider.stream(request.clone()).await {
-                Ok(stream) => return Ok((stream, name)),
-                Err(e) => {
-                    tracing::warn!("Fallback Provider {} 也失败：{}", name, e);
+        // 第二次尝试：fallback Provider（排除已失败的 provider）
+        if let Some(ref name) = failed_provider_name {
+            if let Some(provider_name) = self.router.find_fallback_name(name, model) {
+                let fallback_name = provider_name.clone();
+                tracing::info!("Fallback 到 Provider：{}", fallback_name);
+                if let Some(provider) = self.router.get_provider_mut(&provider_name) {
+                    match provider.stream(request.clone()).await {
+                        Ok(stream) => return Ok((stream, fallback_name)),
+                        Err(e) => {
+                            tracing::warn!("Fallback Provider {} 也失败：{}", fallback_name, e);
+                        }
+                    }
                 }
             }
         }
@@ -183,12 +191,9 @@ impl Node for SamplerNode {
     }
 
     async fn handle_message(&mut self, msg: Message, transport: &NodeTransportHandle) -> anyhow::Result<()> {
-        match msg.topic.as_str() {
-            "sampler/request" => {
-                let request: SampleRequest = FrameCodec::decode_payload(&msg)?;
-                self.handle_sample_request(request, transport).await?;
-            }
-            _ => {}
+        if msg.topic.as_str() == "sampler/request" {
+            let request: SampleRequest = FrameCodec::decode_payload(&msg)?;
+            self.handle_sample_request(request, transport).await?;
         }
         Ok(())
     }

@@ -8,7 +8,7 @@
 //! name: refactor
 //! description: 代码重构助手
 //! tools: [bash, read, write, edit]
-//! model: grok-3
+//! model: ccode-3
 //! ---
 //! 你是一个代码重构专家...
 //! ```
@@ -35,6 +35,12 @@ pub struct Skill {
 /// Skill 注册表
 pub struct SkillRegistry {
     skills: HashMap<String, Skill>,
+}
+
+impl Default for SkillRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SkillRegistry {
@@ -93,8 +99,7 @@ impl SkillRegistry {
         let content = std::fs::read_to_string(path)?;
 
         // 分离 front-matter 和 prompt 模板
-        let (front_matter, prompt_template) = if content.starts_with("---") {
-            let rest = &content[3..];
+        let (front_matter, prompt_template) = if let Some(rest) = content.strip_prefix("---") {
             if let Some(end_idx) = rest.find("---") {
                 let fm = &rest[..end_idx];
                 let template = rest[end_idx + 3..].trim().to_string();

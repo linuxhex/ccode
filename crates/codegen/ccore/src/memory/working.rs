@@ -87,15 +87,15 @@ impl WorkingMemory {
     pub fn to_chat_messages(&self) -> Vec<(String, String)> {
         self.entries
             .iter()
-            .filter_map(|entry| match entry {
+            .map(|entry| match entry {
                 WorkingEntry::Hot { role, content, .. } => {
-                    Some((role.clone(), content.clone()))
+                    (role.clone(), content.clone())
                 }
                 WorkingEntry::Warm { summary, .. } => {
-                    Some(("system".into(), format!("[上下文摘要] {}", summary)))
+                    ("system".into(), format!("[上下文摘要] {}", summary))
                 }
                 WorkingEntry::Cold { placeholder, .. } => {
-                    Some(("system".into(), placeholder.clone()))
+                    ("system".into(), placeholder.clone())
                 }
             })
             .collect()

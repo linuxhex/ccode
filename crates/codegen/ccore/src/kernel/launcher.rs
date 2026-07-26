@@ -52,9 +52,12 @@ impl NodeLauncher {
 
     /// 获取 NodeContext（供各 Node 连接消息总线）
     fn node_context(&self) -> NodeContext {
+        let node_id = NodeId::new();
         NodeContext {
             router_addr: self.kernel_config.router_addr.clone(),
             pub_addr: self.kernel_config.pub_addr.clone(),
+            data_pub_addr: format!("ipc:///tmp/ccode-pub-{}", node_id),
+            data_rep_addr: None,
         }
     }
 
@@ -70,12 +73,10 @@ impl NodeLauncher {
     /// 4. Agent（主 Agent）- 核心循环
     /// 5. TUI（终端渲染）- 用户交互
     pub async fn spawn_initial_set(&mut self) -> anyhow::Result<Vec<NodeDescriptor>> {
-        let ctx = self.node_context();
-
         // 1. Sampler Node（使用 ccode_config 中的 Provider 配置）
+        let sampler_ctx = self.node_context();
         let sampler_id = NodeId::new();
         let sampler = SamplerNode::with_configs(sampler_id.clone(), &self.ccode_config.providers);
-        let sampler_ctx = ctx.clone();
         tokio::spawn(async move {
             if let Err(e) = run_node(sampler, sampler_ctx).await {
                 tracing::error!("Sampler Node 异常退出：{}", e);
@@ -89,9 +90,9 @@ impl NodeLauncher {
         tracing::info!("Sampler Node 已 spawn");
 
         // 2. State Node
+        let state_ctx = self.node_context();
         let state_id = NodeId::new();
         let state = StateNode::new(state_id.clone());
-        let state_ctx = ctx.clone();
         tokio::spawn(async move {
             if let Err(e) = run_node(state, state_ctx).await {
                 tracing::error!("State Node 异常退出：{}", e);
@@ -105,9 +106,9 @@ impl NodeLauncher {
         tracing::info!("State Node 已 spawn");
 
         // 3. Tool Node
+        let tool_ctx = self.node_context();
         let tool_id = NodeId::new();
         let tool = ToolNode::new(tool_id.clone());
-        let tool_ctx = ctx.clone();
         tokio::spawn(async move {
             if let Err(e) = run_node(tool, tool_ctx).await {
                 tracing::error!("Tool Node 异常退出：{}", e);
@@ -121,6 +122,7 @@ impl NodeLauncher {
         tracing::info!("Tool Node 已 spawn");
 
         // 4. Primary Agent
+        let agent_ctx = self.node_context();
         let agent_id = NodeId::new();
         let agent_config = AgentConfig {
             agent_type: AgentType::Primary,
@@ -132,7 +134,6 @@ impl NodeLauncher {
             tools: Vec::new(), // 将通过 tool/register 消息动态填充
         };
         let agent = AgentNode::new(agent_id.clone(), agent_config);
-        let agent_ctx = ctx.clone();
         tokio::spawn(async move {
             if let Err(e) = run_node(agent, agent_ctx).await {
                 tracing::error!("Agent Node 异常退出：{}", e);
@@ -146,9 +147,9 @@ impl NodeLauncher {
         tracing::info!("Primary Agent 已 spawn");
 
         // 5. TUI Node（使用专用交互循环）
+        let tui_ctx = self.node_context();
         let tui_id = NodeId::new();
         let tui = TUINode::new(tui_id.clone());
-        let tui_ctx = ctx;
         tokio::spawn(async move {
             if let Err(e) = crate::node::tui::run_tui_node(tui, tui_ctx).await {
                 tracing::error!("TUI Node 异常退出：{}", e);
@@ -170,7 +171,7 @@ impl NodeLauncher {
         &mut self,
         agent_type: AgentType,
         model: Option<String>,
-        task_description: String,
+        _task_description: String,
     ) -> NodeDescriptor {
         let ctx = self.node_context();
         let id = NodeId::new();

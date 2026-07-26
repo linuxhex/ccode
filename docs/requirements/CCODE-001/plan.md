@@ -1,6 +1,6 @@
 # ccode 改造实现计划
 
-**目标：** 将 grok-build 改造为名为 ccode 的终端 AI 编程代理，引入 ZeroMQ 消息总线、冷热分层记忆、多模型后端，实现进程级并行和多 Agent 编排
+**目标：** 将 ccode 改造为名为 ccode 的终端 AI 编程代理，引入 ZeroMQ 消息总线、冷热分层记忆、多模型后端，实现进程级并行和多 Agent 编排
 
 **架构：** 微内核 + ZeroMQ PUB/SUB + REQ/REP 消息总线，所有功能模块作为独立 Node 进程，子 Agent 通过消息总线与主 Agent 通信，核心逻辑编译为 libccore 动态库保护源码
 
@@ -12,13 +12,13 @@
 
 ### 阶段 A：最小闭环（MVP）—— 能对话
 - Kernel 消息总线
-- Agent Node（单 agent，复用 grok 的 prompt/工具逻辑）
-- Sampler Node（单 Provider：xAI Grok）
-- TUI Node（复用 grok 的 markdown 渲染）
+- Agent Node（单 agent，复用 ccode 的 prompt/工具逻辑）
+- Sampler Node（单 Provider：API Provider）
+- TUI Node（复用 ccode 的 markdown 渲染）
 - CLI 入口 + 动态库骨架
 
 ### 阶段 B：工具 + 状态 —— 能干活
-- Tool Node（复用 grok 全部工具）
+- Tool Node（复用 ccode 全部工具）
 - State Node（对话持久化 + 基础滑动窗口）
 
 ### 阶段 C：记忆系统 —— 能记住
@@ -85,7 +85,7 @@
 | crates/codegen/ccore/src/agent/doom_loop.rs | 新增 | Doom Loop 检测 |
 | crates/codegen/ccore/src/agent/plan_execute.rs | 新增 | Plan-Execute 循环 |
 | crates/codegen/ccore/src/agent/skills.rs | 新增 | Skill 系统 |
-| crates/codegen/ccore/src/tools/bridge.rs | 新增 | 工具桥接（调用 grok 工具实现） |
+| crates/codegen/ccore/src/tools/bridge.rs | 新增 | 工具桥接（调用 ccode 工具实现） |
 | crates/codegen/ccore/src/tools/checkpoint.rs | 新增 | Git Checkpoint |
 | crates/codegen/ccore/src/tools/verify.rs | 新增 | 自动验证循环 |
 | crates/codegen/ccore/src/ffi/mod.rs | 新增 | C FFI 导出接口 |
@@ -208,7 +208,7 @@ impl Kernel {
 
 ### 任务 5：实现 Sampler Node（单 Provider）
 
-**目标**：Sampler Node 接收采样请求，调用 xAI Grok API，流式返回
+**目标**：Sampler Node 接收采样请求，调用 API Provider API，流式返回
 
 **文件**：
 - 新增：`crates/codegen/ccore/src/node/sampler.rs`
@@ -218,7 +218,7 @@ impl Kernel {
 **实现要点**：
 - Provider trait：send_streaming / send / model_list
 - OpenAI Compat 实现：调用 /v1/chat/completions，SSE 流式解析
-- 从 grok 的 xai-grok-sampler 迁移采样逻辑
+- 从 ccode 的 ccode-sampler 迁移采样逻辑
 - Sampler Node 订阅 sampler/request topic，发布 sampler/{req_id}/stream
 - 流式返回：逐 token 发送 text channel，完成时发 usage
 
@@ -241,8 +241,8 @@ pub trait Provider: Send + Sync {
 
 **实现要点**：
 - Agent 循环：input → sampler/request → 解析 response → tool_call 或 output
-- 从 grok 的 xai-grok-agent 迁移 agent 逻辑
-- 复用 grok 的 prompt.md 模板
+- 从 ccode 的 ccode-agent 迁移 agent 逻辑
+- 复用 ccode 的 prompt.md 模板
 - 订阅：agent/{self.id}/input, agent/{self.id}/tool_result, sampler/{req_id}/stream
 - 发布：sampler/request, agent/{self.id}/tool_call, agent/{self.id}/output
 
@@ -262,13 +262,13 @@ impl AgentNode {
 
 ### 任务 7：实现 TUI Node
 
-**目标**：终端渲染 + 用户输入，复用 grok 的 ratatui + markdown 渲染
+**目标**：终端渲染 + 用户输入，复用 ccode 的 ratatui + markdown 渲染
 
 **文件**：
 - 新增：`crates/codegen/ccore/src/node/tui.rs`
 
 **实现要点**：
-- 从 grok 的 xai-grok-pager 迁移 TUI 渲染逻辑
+- 从 ccode 的 ccode-pager 迁移 TUI 渲染逻辑
 - 订阅 agent/{primary_id}/output 渲染 agent 回复
 - 用户输入发布到 agent/{primary_id}/input
 - 渲染工具调用状态（等待/执行中/完成）
@@ -314,7 +314,7 @@ fn main() {
 - 新增：`crates/codegen/ccore/src/config/memory.rs`
 
 **实现要点**：
-- 从 grok 的 xai-grok-config 迁移配置逻辑
+- 从 ccode 的 ccode-config 迁移配置逻辑
 - Provider 配置：api_key, base_url, adapter, models
 - 记忆配置：L1 容量、L2 路径、热度权重、滑动窗口策略
 - 权限配置：allow/deny 规则、yolo 模式
@@ -346,9 +346,9 @@ fn main() {
 - 新增：`crates/codegen/ccore/src/tools/bridge.rs`
 
 **实现要点**：
-- 从 grok 的 xai-grok-tools 迁移全部工具实现
+- 从 ccode 的 ccode-tools 迁移全部工具实现
 - Tool Node 订阅 agent/{any}/tool_call，发布 agent/{src}/tool_result
-- 工具桥接：将 grok 的 Tool trait 实现适配为 ccode 的工具调用协议
+- 工具桥接：将 ccode 的 Tool trait 实现适配为 ccode 的工具调用协议
 - 支持并行工具调用
 
 ---
