@@ -341,6 +341,30 @@ impl SessionActor {
                 continue;
             }
 
+            // === fileCache 命中检查：对 Read 工具，如果文件已缓存则跳过实际调用 ===
+            if call.function.name == "Read" || call.function.name == "read_file" {
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) {
+                    if let Some(path_str) = args.get("file_path")
+                        .or_else(|| args.get("path"))
+                        .and_then(|v| v.as_str())
+                    {
+                        let path = std::path::PathBuf::from(path_str);
+                        if let Some(cached_content) = file_cache.get(&path) {
+                            tracing::debug!(
+                                file_path = %path_str,
+                                "fileCache hit: returning cached content for Read tool"
+                            );
+                            self.chat_state_handle.push_tool_result(ConversationItem::tool_result(
+                                call.id.clone(),
+                                format!("[fileCache] Content served from cache ({} bytes):\n{}",
+                                    cached_content.len(), cached_content),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // === toolCallBudget 检查 ===
             if tool_call_budget == 0 {
                 tracing::warn!(

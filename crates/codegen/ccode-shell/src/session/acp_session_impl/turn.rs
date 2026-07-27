@@ -860,7 +860,7 @@ impl SessionActor {
         let doom_event_model = turn_model_id.clone();
         let turn_timer = std::time::Instant::now();
 
-        // Agent 主循环状态机：追踪循环阶段，使状态变迁可观测
+        // Agent 主循环状态机：追踪循环阶段，使状态变迁可观测、可中断
         let mut loop_sm = ccode_agent::loop_state::LoopStateMachine::new();
 
         let result = {
@@ -874,12 +874,14 @@ impl SessionActor {
                     self.set_goal_loop_active_resource(goal_loop_active).await;
                 }
 
-                // 状态机记录：当前处于 CallingLLM 阶段
-                tracing::debug!(
+                // 状态机驱动：根据当前状态决定动作
+                tracing::info!(
                     loop_state = ?loop_sm.state(),
                     turn_count = loop_sm.turn_count(),
                     tokens_used = loop_sm.tokens_used(),
-                    "agent loop: calling LLM"
+                    consecutive_failures = loop_sm.consecutive_failures(),
+                    elapsed_secs = loop_sm.elapsed().as_secs(),
+                    "agent loop: state machine status"
                 );
 
                 let round = self
@@ -891,15 +893,22 @@ impl SessionActor {
                     )
                     .await;
 
-                // 根据采样轮结果驱动状态机
+                // 根据采样轮结果驱动状态机转换
                 if let Ok(TurnOutcome::Completed { refusal, .. }) = &round {
                     if refusal.is_some() {
-                        // 模型拒绝
-                        let _ = loop_sm.transition(ccode_agent::loop_state::LoopEvent::LLMResponse {
-                            stop_reason: "end_turn".to_string(),
-                            token_used: 0,
-                            tool_calls: vec![],
-                        });
+                        // 模型拒绝：状态机转换到 Done
+                        let action = loop_sm.transition(
+                            ccode_agent::loop_state::LoopEvent::LLMResponse {
+                                stop_reason: "end_turn".to_string(),
+                                token_used: 0,
+                                tool_calls: vec![],
+                            },
+                        );
+                        tracing::info!(
+                            loop_action = ?action,
+                            loop_state = ?loop_sm.state(),
+                            "agent loop: model refusal, state machine transitioned to Done"
+                        );
                         self.auto_pause_goal_if_active_with_message(
                             crate::session::goal_tracker::GoalPauseReason::Infra,
                             "The model provider refused this goal round. Use /goal resume to retry."
@@ -907,10 +916,42 @@ impl SessionActor {
                         )
                         .await;
                     } else {
-                        // 正常完成一轮，状态机回到 CallingLLM 或 Done
-                        // process_conversation_turn_with_recovery 内部已处理工具调用
-                        // 外层状态机只需追踪"完成了多少轮"
+                        // 正常完成：状态机转换到 CallingLLM（准备下一轮）或 Done
+                        // 检查连续失败熔断
+                        if loop_sm.consecutive_failures() >= 3 {
+                            let action = loop_sm.transition(
+                                ccode_agent::loop_state::LoopEvent::ConsecutiveFailures {
+                                    count: loop_sm.consecutive_failures(),
+                                },
+                            );
+                            tracing::warn!(
+                                loop_action = ?action,
+                                "agent loop: consecutive failures circuit-break triggered by state machine"
+                            );
+                        } else {
+                            // 正常完成一轮，状态机记录 token 使用并回到 CallingLLM
+                            let action = loop_sm.transition(
+                                ccode_agent::loop_state::LoopEvent::LLMResponse {
+                                    stop_reason: "tool_use".to_string(),
+                                    token_used: 0,
+                                    tool_calls: vec![],
+                                },
+                            );
+                            tracing::debug!(
+                                loop_action = ?action,
+                                "agent loop: round completed, state machine ready for next round"
+                            );
+                        }
                     }
+                }
+
+                // 检查状态机是否已经结束
+                if let ccode_agent::loop_state::LoopState::Done { reason } = loop_sm.state() {
+                    tracing::info!(
+                        done_reason = ?reason,
+                        "agent loop: state machine reached Done state, ending turn"
+                    );
+                    break round;
                 }
 
                 if !matches!(round, Ok(TurnOutcome::Completed { .. })) {
