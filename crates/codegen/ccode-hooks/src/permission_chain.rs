@@ -56,16 +56,37 @@ pub enum DecisionSource {
 ///
 /// 预过滤拦截的请求不可重试，因为操作本身就是危险的。
 pub fn pre_filter(tool_name: &str, input: &serde_json::Value) -> Option<PermissionChainResult> {
-    // 危险命令黑名单
+    // 危险命令黑名单——无论 auto_mode 与否都直接阻断
     let dangerous_commands = [
         "rm -rf /",
         "rm -rf /*",
+        "rm -rf ~",
+        "rm -rf ~/*",
         "mkfs",
         "dd if=/dev/zero",
+        "dd if=/dev/urandom",
         ":(){ :|:& };:",
         "chmod -R 777 /",
+        "chmod 777 /",
+        "chown -R root /",
         "curl | sh",
+        "curl | bash",
         "wget | sh",
+        "wget | bash",
+        "shutdown",
+        "reboot",
+        "halt",
+        "poweroff",
+        "init 0",
+        "init 6",
+        "> /dev/sda",
+        "mv / /dev/null",
+        "rm -rf /var",
+        "rm -rf /etc",
+        "rm -rf /usr",
+        "systemctl stop",
+        "systemctl disable",
+        "service stop",
     ];
 
     // 检查危险 shell 命令
@@ -185,21 +206,43 @@ pub fn evaluate_permission_chain(
         _ => {} // auto 模式下的 Ask 走默认策略
     }
 
-    // 4. 默认策略：无匹配规则时
+    // 4. 默认策略：deny-first 语义
+    // auto_mode 下保留快速放行路径（仅对安全白名单内的操作）
+    // 非 auto_mode 下，不在安全白名单中的操作默认 Deny
     if auto_mode {
-        PermissionChainResult {
-            decision: PermissionDecision::Allow,
-            source: DecisionSource::Default,
-            alternatives: Vec::new(),
-            retryable: false,
+        // auto_mode：对已知安全操作快速放行，其余需确认
+        let safe_tools = [
+            "Read", "Grep", "Glob", "LS", "SearchCodebase", "WebSearch",
+            "WebFetch", "TodoWrite", "TodoRead", "TaskOutput",
+        ];
+        if safe_tools.contains(&tool_name) {
+            return PermissionChainResult {
+                decision: PermissionDecision::Allow,
+                source: DecisionSource::Default,
+                alternatives: Vec::new(),
+                retryable: false,
+            };
         }
-    } else {
+        // 非 safe_tools 的操作在 auto_mode 下也需要 Ask（而非直接 Allow）
         PermissionChainResult {
             decision: PermissionDecision::Ask {
-                reason: format!("未找到 {} 的权限规则，需要确认", tool_name),
+                reason: format!("auto 模式下 {} 操作需要确认", tool_name),
             },
             source: DecisionSource::Default,
             alternatives: Vec::new(),
+            retryable: true,
+        }
+    } else {
+        // 非 auto_mode：deny-first，不在规则中的操作默认 Deny
+        PermissionChainResult {
+            decision: PermissionDecision::Deny {
+                reason: format!("deny-first：未找到 {} 的允许规则，默认拒绝", tool_name),
+            },
+            source: DecisionSource::Default,
+            alternatives: vec![
+                "在 .ccode/permissions.json 中添加 allow 规则".to_string(),
+                "使用 /permissions 命令管理权限".to_string(),
+            ],
             retryable: true,
         }
     }

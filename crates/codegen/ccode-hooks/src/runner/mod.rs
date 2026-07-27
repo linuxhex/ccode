@@ -29,13 +29,29 @@ pub enum HookRunnerResult {
     Failed(String),
 }
 
+/// Additional output from a PreToolUse hook that the dispatcher uses for
+/// input rewriting and context injection.
+#[derive(Debug, Clone, Default)]
+pub struct HookRewriteInfo {
+    /// Rewritten tool input (the `updatedInput` field from hook stdout JSON).
+    pub updated_input: Option<serde_json::Value>,
+    /// Additional context string injected by the hook.
+    pub additional_context: Option<String>,
+}
+
 /// JSON from `PreToolUse` gate hooks:
-/// `{"decision": "allow" | "deny", "reason": "…"}`.
+/// `{"decision": "allow" | "deny", "reason": "…", "updatedInput": {...}, "additionalContext": "…"}`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct GateHookJson {
     pub decision: String,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Rewritten tool input from the hook (Claude Code `updatedInput`).
+    #[serde(default, rename = "updatedInput")]
+    pub updated_input: Option<serde_json::Value>,
+    /// Additional context to inject into the agent's next turn.
+    #[serde(default, rename = "additionalContext")]
+    pub additional_context: Option<String>,
 }
 
 /// Interpret a [`GateHookJson`] as a [`HookDecision`]. An unknown decision value
@@ -114,9 +130,9 @@ pub(crate) fn stop_json_to_outcome(
     })
 }
 
-/// Each runner returns the result, wall-clock duration, and optional HTTP
-/// metadata for enriched scrollback logging.
-pub type HookRunOutput = (HookRunnerResult, Duration, Option<HttpInfo>);
+/// Each runner returns the result, wall-clock duration, optional HTTP
+/// metadata, and any rewrite info extracted from hook stdout.
+pub type HookRunOutput = (HookRunnerResult, Duration, Option<HttpInfo>, HookRewriteInfo);
 
 pub async fn run_hook(
     spec: &HookSpec,
@@ -126,9 +142,12 @@ pub async fn run_hook(
 ) -> HookRunOutput {
     match spec.handler_type {
         crate::config::HandlerType::Command => {
-            let (result, elapsed) = command::run_command_hook(spec, envelope, ctx, mode).await;
-            (result, elapsed, None)
+            let (result, elapsed, rewrite) = command::run_command_hook(spec, envelope, ctx, mode).await;
+            (result, elapsed, None, rewrite)
         }
-        crate::config::HandlerType::Http => http::run_http_hook(spec, envelope, ctx, mode).await,
+        crate::config::HandlerType::Http => {
+            let (result, elapsed, http_info, _) = http::run_http_hook(spec, envelope, ctx, mode).await;
+            (result, elapsed, http_info, HookRewriteInfo::default())
+        }
     }
 }

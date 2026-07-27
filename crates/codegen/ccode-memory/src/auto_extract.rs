@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// 提取的知识条目
 ///
 /// 每条知识携带类型、内容、来源会话和提取时间，
-//! 便于后续整合时去重和溯源。
+/// 便于后续整合时去重和溯源。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeItem {
     /// 知识类型

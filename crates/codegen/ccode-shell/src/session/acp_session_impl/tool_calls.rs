@@ -291,6 +291,26 @@ impl SessionActor {
         let mut final_result: Option<ToolLoop> = None;
         let mut deferred_followups: Vec<ConversationItem> = Vec::new();
         let mut approved: Vec<PreparedToolCall> = Vec::new();
+
+        // === 循环保护机制 ===
+        /// Maximum consecutive tool execution failures before circuit-breaking.
+        const MAX_CONSECUTIVE_TOOL_FAILURES: usize = 3;
+        let mut consecutive_failures: usize = 0;
+
+        /// Loop detection: if the same (tool_name, input_hash) appears
+        /// consecutively this many times, circuit-break the loop.
+        const LOOP_DETECTION_WINDOW: usize = 5;
+        let mut recent_calls: std::collections::VecDeque<(String, u64)> =
+            std::collections::VecDeque::with_capacity(LOOP_DETECTION_WINDOW);
+
+        // === toolCallBudget: 单轮工具调用配额 ===
+        const DEFAULT_TOOL_CALL_BUDGET: u32 = 50;
+        let mut tool_call_budget: u32 = DEFAULT_TOOL_CALL_BUDGET;
+
+        // === fileCache: 已读文件内容缓存 ===
+        const FILE_CACHE_MAX_ENTRIES: usize = 50;
+        let mut file_cache: std::collections::HashMap<std::path::PathBuf, String> =
+            std::collections::HashMap::with_capacity(FILE_CACHE_MAX_ENTRIES);
         for call in tool_calls.into_iter() {
             if final_result.is_some() {
                 let message = match &final_result {
@@ -320,6 +340,56 @@ impl SessionActor {
                     .push_tool_result(ConversationItem::tool_result(call.id.clone(), message));
                 continue;
             }
+
+            // === toolCallBudget 检查 ===
+            if tool_call_budget == 0 {
+                tracing::warn!(
+                    tool_name = %call.function.name,
+                    "toolCallBudget exhausted, skipping tool call"
+                );
+                self.chat_state_handle.push_tool_result(ConversationItem::tool_result(
+                    call.id.clone(),
+                    "Tool call budget exhausted for this turn. No more tool calls will be executed.".to_string(),
+                ));
+                final_result = Some(ToolLoop::Continue);
+                continue;
+            }
+            tool_call_budget -= 1;
+
+            // === 循环检测 ===
+            {
+                let input_hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    call.function.arguments.hash(&mut hasher);
+                    hasher.finish()
+                };
+                let call_sig = (call.function.name.clone(), input_hash);
+                recent_calls.push_back(call_sig.clone());
+                if recent_calls.len() > LOOP_DETECTION_WINDOW {
+                    recent_calls.pop_front();
+                }
+                if recent_calls.len() >= LOOP_DETECTION_WINDOW
+                    && recent_calls.iter().all(|c| c == &call_sig)
+                {
+                    tracing::warn!(
+                        tool_name = %call.function.name,
+                        repeat_count = LOOP_DETECTION_WINDOW,
+                        "loop detected: same tool call repeated, circuit-breaking"
+                    );
+                    self.chat_state_handle.push_tool_result(ConversationItem::tool_result(
+                        call.id.clone(),
+                        format!(
+                            "Loop detected: the same tool call ({}) has been repeated {} times. \
+                             Please try a different approach or stop.",
+                            call.function.name, LOOP_DETECTION_WINDOW
+                        ),
+                    ));
+                    final_result = Some(ToolLoop::Continue);
+                    continue;
+                }
+            }
+
             self.emit_event(crate::session::events::Event::ToolStarted {
                 tool_name: call.function.name.clone(),
             });
@@ -532,11 +602,33 @@ impl SessionActor {
             };
             let tool_loop = match result {
                 Ok(tool_result) => {
+                    consecutive_failures = 0;
+
                     let effective_tool_name = tool_result
                         .effective_tool_name
                         .clone()
                         .or_else(|| prepared.dispatch_target_name.clone())
                         .unwrap_or_else(|| prepared.tool_name.clone());
+
+                    // === fileCache: 缓存 Read 工具的文件内容 ===
+                    if effective_tool_name == "Read" || effective_tool_name == "read_file" {
+                        if let Some(path_str) = prepared.parsed_args.get("file_path")
+                            .or_else(|| prepared.parsed_args.get("path"))
+                            .and_then(|v| v.as_str())
+                        {
+                            let path = std::path::PathBuf::from(path_str);
+                            if !file_cache.contains_key(&path) {
+                                if file_cache.len() >= FILE_CACHE_MAX_ENTRIES {
+                                    // LRU 淘汰：移除最早插入的 key
+                                    if let Some(oldest) = file_cache.keys().next().cloned() {
+                                        file_cache.remove(&oldest);
+                                    }
+                                }
+                                file_cache.insert(path, tool_result.prompt_text.clone());
+                            }
+                        }
+                    }
+
                     post_tool_use_result = self
                         .hook_event_active(ccode_hooks::event::HookEventName::PostToolUse)
                         .then(|| {
@@ -565,6 +657,26 @@ impl SessionActor {
                 }
                 Err(err) => {
                     let err: anyhow::Error = err.into();
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES {
+                        tracing::warn!(
+                            consecutive_failures,
+                            tool_name = %prepared.tool_name,
+                            "circuit-breaking: too many consecutive tool failures, ending turn"
+                        );
+                        // Push a message informing the model about the circuit break.
+                        let chat = ConversationItem::tool_result(
+                            prepared.call_id.clone(),
+                            format!(
+                                "⚠️ Circuit break: {consecutive_failures} consecutive tool failures. \
+                                The current turn will end to prevent infinite retry loops. \
+                                Last error: {err:#}"
+                            ),
+                        );
+                        self.chat_state_handle.push_user_message(chat);
+                        final_result = Some(ToolLoop::Continue);
+                        break;
+                    }
                     let err_followups = self
                         .handle_tool_error(
                             &prepared.tool_call_id,
@@ -835,7 +947,7 @@ impl SessionActor {
         );
         let parse_result = serde_json::from_str::<serde_json::Value>(args_str);
         let mut concatenated_json_count: usize = 0;
-        let raw_input = match &parse_result {
+        let mut raw_input = match &parse_result {
             Ok(value) => value.clone(),
             Err(e) => {
                 if let Some(objects) = crate::session::helpers::tool_input_parsing::try_extract_concatenated_json_objects(
@@ -883,7 +995,7 @@ impl SessionActor {
                 }
             }
         };
-        let tool_input = match self
+        let mut tool_input = match self
             .agent
             .borrow()
             .tool_bridge()
@@ -950,9 +1062,21 @@ impl SessionActor {
             let hook_registry_snapshot = self.hook_registry.borrow().clone();
             if let Some(registry) = hook_registry_snapshot {
                 let ctx = self.hook_run_ctx();
+
+                // Load permission rules from project root for pre-filter and rule engine.
+                let rules = self.tool_context.cwd.parent().map(|root| {
+                    ccode_hooks::permission_rules::PermissionRuleSet::load_from_dirs(root)
+                });
+
                 let pre_result =
-                    ccode_hooks::dispatcher::dispatch_pre_tool_use(&registry, &envelope, &ctx, None, false)
-                        .await;
+                    ccode_hooks::dispatcher::dispatch_pre_tool_use(
+                        &registry,
+                        &envelope,
+                        &ctx,
+                        rules.as_ref(),
+                        self.permissions.is_auto_mode(),
+                    )
+                    .await;
                 self.send_hook_execution(
                     "pre_tool_use",
                     Some(&resolved_tool_name),
@@ -966,6 +1090,46 @@ impl SessionActor {
                     &pre_result.results,
                 )
                 .await;
+
+                // Apply hook rewrite: if a hook provided updatedInput, replace tool input.
+                if let Some(ref updated) = pre_result.rewrite.updated_input {
+                    tracing::info!(
+                        tool_name = %resolved_tool_name,
+                        tool_use_id = %call.id,
+                        "hook rewrote tool input via updatedInput"
+                    );
+                    // Re-parse the updated input through the tool bridge.
+                    match self.agent.borrow().tool_bridge().try_parse(&call.function.name, updated.clone()).await {
+                        Ok(new_input) => {
+                            tool_input = new_input;
+                            raw_input = updated.clone();
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                tool_name = %resolved_tool_name,
+                                error = %e,
+                                "hook rewrite produced invalid tool input, keeping original"
+                            );
+                        }
+                    }
+                }
+
+                // Inject additional context from hooks into the conversation.
+                if let Some(ref additional_ctx) = pre_result.rewrite.additional_context {
+                    if !additional_ctx.is_empty() {
+                        tracing::info!(
+                            tool_name = %resolved_tool_name,
+                            context_len = additional_ctx.len(),
+                            "hook injected additionalContext"
+                        );
+                        // Inject as a user message so the model sees it in the next turn.
+                        let context_msg = format!("[Hook Context] {}", additional_ctx);
+                        self.chat_state_handle.push_user_message(
+                            ConversationItem::user(context_msg),
+                        );
+                    }
+                }
+
                 if let ccode_hooks::result::HookDecision::Deny { reason, hook_name } =
                     pre_result.decision
                 {
@@ -978,6 +1142,29 @@ impl SessionActor {
                             reason,
                         )
                         .await?));
+                }
+
+                // Honor permission chain deny from rule engine / pre-filter.
+                if let Some(chain_result) = pre_result.chain_result {
+                    if let ccode_hooks::permission_rules::PermissionDecision::Deny { reason } =
+                        chain_result.decision
+                    {
+                        tracing::info!(
+                            tool_name = %resolved_tool_name,
+                            decision_source = ?chain_result.source,
+                            reason = %reason,
+                            "permission chain denied tool call"
+                        );
+                        return Ok(Err(self
+                            .deny_tool(
+                                &call.id,
+                                &tool_call_id,
+                                resolved_tool_name.clone(),
+                                "permission_chain".to_string(),
+                                reason,
+                            )
+                            .await?));
+                    }
                 }
             }
             if let Some(denied) = self

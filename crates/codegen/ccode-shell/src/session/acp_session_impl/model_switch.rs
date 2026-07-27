@@ -119,6 +119,34 @@ impl SessionActor {
             });
         Ok(model_id)
     }
+
+    /// Lightweight model switch for skill execution.
+    ///
+    /// Reconstructs the current full `SamplerConfig` via
+    /// `reconstruct_full_config`, then overrides only `model` and
+    /// `reasoning_effort` before delegating to `handle_set_session_model`.
+    /// This avoids the caller needing to assemble a full `SamplerConfig`
+    /// from scratch.
+    pub(super) async fn handle_lightweight_model_switch(
+        &self,
+        model: String,
+        effort: Option<String>,
+    ) -> Result<acp::ModelId, acp::Error> {
+        let mut config = self.reconstruct_full_config().await;
+        config.model = model;
+        if let Some(e) = effort {
+            config.reasoning_effort = e.parse().ok();
+        }
+        self.handle_set_session_model(
+            config,
+            false,  // use_concise
+            true,   // apply_prompt_override
+            false,  // skip_prompt_rewrite
+            80,     // auto_compact_threshold_percent
+        )
+        .await
+    }
+
     /// Handle [`SessionCommand::RebuildAgentForDefinition`].
     ///
     /// Builds a fresh [`ccode_agent::Agent`] from the cached

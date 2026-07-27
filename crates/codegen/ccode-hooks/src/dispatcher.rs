@@ -1,11 +1,10 @@
 use crate::config::HookSpec;
 use crate::discovery::HookRegistry;
 use crate::event::{HookEventEnvelope, HookEventName};
-use crate::hook_rewrite::{self, HookRewriteResult};
 use crate::permission_chain::{self, PermissionChainResult};
 use crate::permission_rules::PermissionRuleSet;
 use crate::result::{HookDecision, HookRunResult};
-use crate::runner::{self, GateKind, HookRunnerResult, RunContext};
+use crate::runner::{self, GateKind, HookRewriteInfo, HookRunnerResult, RunContext};
 
 fn dispatch_span(event: HookEventName, hook_count: usize) -> tracing::Span {
     tracing::info_span!(
@@ -44,8 +43,9 @@ pub struct PreToolUseResult {
     pub decision: HookDecision,
     pub results: Vec<HookRunResult>,
     /// Hook rewrite result: updated tool input and/or additional context
-    /// injected by hooks.
-    pub rewrite: HookRewriteResult,
+    /// injected by hooks. Populated from the `updatedInput` and
+    /// `additionalContext` fields in hook stdout JSON.
+    pub rewrite: HookRewriteInfo,
     /// Full permission chain evaluation result (pre-filter → hook → rule
     /// engine → default). `None` when no `PermissionRuleSet` was provided.
     pub chain_result: Option<PermissionChainResult>,
@@ -87,7 +87,7 @@ pub async fn dispatch_pre_tool_use(
         return PreToolUseResult {
             decision: HookDecision::Allow,
             results: Vec::new(),
-            rewrite: HookRewriteResult::default(),
+            rewrite: HookRewriteInfo::default(),
             chain_result: None,
         };
     }
@@ -97,7 +97,7 @@ pub async fn dispatch_pre_tool_use(
 
     let match_value = envelope.payload.match_value().map(str::to_string);
     let mut run_results = Vec::new();
-    let mut combined_rewrite = HookRewriteResult::default();
+    let mut combined_rewrite = HookRewriteInfo::default();
     let mut hook_decision: Option<HookDecision> = None;
 
     // Extract tool_name and tool_input for permission chain evaluation
@@ -120,8 +120,30 @@ pub async fn dispatch_pre_tool_use(
         )
         .entered();
 
-        let (result, elapsed, http_info) =
+        let (result, elapsed, http_info, rewrite_info) =
             runner::run_hook(spec, envelope, ctx, GateKind::Tool).await;
+
+        // Accumulate rewrite information from all hooks.
+        if rewrite_info.updated_input.is_some() {
+            if combined_rewrite.updated_input.is_none() {
+                combined_rewrite.updated_input = rewrite_info.updated_input;
+            } else {
+                tracing::warn!(
+                    hook_name = %spec.name,
+                    "multiple hooks provided updatedInput; last one wins"
+                );
+                combined_rewrite.updated_input = rewrite_info.updated_input;
+            }
+        }
+        if let Some(ctx) = rewrite_info.additional_context {
+            // Append additional context from each hook.
+            if let Some(ref mut existing) = combined_rewrite.additional_context {
+                existing.push_str("\n");
+                existing.push_str(&ctx);
+            } else {
+                combined_rewrite.additional_context = Some(ctx);
+            }
+        }
 
         match result {
             HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => {
@@ -346,7 +368,7 @@ pub async fn dispatch_stop(
         )
         .entered();
 
-        let (result, elapsed, http_info) =
+        let (result, elapsed, http_info, _) =
             runner::run_hook(spec, envelope, ctx, GateKind::Stop).await;
 
         match result {
@@ -449,7 +471,7 @@ pub async fn dispatch_non_blocking(
         )
         .entered();
 
-        let (result, elapsed, http_info) =
+        let (result, elapsed, http_info, _) =
             runner::run_hook(spec, envelope, ctx, GateKind::Observe).await;
 
         match result {

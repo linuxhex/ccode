@@ -1,69 +1,38 @@
-# CCODE-002 编译/构建检查记录
+## 方案审查
 
-## 检查范围
+### 业务逻辑推演
+- 任务 1（显式状态机）：✓ 外层包装，不替代 process_conversation_turn_with_recovery
+- 任务 2（deny-first）：✓ 仅非 auto_mode 场景，危险命令全模式 Deny
+- 任务 3（技能模型切换）：✓ SamplingConfig 类型需确认转换路径
+- 任务 4（fileCache）：✓ 从工具输入 JSON 提取 file_path 作为 key
+- 任务 5（toolCallBudget）：✓ 先硬编码 50，后续可配置
+- 任务 6（循环检测）：✓ canonical JSON hash 保证稳定性
 
-| Crate | 路径 | 检查方式 |
-|-------|------|---------|
-| ccode-tracing | crates/common/ccode-tracing | cargo check |
-| ccode-hooks | crates/codegen/ccode-hooks | cargo check |
-| ccode-agent | crates/codegen/ccode-agent | cargo check |
-| ccode-tools | crates/codegen/ccode-tools | cargo check |
-| ccode-hub-sdk | crates/common/ccode-hub-sdk | cargo check |
-| ccode-workspace | crates/codegen/ccode-workspace | cargo check |
-| ccode-fsnotify | crates/codegen/ccode-fsnotify | cargo check |
+### 技术方案审查
+- 文件路径正确：✓
+- 依赖关系合理：✓
+- 接口契约一致：✓
+- 配置项完整：✓
 
-## 检查结果
+### 关键决策修正
+- [critical] 任务 1 状态机必须外层包装，不能替代 process_conversation_turn_with_recovery
+- [critical] 任务 2 deny-first 仅非 auto_mode，auto_mode 保留快速放行路径
+- [minor] 任务 3 SamplingConfig 类型转换需在代码中确认
 
-**最终状态：全部通过，零错误**
+---
 
-## 修复的问题
+## 推演收敛
 
-### 1. ccode-tracing 融合（同名冲突 → 合并为单一 crate）
+### Round 1
+- [critical] 循环检测中 `raw_input` 变量在代码位置未定义 → 改用 `call.function.arguments` 计算 hash
+- [critical] fileCache 中 `raw_input` 变量在 dispatch 结果处理时不可用 → 改用 `prepared.parsed_args`
+- [minor] `ReasoningEffort` 的 parse 实现 → 已确认 FromStr 存在
 
-**问题**：`crates/common/ccode-tracing` 和 `crates/codegen/ccode-tracing` 两个 crate 同名冲突。
+### Round 2
+- 所有变量作用域问题已修复
+- 业务流程完整，无遗漏
+- 技术方案可行，无新问题
 
-**融合方案**：
-- 将 codegen 版的 `timed.rs` 和 `timestamp.rs` 宏模块合并到 common 版
-- 删除 `crates/codegen/ccode-tracing` 目录
-- 统一 `ccode-tracing` 指向 `crates/common/ccode-tracing`
-- 更新 ccode-fsnotify、ccode-shell 从 `path = "../ccode-tracing"` 改为 `workspace = true`
-- 回退之前的 `ccode-otel-tracing` 重命名，所有代码恢复使用 `ccode_tracing::`
-
-**融合后的 ccode-tracing 包含**：
-- 原 common 版：dispatch、grpc_client、http_client、fastrace、tokio、timer、testing
-- 原 codegen 版：timed!、tprintln!、teprintln! 宏
-
-### 2. ccode-tools 编译错误（9 个）
-
-| 错误 | 文件 | 修复方式 |
-|------|------|----------|
-| E0753 doc comment | agent_whitelist.rs | `//!` → `//` |
-| E0277 trait bound | deps_search/output.rs | 为 DepsSearchOutput 实现 ToolOutput |
-| E0382 move value | deps_search/mod.rs:264 | registry_name.clone() |
-| E0277 trait bound | github_search/output.rs | 为 GitHubSearchOutput 实现 ToolOutput |
-| E0658 unstable feature | github_search/mod.rs:192 | 移除 .as_str() |
-| E0382 move value | deps_search/mod.rs:317 | c.name.clone() |
-| E0382 move value | deps_search/mod.rs:376 | obj.package.name.clone() |
-| E0061 wrong args | context_layer/mod.rs:137 | new_v7() → new_v4() |
-| E0308 type mismatch | deps_search/mod.rs:668 | Vec<&str> → Vec<String> |
-
-### 3. ccode-agent 编译错误（1 个）
-
-| 错误 | 文件 | 修复方式 |
-|------|------|----------|
-| E0382 move value | loop_state.rs:186 | message.clone() 先 clone 再 move |
-
-### 4. ccode-graph 预存拼写错误
-
-| 错误 | 文件 | 修复方式 |
-|------|------|----------|
-| E0432 unresolved import | index_manager.rs:47, builder.rs:15 | `ccode_pathss` → `ccode_paths` |
-
-### 5. rustfmt 格式修复
-
-- hook_rewrite.rs: 函数签名格式
-- loop_state.rs: 枚举变体格式 + 测试代码格式
-
-## 检查时间
-
-2026-07-26
+### 收敛结论
+- 轮次：2
+- 发现问题：2 个 critical（已修复），1 个 minor（已确认）

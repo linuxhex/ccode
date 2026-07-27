@@ -144,6 +144,7 @@ pub async fn run_http_hook(
             HookRunnerResult::Failed("http hook has no 'url' field".into()),
             start.elapsed(),
             None,
+            super::HookRewriteInfo::default(),
         );
     };
 
@@ -191,6 +192,7 @@ pub async fn run_http_hook(
             HookRunnerResult::Failed(format!("blocked by SSRF protection: {reason}")),
             start.elapsed(),
             Some(make_info(None, None)),
+            super::HookRewriteInfo::default(),
         );
     }
 
@@ -201,6 +203,7 @@ pub async fn run_http_hook(
                 HookRunnerResult::Failed(format!("failed to serialize envelope: {e}")),
                 start.elapsed(),
                 Some(make_info(None, None)),
+                super::HookRewriteInfo::default(),
             );
         }
     };
@@ -230,6 +233,7 @@ pub async fn run_http_hook(
                 HookRunnerResult::Failed(error),
                 elapsed,
                 Some(make_info(None, None)),
+                super::HookRewriteInfo::default(),
             );
         }
     };
@@ -249,12 +253,13 @@ pub async fn run_http_hook(
     if mode == GateKind::Observe {
         let http_info = Some(make_info(Some(status_code), None));
         if status.is_success() {
-            return (HookRunnerResult::Success, elapsed, http_info);
+            return (HookRunnerResult::Success, elapsed, http_info, super::HookRewriteInfo::default());
         }
         return (
             HookRunnerResult::Failed(format!("HTTP status {}", status)),
             elapsed,
             http_info,
+            super::HookRewriteInfo::default(),
         );
     }
 
@@ -270,6 +275,7 @@ pub async fn run_http_hook(
                 )),
                 elapsed,
                 Some(make_info(Some(status_code), None)),
+                super::HookRewriteInfo::default(),
             );
         }
     };
@@ -287,7 +293,7 @@ pub async fn run_http_hook(
         GateKind::Stop => parse_http_stop_result(&response_text, status, &spec.name),
         GateKind::Observe => HookRunnerResult::Success,
     };
-    (result, elapsed, http_info)
+    (result, elapsed, http_info, super::HookRewriteInfo::default())
 }
 
 /// HTTP analogue of `command::parse_stop_result`: a 2xx JSON body is parsed for

@@ -28,13 +28,14 @@ pub async fn run_command_hook(
     envelope: &HookEventEnvelope,
     ctx: &RunContext<'_>,
     mode: GateKind,
-) -> (HookRunnerResult, Duration) {
+) -> (HookRunnerResult, Duration, super::HookRewriteInfo) {
     let start = Instant::now();
 
     let Some(ref command) = spec.command else {
         return (
             HookRunnerResult::Failed("command hook has no 'command' field".into()),
             start.elapsed(),
+            super::HookRewriteInfo::default(),
         );
     };
     let command_str = command.to_string_lossy();
@@ -46,6 +47,7 @@ pub async fn run_command_hook(
             return (
                 HookRunnerResult::Failed(format!("failed to serialize envelope: {e}")),
                 elapsed,
+                super::HookRewriteInfo::default(),
             );
         }
     };
@@ -90,6 +92,7 @@ pub async fn run_command_hook(
                     "hook not executed: required env var(s) not set: {list}"
                 )),
                 elapsed,
+                super::HookRewriteInfo::default(),
             );
         }
         #[cfg(unix)]
@@ -116,6 +119,7 @@ pub async fn run_command_hook(
             return (
                 HookRunnerResult::Failed(format!("command not found: {}", command_path.display())),
                 elapsed,
+                super::HookRewriteInfo::default(),
             );
         }
         tokio::process::Command::new(command_path)
@@ -162,6 +166,7 @@ pub async fn run_command_hook(
             return (
                 HookRunnerResult::Failed(format!("failed to spawn command: {e}")),
                 elapsed,
+                super::HookRewriteInfo::default(),
             );
         }
     };
@@ -190,11 +195,13 @@ pub async fn run_command_hook(
             (
                 HookRunnerResult::Failed(format!("timed out after {}ms", spec.timeout_ms)),
                 elapsed,
+                super::HookRewriteInfo::default(),
             )
         }
         Ok(Err(e)) => (
             HookRunnerResult::Failed(format!("command execution failed: {e}")),
             elapsed,
+            super::HookRewriteInfo::default(),
         ),
         Ok(Ok(output)) => {
             let exit_code = output.status.code().unwrap_or(-1);
@@ -230,11 +237,12 @@ pub async fn run_command_hook(
             match mode {
                 GateKind::Observe => {
                     if exit_code == 0 {
-                        return (HookRunnerResult::Success, elapsed);
+                        return (HookRunnerResult::Success, elapsed, super::HookRewriteInfo::default());
                     }
                     (
                         HookRunnerResult::Failed(format!("exit code {exit_code}")),
                         elapsed,
+                        super::HookRewriteInfo::default(),
                     )
                 }
                 GateKind::Tool => parse_blocking_result(&stdout, exit_code, &spec.name, elapsed),
@@ -412,7 +420,7 @@ fn parse_blocking_result(
     exit_code: i32,
     hook_name: &str,
     elapsed: Duration,
-) -> (HookRunnerResult, Duration) {
+) -> (HookRunnerResult, Duration, super::HookRewriteInfo) {
     let json_decision = if !stdout.trim().is_empty() {
         serde_json::from_str::<GateHookJson>(stdout.trim()).ok()
     } else {
@@ -420,6 +428,10 @@ fn parse_blocking_result(
     };
 
     if let Some(output) = json_decision {
+        let rewrite = super::HookRewriteInfo {
+            updated_input: output.updated_input.clone(),
+            additional_context: output.additional_context.clone(),
+        };
         match gate_json_to_decision(output, hook_name) {
             Ok(HookDecision::Deny { reason, hook_name }) => {
                 // A JSON deny is honored on any exit code (fail-safe).
@@ -433,6 +445,7 @@ fn parse_blocking_result(
                 return (
                     HookRunnerResult::Decision(HookDecision::Deny { reason, hook_name }),
                     elapsed,
+                    rewrite,
                 );
             }
             Ok(HookDecision::Allow) => {
@@ -445,28 +458,30 @@ fn parse_blocking_result(
                         "JSON decision is 'allow' but exit code is 2 — denying (stdout is ignored on exit 2)"
                     );
                 } else {
-                    return (HookRunnerResult::Decision(HookDecision::Allow), elapsed);
+                    return (HookRunnerResult::Decision(HookDecision::Allow), elapsed, rewrite);
                 }
             }
             // Unknown decision value: failure so typos surface.
-            Err(err) => return (HookRunnerResult::Failed(err), elapsed),
+            Err(err) => return (HookRunnerResult::Failed(err), elapsed, rewrite),
         }
     }
 
     match exit_code {
-        0 => (HookRunnerResult::Decision(HookDecision::Allow), elapsed),
+        0 => (HookRunnerResult::Decision(HookDecision::Allow), elapsed, super::HookRewriteInfo::default()),
         GATE_EXIT_CODE => (
             HookRunnerResult::Decision(HookDecision::Deny {
                 reason: format!("denied by hook '{hook_name}' (exit code {GATE_EXIT_CODE})"),
                 hook_name: hook_name.to_string(),
             }),
             elapsed,
+            super::HookRewriteInfo::default(),
         ),
         _ => (
             HookRunnerResult::Failed(format!(
                 "hook '{hook_name}' failed with exit code {exit_code}"
             )),
             elapsed,
+            super::HookRewriteInfo::default(),
         ),
     }
 }
@@ -490,14 +505,14 @@ fn parse_stop_result(
     exit_code: i32,
     hook_name: &str,
     elapsed: Duration,
-) -> (HookRunnerResult, Duration) {
+) -> (HookRunnerResult, Duration, super::HookRewriteInfo) {
     let trimmed = stdout.trim();
     if !trimmed.is_empty() {
         match serde_json::from_str::<StopHookJson>(trimmed) {
             Ok(json) => {
                 return match stop_json_to_outcome(json, hook_name) {
-                    Ok(outcome) => (HookRunnerResult::Stop(outcome), elapsed),
-                    Err(err) => (HookRunnerResult::Failed(err), elapsed),
+                    Ok(outcome) => (HookRunnerResult::Stop(outcome), elapsed, super::HookRewriteInfo::default()),
+                    Err(err) => (HookRunnerResult::Failed(err), elapsed, super::HookRewriteInfo::default()),
                 };
             }
             Err(err) => {
@@ -514,7 +529,7 @@ fn parse_stop_result(
         }
     }
     match exit_code {
-        0 => (HookRunnerResult::Stop(StopHookOutcome::default()), elapsed),
+        0 => (HookRunnerResult::Stop(StopHookOutcome::default()), elapsed, super::HookRewriteInfo::default()),
         GATE_EXIT_CODE => {
             let feedback = stderr.trim();
             let block_reason = if feedback.is_empty() {
@@ -528,6 +543,7 @@ fn parse_stop_result(
                     ..Default::default()
                 }),
                 elapsed,
+                super::HookRewriteInfo::default(),
             )
         }
         _ => (
@@ -535,6 +551,7 @@ fn parse_stop_result(
                 "hook '{hook_name}' failed with exit code {exit_code}"
             )),
             elapsed,
+            super::HookRewriteInfo::default(),
         ),
     }
 }
@@ -573,14 +590,14 @@ mod tests {
 
     #[test]
     fn parse_json_decision() {
-        let (allow, _) =
+        let (allow, _, _) =
             parse_blocking_result(r#"{"decision":"allow"}"#, 0, "test", Duration::ZERO);
         assert!(matches!(
             allow,
             HookRunnerResult::Decision(HookDecision::Allow)
         ));
 
-        let (deny, _) = parse_blocking_result(
+        let (deny, _, _) = parse_blocking_result(
             r#"{"decision":"deny","reason":"bad command"}"#,
             2,
             "test",
@@ -593,7 +610,7 @@ mod tests {
             other => panic!("expected Deny, got {other:?}"),
         }
 
-        let (deny_no_reason, _) =
+        let (deny_no_reason, _, _) =
             parse_blocking_result(r#"{"decision":"deny"}"#, 2, "my-hook", Duration::ZERO);
         match deny_no_reason {
             HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => {
@@ -602,7 +619,7 @@ mod tests {
             other => panic!("expected Deny, got {other:?}"),
         }
 
-        let (unknown, _) =
+        let (unknown, _, _) =
             parse_blocking_result(r#"{"decision":"maybe"}"#, 0, "test", Duration::ZERO);
         assert!(matches!(unknown, HookRunnerResult::Failed(_)));
     }
@@ -612,7 +629,7 @@ mod tests {
         for (stdout, code, expect_allow) in
             [("", 0, true), ("not json at all", 0, true), ("", 2, false)]
         {
-            let (result, _) = parse_blocking_result(stdout, code, "test", Duration::ZERO);
+            let (result, _, _) = parse_blocking_result(stdout, code, "test", Duration::ZERO);
             if expect_allow {
                 assert!(matches!(
                     result,
@@ -625,13 +642,13 @@ mod tests {
                 ));
             }
         }
-        let (fail, _) = parse_blocking_result("", 1, "test", Duration::ZERO);
+        let (fail, _, _) = parse_blocking_result("", 1, "test", Duration::ZERO);
         assert!(matches!(fail, HookRunnerResult::Failed(_)));
     }
 
     #[test]
     fn json_decision_vs_exit_code() {
-        let (deny, _) = parse_blocking_result(
+        let (deny, _, _) = parse_blocking_result(
             r#"{"decision":"deny","reason":"nope"}"#,
             0,
             "test",
@@ -642,7 +659,7 @@ mod tests {
             HookRunnerResult::Decision(HookDecision::Deny { .. })
         ));
 
-        let (blocked, _) =
+        let (blocked, _, _) =
             parse_blocking_result(r#"{"decision":"allow"}"#, 2, "test", Duration::ZERO);
         assert!(matches!(
             blocked,
@@ -659,7 +676,7 @@ mod tests {
 
     #[test]
     fn stop_block_decision_with_reason() {
-        let (result, _) = parse_stop_result(
+        let (result, _, _) = parse_stop_result(
             r#"{"decision":"block","reason":"tests are failing"}"#,
             "",
             0,
@@ -675,7 +692,7 @@ mod tests {
             }
         );
 
-        let (result, _) =
+        let (result, _, _) =
             parse_stop_result(r#"{"decision":"block"}"#, "", 0, "my-stop", Duration::ZERO);
         assert_eq!(
             stop_outcome(result).block_reason.as_deref(),
@@ -685,14 +702,14 @@ mod tests {
 
     #[test]
     fn stop_exit_2_blocks_with_stderr() {
-        let (result, _) =
+        let (result, _, _) =
             parse_stop_result("", "run the test suite first\n", 2, "s", Duration::ZERO);
         assert_eq!(
             stop_outcome(result).block_reason.as_deref(),
             Some("run the test suite first")
         );
 
-        let (result, _) = parse_stop_result("", "", 2, "s", Duration::ZERO);
+        let (result, _, _) = parse_stop_result("", "", 2, "s", Duration::ZERO);
         assert_eq!(
             stop_outcome(result).block_reason.as_deref(),
             Some("Blocked by stop hook 's' (exit code 2)")
@@ -701,7 +718,7 @@ mod tests {
 
     #[test]
     fn stop_stdout_json_wins_over_exit_2() {
-        let (result, _) = parse_stop_result(
+        let (result, _, _) = parse_stop_result(
             r#"{"continue":false,"stopReason":"enough","hookSpecificOutput":{"additionalContext":"ctx"}}"#,
             "log noise\n",
             2,
@@ -718,7 +735,7 @@ mod tests {
         );
         assert_eq!(outcome.additional_context.as_deref(), Some("ctx"));
 
-        let (result, _) = parse_stop_result("log noise\n", "blocked", 2, "s", Duration::ZERO);
+        let (result, _, _) = parse_stop_result("log noise\n", "blocked", 2, "s", Duration::ZERO);
         assert_eq!(
             stop_outcome(result).block_reason.as_deref(),
             Some("blocked")
@@ -727,7 +744,7 @@ mod tests {
 
     #[test]
     fn stop_continue_false_prevents_continuation() {
-        let (result, _) = parse_stop_result(
+        let (result, _, _) = parse_stop_result(
             r#"{"continue":false,"stopReason":"budget exhausted"}"#,
             "",
             0,
@@ -744,13 +761,13 @@ mod tests {
                 ..Default::default()
             }
         );
-        let (result, _) = parse_stop_result(r#"{"continue":true}"#, "", 0, "s", Duration::ZERO);
+        let (result, _, _) = parse_stop_result(r#"{"continue":true}"#, "", 0, "s", Duration::ZERO);
         assert!(stop_outcome(result).is_empty());
     }
 
     #[test]
     fn stop_additional_context_captured() {
-        let (result, _) = parse_stop_result(
+        let (result, _, _) = parse_stop_result(
             r#"{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"run the test suite before finishing"}}"#,
             "",
             0,
@@ -769,27 +786,27 @@ mod tests {
 
     #[test]
     fn stop_allow_failure_and_unknown_decision() {
-        let (result, _) = parse_stop_result("", "", 0, "s", Duration::ZERO);
+        let (result, _, _) = parse_stop_result("", "", 0, "s", Duration::ZERO);
         assert!(stop_outcome(result).is_empty());
 
-        let (result, _) = parse_stop_result("all done!", "", 0, "s", Duration::ZERO);
+        let (result, _, _) = parse_stop_result("all done!", "", 0, "s", Duration::ZERO);
         assert!(stop_outcome(result).is_empty());
 
-        let (result, _) = parse_stop_result("", "boom", 1, "s", Duration::ZERO);
+        let (result, _, _) = parse_stop_result("", "boom", 1, "s", Duration::ZERO);
         assert!(matches!(result, HookRunnerResult::Failed(_)));
 
-        let (result, _) = parse_stop_result(r#"{"decision":"deny"}"#, "", 0, "s", Duration::ZERO);
+        let (result, _, _) = parse_stop_result(r#"{"decision":"deny"}"#, "", 0, "s", Duration::ZERO);
         assert!(matches!(result, HookRunnerResult::Failed(_)));
 
         // `approve` is accepted as a no-op (shared approve/block vocabulary).
-        let (result, _) =
+        let (result, _, _) =
             parse_stop_result(r#"{"decision":"approve"}"#, "", 0, "s", Duration::ZERO);
         assert!(stop_outcome(result).is_empty());
     }
 
     #[test]
     fn stop_output_captures_all_combined_signals() {
-        let (result, _) = parse_stop_result(
+        let (result, _, _) = parse_stop_result(
             r#"{"decision":"block","reason":"keep going","continue":false,"stopReason":"user said stop","hookSpecificOutput":{"additionalContext":"ctx"}}"#,
             "",
             0,
@@ -915,7 +932,7 @@ mod tests {
         spec.timeout_ms = 100;
         let envelope = make_envelope();
         let ctx = make_ctx();
-        let (result, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
+        let (result, _, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
         assert!(
             matches!(&result, HookRunnerResult::Failed(msg) if msg.contains("timed out")),
             "expected a timeout failure, got {result:?}"
@@ -941,7 +958,7 @@ mod tests {
         };
         let ctx = make_ctx();
         let run = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe);
-        let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+        let (result, _, _) = tokio::time::timeout(std::time::Duration::from_secs(10), run)
             .await
             .expect("hook must not deadlock on a large envelope");
         assert!(matches!(result, HookRunnerResult::Success));
@@ -973,7 +990,7 @@ mod tests {
         let envelope = make_envelope();
         let ctx = make_ctx();
 
-        let (result, _duration) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
+        let (result, _duration, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
         assert!(
             matches!(result, HookRunnerResult::Success),
@@ -988,7 +1005,7 @@ mod tests {
         let envelope = make_envelope();
         let ctx = make_ctx();
 
-        let (result, _duration) = run_command_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
+        let (result, _duration, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
 
         assert!(
             matches!(result, HookRunnerResult::Decision(HookDecision::Allow)),
@@ -1042,7 +1059,7 @@ mod tests {
 
         let envelope = make_envelope();
         let ctx = make_ctx();
-        let (result, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
+        let (result, _, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
         assert!(
             matches!(result, HookRunnerResult::Success),
@@ -1103,7 +1120,7 @@ mod tests {
             session_id: "test-session",
             workspace_root: &workspace,
         };
-        let (result, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
+        let (result, _, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
         assert!(
             matches!(result, HookRunnerResult::Success),
@@ -1229,7 +1246,7 @@ mod tests {
 
         let envelope = make_envelope();
         let ctx = make_ctx();
-        let (result, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
+        let (result, _, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
         match result {
             HookRunnerResult::Failed(reason) => {
@@ -1367,7 +1384,7 @@ mod tests {
 
         let envelope = make_envelope();
         let ctx = make_ctx();
-        let (result, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
+        let (result, _, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
         assert!(
             matches!(result, HookRunnerResult::Success),

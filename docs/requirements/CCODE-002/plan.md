@@ -1,10 +1,10 @@
-# 精华融合 + Skill-Model 切换实现计划
+# Claude Code 6 项优秀设计集成计划
 
-**目标：** 清理8个重复模块，将3个真正缺失能力（权限决策链、Hook改写、循环状态机）融入现有架构，实现技能调用时模型切换
+**目标：** 将 6 项 Claude Code 架构能力完整集成到 ccode，消除安全缺陷和功能缺口
 
-**架构：** 删除5个完全重复模块，精简3个模块为接口层集成到现有代码，新增技能模型切换桥接
+**架构：** 在现有 ccode-shell/ccode-hooks/ccode-agent 架构上增量集成，不破坏现有运行路径
 
-**技术栈：** Rust，基于现有 ccode-agent / ccode-hooks / ccode-shell / ccode-tools crate
+**技术栈：** Rust / Tokio async / ccode-sampler / ccode-hooks
 
 ---
 
@@ -12,214 +12,146 @@
 
 | 文件 | 操作 | 职责 |
 |------|------|------|
-| ccode-agent/src/fork.rs | 删除 | 与现有 AgentDefinition + 子代理系统完全重复 |
-| ccode-agent/src/coordinator.rs | 删除 | 与现有 subagent 编排系统完全重复 |
-| ccode-agent/src/task_state.rs | 删除 | 与现有 TaskTool + ccode-subagent 完全重复 |
-| ccode-agent/src/background.rs | 删除 | 与现有后台任务 + 通知系统完全重复 |
-| ccode-agent/src/prompt_template.rs | 删除 | 与现有 prompt::context 系统大部分重复 |
-| ccode-agent/src/loop_state.rs | 修改 | 精简为 LoopStateMachine 核心类型，集成到 agent 模块 |
-| ccode-hooks/src/permission_chain.rs | 修改 | 集成到现有 permission_rules，保留决策链和替代方案 |
-| ccode-hooks/src/hook_rewrite.rs | 修改 | 集成到现有 hook dispatcher，保留改写和上下文注入 |
-| ccode-agent/src/lib.rs | 修改 | 更新模块声明，移除已删除模块 |
-| ccode-hooks/src/lib.rs | 修改 | 确认模块声明正确 |
-| ccode-tools/src/implementations/ccode_build/skill/mod.rs | 修改 | 技能执行时传递 model 字段 |
-| ccode-agent/src/prompt/skills.rs | 修改 | 技能列表注入时包含 model 信息 |
+| crates/codegen/ccode-agent/src/loop_state.rs | 新增 | 显式状态机定义 |
+| crates/codegen/ccode-agent/src/lib.rs | 修改 | 导出 loop_state 模块 |
+| crates/codegen/ccode-shell/src/session/acp_session_impl/turn.rs | 修改 | 主循环改为状态机驱动 |
+| crates/codegen/ccode-hooks/src/permission_chain.rs | 修改 | deny-first 默认决策 |
+| crates/codegen/ccode-hooks/src/permission_rules.rs | 修改 | 安全白名单 + deny-first 规则 |
+| crates/codegen/ccode-hooks/src/pre_filter.rs | 修改 | 增强预过滤（危险命令列表） |
+| crates/codegen/ccode-shell/src/session/acp_session_impl/turn.rs | 修改 | 技能模型切换执行 |
+| crates/codegen/ccode-shell/src/session/acp_session_impl/model_switch.rs | 修改 | 新增简化模型切换入口 |
+| crates/codegen/ccode-shell/src/session/acp_session_impl/tool_calls.rs | 修改 | toolCallBudget + 循环检测 |
 
 ---
 
 ## 任务拆分
 
-### 任务 1：删除完全重复的5个模块
+### 任务 1：显式状态机 queryLoop（P0）
 
-**目标：** 移除与现有代码完全重复的 fork、coordinator、task_state、background、prompt_template
+**目标**：引入 LoopState 枚举驱动主循环，使状态可观测、可中断
 
-**文件：**
-- 删除：`ccode-agent/src/fork.rs`
-- 删除：`ccode-agent/src/coordinator.rs`
-- 删除：`ccode-agent/src/task_state.rs`
-- 删除：`ccode-agent/src/background.rs`
-- 删除：`ccode-agent/src/prompt_template.rs`
+**文件**：
+- 新增：`crates/codegen/ccode-agent/src/loop_state.rs`
+- 修改：`crates/codegen/ccode-agent/src/lib.rs`
+- 修改：`crates/codegen/ccode-shell/src/session/acp_session_impl/turn.rs`
 
-**实现要点：**
-- 删除5个文件
-- 在 `lib.rs` 中移除对应 mod 声明
-- 确认无其他代码引用这些模块的公开类型
-- 如果有引用，替换为现有代码中的等价类型
+**实现要点**：
+- 定义 `LoopState` 枚举：Idle → CallingLLM → ExecutingTools → WaitingPermission → Done
+- 定义 `LoopEvent` 枚举：LLMResponse、ToolExecutionCompleted、PermissionDenied、BudgetExhausted、UserCancelled
+- 定义 `LoopAction` 枚举：CallLLM、ExecuteTool、WaitForPermission、EndTurn、ContinueLoop
+- 实现 `LoopStateMachine::new()` + `transition(event) -> LoopAction`
+- 在 turn.rs 的 `loop {}` 中使用状态机驱动：每次迭代根据当前状态决定动作
+- **不改变现有的 process_conversation_turn_with_recovery 调用**，只在循环层包装状态机
 
-**核心逻辑示意：**
+**核心逻辑示意**：
 ```rust
-// lib.rs 修改：移除5个重复模块声明
-// 删除: pub mod fork;
-// 删除: pub mod coordinator;
-// 删除: pub mod task_state;
-// 删除: pub mod background;
-// 删除: pub mod prompt_template;
-```
-
----
-
-### 任务 2：精简 loop_state.rs 为核心状态机类型
-
-**目标：** 保留循环状态机的核心决策逻辑，移除与现有代码重复的辅助类型
-
-**文件：**
-- 修改：`ccode-agent/src/loop_state.rs`
-
-**修改内容：**
-- 保留 `AgentLoopStateMachine` 核心类型和 `transition` 方法
-- 保留 `LoopState`、`LoopEvent`、`LoopAction`、`FinishReason` 枚举
-- 保留 `ErrorKind` 及其退避策略
-- 保留 `TokenUsage` 及其 auto-compact 判定
-- 保留 `DeniedToolCall` 和 deny recovery
-- 移除 `ToolCall` 和 `ToolResult` 辅助类型（与 `ccode_sampling_types::ToolCall` 重复）
-- 修改 `LLMResponse` 事件：将 `tool_calls: Vec<ToolCall>` 改为 `tool_calls: Vec<(String, String, serde_json::Value)>`（id, name, input 三元组）
-- 修改 `ToolExecutionCompleted/Failed`：移除 `ToolResult`，直接用 `(tool_use_id, content)` 元组
-
-**核心逻辑示意：**
-```rust
-// LLMResponse 事件改用内联元组，不再依赖自定义 ToolCall
-LoopEvent::LLMResponse {
-    stop_reason: String,
-    tool_calls: Vec<(String, String, serde_json::Value)>,  // (id, name, input)
-    token_used: u64,
+pub enum LoopState { Idle, CallingLLM, ExecutingTools, WaitingPermission, Done }
+pub enum LoopAction { CallLLM, ExecuteTool { .. }, WaitForPermission, EndTurn }
+impl LoopStateMachine {
+    pub fn transition(&mut self, event: LoopEvent) -> LoopAction { ... }
 }
 ```
 
 ---
 
-### 任务 3：集成 permission_chain.rs 到现有权限系统
+### 任务 2：deny-first 权限模型（P0）
 
-**目标：** 将权限决策链作为现有 `permission_rules` 的增强层，而非独立系统
+**目标**：默认 Deny，逐层放行，危险命令自动阻断
 
-**文件：**
-- 修改：`ccode-hooks/src/permission_chain.rs`
+**文件**：
+- 修改：`crates/codegen/ccode-hooks/src/permission_chain.rs`
+- 修改：`crates/codegen/ccode-hooks/src/permission_rules.rs`
+- 修改：`crates/codegen/ccode-hooks/src/pre_filter.rs`
 
-**修改内容：**
-- 保留 `PermissionChainResult` 类型（含 decision、source、alternatives、retryable）
-- 保留 `DecisionSource` 枚举（PreFilter、Hook、RuleEngine、UserConfirmation、Default）
-- 保留 `pre_filter` 函数（危险命令预过滤）
-- 保留 `evaluate_permission_chain` 函数（完整决策链）
-- 修改 `evaluate_permission_chain` 使其接受 `&PermissionRuleSet` 引用（已与现有类型对齐）
-- 确认 `HookDecision` 引用来自 `crate::result`（已对齐）
-- 确认 `PermissionDecision` 引用来自 `crate::permission_rules`（已对齐）
+**实现要点**：
+- 在 `evaluate_permission_chain` 中，当规则匹配和 hook 都无决策时，默认返回 Deny（而非 Allow）
+- 新增 `PermissionRuleSet::default_deny_rules()` 生成默认 deny 规则
+- 增强 `pre_filter` 的危险命令列表：`rm -rf /`、`mkfs`、`dd if=`、`format`、`shutdown`、`reboot`
+- 在 `dispatch_pre_tool_use` 中，当 `chain_result` 无明确 Allow 时，应用 deny-first 语义
+- 保留 auto_mode 的快速放行路径（白名单内的 Read/Grep 等不受影响）
 
-**核心逻辑示意：**
+---
+
+### 任务 3：技能模型切换执行（P0）
+
+**目标**：技能声明 model/effort 后，运行时完成完整模型切换
+
+**文件**：
+- 修改：`crates/codegen/ccode-shell/src/session/acp_session_impl/turn.rs`
+- 修改：`crates/codegen/ccode-shell/src/session/acp_session_impl/model_switch.rs`
+
+**实现要点**：
+- 在 `model_switch.rs` 中新增 `handle_lightweight_model_switch(&self, model: String, effort: Option<String>)` 方法
+- 该方法从 `chat_state_handle.get_sampling_config()` 获取当前配置，只修改 model 和 reasoning_effort
+- 调用现有的 `handle_set_session_model` 完成完整切换
+- 在 turn.rs 中，技能加载后检查 model/effort，调用 `handle_lightweight_model_switch`
+
+**核心逻辑示意**：
 ```rust
-// 已对齐现有类型，无需额外适配
-pub fn evaluate_permission_chain(
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-    rules: &PermissionRuleSet,      // ← 来自 crate::permission_rules
-    hook_decision: Option<HookDecision>,  // ← 来自 crate::result
-    auto_mode: bool,
-) -> PermissionChainResult
+pub async fn handle_lightweight_model_switch(&self, model: String, effort: Option<String>) -> Result<(), acp::Error> {
+    let current = self.chat_state_handle.get_sampling_config();
+    let mut new_config = current.to_sampler_config();
+    new_config.model = model;
+    if let Some(e) = effort { new_config.reasoning_effort = parse_effort(&e); }
+    self.handle_set_session_model(new_config, false, true, false, 80).await?;
+    Ok(())
+}
 ```
 
 ---
 
-### 任务 4：集成 hook_rewrite.rs 到现有 hook 系统
+### 任务 4：7 层上下文压缩 — fileCache 层（P1）
 
-**目标：** 将 hook 改写逻辑作为 dispatcher 的增强，而非独立系统
+**目标**：避免重复读取消耗 Token，已读文件内容缓存
 
-**文件：**
-- 修改：`ccode-hooks/src/hook_rewrite.rs`
+**文件**：
+- 修改：`crates/codegen/ccode-shell/src/session/acp_session_impl/tool_calls.rs`
 
-**修改内容：**
-- 保留 `HookRewriteResult` 类型
-- 保留 `parse_hook_output` 函数
-- 保留 `inject_additional_context` 函数
-- 修改 `inject_additional_context` 的签名：`Vec<serde_json::Value>` → 更通用的 `&mut Vec<serde_json::Value>`（已如此，无需改动）
-- 确认与现有 `dispatcher` 的集成点：`parse_hook_output` 的输出应被 dispatcher 调用后传递给工具执行层
-
-**核心逻辑示意：**
-```rust
-// dispatcher 中调用 hook_rewrite 的示例流程：
-// let hook_output = run_hook(hook, event).await;
-// let rewrite = parse_hook_output(&hook_output);
-// if rewrite.blocked { return deny; }
-// if let Some(updated) = rewrite.updated_input { tool_input = updated; }
-// if let Some(ctx) = rewrite.additional_context { inject_additional_context(&mut context, &ctx); }
-```
+**实现要点**：
+- 在 `execute_tool_calls` 中，当工具是 Read/Bash（cat/head）且返回文件内容时，缓存到 `file_cache: HashMap<PathBuf, String>`
+- 后续同一 turn 中再次读取同一文件时，从缓存返回，不触发实际工具调用
+- 在 turn 开始时清空 file_cache
+- 缓存容量限制（如 50 个文件），超出时 LRU 淘汰
 
 ---
 
-### 任务 5：更新 ccode-agent/src/lib.rs 模块声明
+### 任务 5：toolCallBudget 配额扣减（P1）
 
-**目标：** 反映模块删除和保留
+**目标**：单轮工具调用配额，防止成本失控
 
-**文件：**
-- 修改：`ccode-agent/src/lib.rs`
+**文件**：
+- 修改：`crates/codegen/ccode-shell/src/session/acp_session_impl/tool_calls.rs`
 
-**修改内容：**
-- 移除已删除模块声明：`fork`、`coordinator`、`task_state`、`background`、`prompt_template`
-- 保留：`loop_state`
-- 保留其他所有现有模块
-
-**核心逻辑示意：**
-```rust
-// 移除5个重复模块，保留 loop_state
-pub mod agent;
-// pub mod background;     ← 删除
-pub mod builder;
-pub mod compaction;
-pub mod config;
-// pub mod coordinator;    ← 删除
-pub mod discovery;
-pub mod error;
-// pub mod fork;           ← 删除
-pub mod loop_state;         // ← 保留（精简后）
-pub mod plugins;
-pub mod prompt;
-// pub mod prompt_template; ← 删除
-pub mod repo;
-pub mod system_reminder;
-// pub mod task_state;     ← 删除
-pub mod timing;
-```
+**实现要点**：
+- 在 `execute_tool_calls` 中新增 `tool_call_budget: u32`（默认值从 session config 读取，如 50）
+- 每次工具执行前检查 budget > 0，否则跳过并推入 budget_exhausted 消息
+- 每次工具执行后 budget -= 1
+- budget 耗尽时设置 `final_result = Some(ToolLoop::Continue)`，让模型根据 budget_exhausted 消息决定下一步
 
 ---
 
-### 任务 6：实现技能调用时模型切换
+### 任务 6：循环检测（P1）
 
-**目标：** 技能声明 `model` 字段后，调用时自动切换会话模型，执行后恢复
+**目标**：检测连续相同工具调用循环，触发熔断
 
-**文件：**
-- 修改：`ccode-tools/src/implementations/ccode_build/skill/mod.rs`
-- 修改：`ccode-agent/src/prompt/skills.rs`
+**文件**：
+- 修改：`crates/codegen/ccode-shell/src/session/acp_session_impl/tool_calls.rs`
 
-**实现要点：**
-1. 技能列表注入时，在 system prompt 中标注技能的模型需求
-2. 技能执行前，如果 `skill.model.is_some()`，向 shell 发送 `SetSessionModel` 请求
-3. 技能执行后，发送 `SetSessionModel` 恢复原模型
-4. 模型不可用时，记录 warn 日志并继续使用当前模型执行
+**实现要点**：
+- 扩展现有 `consecutive_failures` 机制，新增 `recent_tool_calls: VecDeque<(String, u64)>` 记录最近 N 次工具调用的 (tool_name, input_hash)
+- 每次工具调用前，计算 (tool_name, input_hash) 并与最近 5 次比较
+- 如果连续 5 次完全相同，触发循环检测熔断
+- 熔断时推入 loop_detected 消息，建议模型换一种方式
 
-**核心逻辑示意：**
+**核心逻辑示意**：
 ```rust
-// 技能调用时的模型切换流程
-// if let Some(ref model_id) = skill.model {
-//     let original_model = session.model_id();
-//     session.set_model(model_id).await;  // 切换
-//     let result = execute_skill(skill).await;  // 执行
-//     session.set_model(&original_model).await;  // 恢复
-//     result
-// } else {
-//     execute_skill(skill).await  // 无需切换
-// }
+const LOOP_DETECTION_WINDOW: usize = 5;
+let mut recent_calls: VecDeque<(String, u64)> = VecDeque::with_capacity(LOOP_DETECTION_WINDOW);
+// 在每次工具调用前：
+let input_hash = calculate_hash(&raw_input);
+let call_sig = (resolved_tool_name.clone(), input_hash);
+recent_calls.push_back(call_sig.clone());
+if recent_calls.len() >= LOOP_DETECTION_WINDOW && recent_calls.iter().all(|c| c == &call_sig) {
+    // 循环检测熔断
+}
 ```
-
----
-
-### 任务 7：验证静态一致性
-
-**目标：** 确认所有改动后代码的静态一致性
-
-**文件：**
-- 全项目
-
-**实现要点：**
-- 检查所有删除模块的公开类型是否仍有引用
-- 检查 loop_state 精简后的类型是否自洽
-- 检查 permission_chain 和 hook_rewrite 与现有类型的对齐
-- 检查 lib.rs 声明与实际文件的一致性
-
-**注意：** 不做编译，仅静态分析

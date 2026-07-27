@@ -460,6 +460,32 @@ impl SessionActor {
                     &self.session_id_string(),
                 )
                 .await;
+
+                // Apply skill model/effort override via lightweight model switch.
+                if let Some(first_skill) = parsed_skills.first() {
+                    if first_skill.model.is_some() || first_skill.effort.is_some() {
+                        let target_model = first_skill.model.clone().unwrap_or_else(|| {
+                            self.chat_state_handle.get_sampling_config().model.clone()
+                        });
+                        tracing::info!(
+                            skill_name = %first_skill.name,
+                            model = %target_model,
+                            effort = ?first_skill.effort,
+                            "switching model for skill execution"
+                        );
+                        if let Err(e) = self.handle_lightweight_model_switch(
+                            target_model,
+                            first_skill.effort.clone(),
+                        ).await {
+                            tracing::warn!(
+                                skill_name = %first_skill.name,
+                                error = %e,
+                                "failed to switch model for skill, continuing with current model"
+                            );
+                        }
+                    }
+                }
+
                 original_blocks
             }
         };
@@ -833,6 +859,10 @@ impl SessionActor {
         let turn_model_id = self.current_model_id().await;
         let doom_event_model = turn_model_id.clone();
         let turn_timer = std::time::Instant::now();
+
+        // Agent 主循环状态机：追踪循环阶段，使状态变迁可观测
+        let mut loop_sm = ccode_agent::loop_state::LoopStateMachine::new();
+
         let result = {
             let mut round_trace = trace_gcs_config;
             let mut round_artifact = artifact_tracker;
@@ -843,6 +873,15 @@ impl SessionActor {
                         == Some(crate::session::goal_tracker::GoalStatus::Active);
                     self.set_goal_loop_active_resource(goal_loop_active).await;
                 }
+
+                // 状态机记录：当前处于 CallingLLM 阶段
+                tracing::debug!(
+                    loop_state = ?loop_sm.state(),
+                    turn_count = loop_sm.turn_count(),
+                    tokens_used = loop_sm.tokens_used(),
+                    "agent loop: calling LLM"
+                );
+
                 let round = self
                     .process_conversation_turn_with_recovery(
                         prompt_id,
@@ -851,6 +890,29 @@ impl SessionActor {
                         json_schema.clone(),
                     )
                     .await;
+
+                // 根据采样轮结果驱动状态机
+                if let Ok(TurnOutcome::Completed { refusal, .. }) = &round {
+                    if refusal.is_some() {
+                        // 模型拒绝
+                        let _ = loop_sm.transition(ccode_agent::loop_state::LoopEvent::LLMResponse {
+                            stop_reason: "end_turn".to_string(),
+                            token_used: 0,
+                            tool_calls: vec![],
+                        });
+                        self.auto_pause_goal_if_active_with_message(
+                            crate::session::goal_tracker::GoalPauseReason::Infra,
+                            "The model provider refused this goal round. Use /goal resume to retry."
+                                .to_string(),
+                        )
+                        .await;
+                    } else {
+                        // 正常完成一轮，状态机回到 CallingLLM 或 Done
+                        // process_conversation_turn_with_recovery 内部已处理工具调用
+                        // 外层状态机只需追踪"完成了多少轮"
+                    }
+                }
+
                 if !matches!(round, Ok(TurnOutcome::Completed { .. })) {
                     break round;
                 }
@@ -861,12 +923,6 @@ impl SessionActor {
                         ..
                     })
                 ) {
-                    self.auto_pause_goal_if_active_with_message(
-                        crate::session::goal_tracker::GoalPauseReason::Infra,
-                        "The model provider refused this goal round. Use /goal resume to retry."
-                            .to_string(),
-                    )
-                    .await;
                     break round;
                 }
                 let goal_active = laziness_injection_active(

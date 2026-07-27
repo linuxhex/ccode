@@ -1,118 +1,67 @@
-# 需求分析（ccode 视角）
+# 需求分析（ccode 视角）— 第二轮：6 项 Claude Code 优秀设计集成
 
 ## 需求概述
-> 精华融合：清理8个重复模块，将真正缺失的能力融入现有架构；实现 Skill-Model 切换功能
+> 将 Claude Code 的 6 项核心架构能力完整集成到 ccode，消除安全缺陷和功能缺口
 
 ## 业务背景
-- 前一轮创建了8个借鉴 Claude Code 架构的模块（loop_state、fork、coordinator、task_state、background、prompt_template、permission_chain、hook_rewrite）
-- 这些模块与现有代码存在严重类型重复（AgentDefinition、AgentType 等）
-- SkillInfo 已有 model 字段但未与运行时模型切换集成
-- 用户期望技能调用时可切换模型
+- 第一轮已完成：hook_rewrite 接入、permission_chain 接入、循环失败熔断、loop_state 删除、技能 model/effort 日志记录
+- 经推演模拟分析，仍有 6 项 Claude Code 优秀设计未集成，其中 3 项为 P0 级安全/核心能力缺口
 
-## 本服务职责
+## 6 项缺口分析
 
-| 职责项 | 说明 |
-|--------|------|
-| 清理重复模块 | 删除8个模块中与现有代码重复的类型和函数，保留真正缺失的能力 |
-| 融合缺失能力 | 将状态机、权限链、hook改写等真正缺失能力集成到现有代码 |
-| Skill-Model切换 | 技能声明模型 → 技能执行前切换会话模型 → 执行后恢复 |
+### 缺口 1：显式状态机 queryLoop（P0）
 
-## 重复问题分析
+**现状**：`handle_prompt` 中使用隐式 `loop {}` 驱动主循环，无统一状态对象，无可观测性
+**风险**：无法断点恢复、无法 deny recovery、无法跨轮次追踪状态
+**目标**：引入 `LoopState` 枚举 + `LoopAction` 驱动主循环，使状态变迁可观测、可中断、可恢复
 
-### 1. fork.rs — 严重重复
-| 重复类型 | 新模块定义 | 现有代码 |
-|----------|-----------|---------|
-| AgentDefinition | `fork::AgentDefinition`（5字段简化版） | `config::AgentDefinition`（30+字段完整版） |
-| AgentType | `fork::AgentType`（6变体枚举） | `config::BuiltinAgentName`（12变体枚举） |
-| load_agent_definitions | `fork::load_agent_definitions`（简单读文件） | `discovery::by_name_in_cwd_with_plugins`（完整发现机制） |
-| build_fork_prompt | `fork::build_fork_prompt` | `prompt::subagent_prompts`（已有完整子代理 prompt 系统） |
-| build_fresh_agent_prompt | `fork::build_fresh_agent_prompt` | 已由 TaskTool + agent definition 系统完全覆盖 |
+### 缺口 2：deny-first 权限模型（P0）
 
-**结论：fork.rs 完全重复，应删除**
+**现状**：`permission_chain` 已接入但默认 allow-first，YOLO 模式下 `rm -rf /` 等危险命令可直达执行
+**风险**：安全漏洞，危险命令绕过所有检查
+**目标**：实现 deny-first 语义——不在安全白名单中的操作默认 Deny，逐层放行
 
-### 2. coordinator.rs — 重复
-| 重复类型 | 新模块定义 | 现有代码 |
-|----------|-----------|---------|
-| Coordinator + AgentSlot | `coordinator::Coordinator` | 已由 `ccode-shell::subagent` 模块完全覆盖 |
-| AgentStatus | `coordinator::AgentStatus` | 已由 `ccode-subagent::types` 中的状态管理覆盖 |
-| TaskStatus | `coordinator::TaskStatus` | 已由 TaskTool 的 task 生命周期管理覆盖 |
+### 缺口 3：技能模型切换执行（P0）
 
-**结论：coordinator.rs 完全重复，应删除**
+**现状**：`SkillInfo.model/effort` 已读取但只记日志，未触发 `handle_set_session_model`
+**风险**：技能声明的模型切换功能形同虚设
+**目标**：技能加载后通过 `SetSessionModel` 命令完成完整模型切换
 
-### 3. task_state.rs — 重复
-| 重复类型 | 新模块定义 | 现有代码 |
-|----------|-----------|---------|
-| Task + TaskManager | `task_state::TaskManager` | 已由 `ccode-subagent::config` + TaskTool 系统覆盖 |
-| claim 机制 | `task_state::TaskManager::claim_task` | 已由 `ccode-subagent` 的原子性任务认领覆盖 |
+### 缺口 4：7 层上下文压缩管线（P1）
 
-**结论：task_state.rs 完全重复，应删除**
+**现状**：有 3 级压缩（Code/Intra/Inter），缺 fileCache 缓存和渐进裁剪
+**风险**：重复读取消耗 Token，大项目上下文利用率低
+**目标**：增加 fileCache 层，避免重复读文件；增加 compactSnapshots 断点快照
 
-### 4. background.rs — 重复
-| 重复类型 | 新模块定义 | 现有代码 |
-|----------|-----------|---------|
-| BackgroundAgent | `background::BackgroundAgent` | 已由 `ccode-tools::task` 的后台任务系统覆盖 |
-| NotificationManager | `background::NotificationManager` | 已由 `ccode-shell::extensions::notification` 覆盖 |
-| AgentNotification | `background::AgentNotification` | 已由 TaskTool 的 `get_task_output` 机制覆盖 |
+### 缺口 5：toolCallBudget 配额扣减（P1）
 
-**结论：background.rs 完全重复，应删除**
+**现状**：有 token 预算和 max_turns，但无单轮工具调用配额
+**风险**：模型可在单轮中无限调用工具，成本失控
+**目标**：引入 `tool_call_budget`，每次工具调用扣减配额，耗尽时结束 turn
 
-### 5. prompt_template.rs — 部分重复
-| 重复类型 | 新模块定义 | 现有代码 |
-|----------|-----------|---------|
-| PromptTemplateEngine | `prompt_template::PromptTemplateEngine` | 部分由 `prompt::context::PromptContext` 覆盖 |
-| AgentPromptDef | `prompt_template::AgentPromptDef` | 已由 `config::AgentDefinition` 覆盖 |
-| generate_agent_tool_prompt | 自定义 prompt 生成 | 已由 `prompt::context` 系统覆盖 |
+### 缺口 6：循环检测（P1）
 
-**结论：prompt_template.rs 大部分重复，应删除**
-
-### 6. permission_chain.rs — 真正缺失，需保留并集成
-- 现有 `permission_rules` 只有简单的 allow/deny/ask 三值决策
-- `permission_chain` 增加了：预过滤 → Hook拦截 → 规则引擎 → 用户确认 的完整链路
-- 增加了 `DecisionSource`（决策来源追踪）和 `alternatives`（替代方案）
-- 需要集成到现有权限系统中
-
-### 7. hook_rewrite.rs — 真正缺失，需保留并集成
-- 现有 hook 系统只有简单的 allow/deny 决策
-- `hook_rewrite` 增加了：工具输入改写（updatedInput）、上下文注入（additionalContext）、阻止（blocked）
-- 需要集成到现有 hook dispatcher 中
-
-### 8. loop_state.rs — 真正缺失，需保留并集成
-- 现有 agent 循环分散在 `ccode-shell/src/session/acp_session_impl/run_loop.rs`
-- `loop_state` 将循环建模为显式状态机，增加了：
-  - 错误重试退避策略（RateLimit 指数退避、ServerError 线性退避）
-  - auto-compact 触发判定
-  - deny recovery（权限被拒后调整策略）
-  - maxTurns 限制
-- 需要作为现有循环的状态管理组件集成
-
-## Skill-Model 切换需求
-
-### 现有基础
-1. `SkillInfo.model: Option<String>` — 技能可声明模型（frontmatter `model: xxx`）
-2. `ModelOverride` — 代理定义的模型覆盖（Inherit / Override）
-3. `model_switch.rs::apply()` — 会话级模型切换的完整实现
-4. `ccode-shell::subagent` — 子代理创建时可指定模型
-
-### 缺失环节
-1. 技能调用时读取 `skill.model` 字段
-2. 技能执行前切换会话模型
-3. 技能执行后恢复原模型
-4. 模型不可用时的降级处理
+**现状**：只检测"连续失败"，不检测"相同工具调用循环"
+**风险**：模型反复执行同一命令但不失败时（如反复读同一文件），不会熔断
+**目标**：检测连续 N 次相同（tool_name + 相似 input）的工具调用，触发熔断
 
 ## 改动范围
-- [ ] 删除：fork.rs（与现有代码完全重复）
-- [ ] 删除：coordinator.rs（与现有代码完全重复）
-- [ ] 删除：task_state.rs（与现有代码完全重复）
-- [ ] 删除：background.rs（与现有代码完全重复）
-- [ ] 删除：prompt_template.rs（与现有代码大部分重复）
-- [ ] 修改：permission_chain.rs → 集成到 ccode-hooks 权限系统
-- [ ] 修改：hook_rewrite.rs → 集成到 ccode-hooks dispatcher
-- [ ] 修改：loop_state.rs → 集成到 ccode-agent 状态管理
-- [ ] 新增：技能执行时模型切换逻辑
-- [ ] 修改：lib.rs 声明（删除已删除模块，保留融合后的模块）
+
+| 模块 | 缺口 | 操作 |
+|------|------|------|
+| ccode-agent | 显式状态机 | 新增 loop_state.rs |
+| ccode-shell/turn.rs | 显式状态机 | 重构主循环为状态机驱动 |
+| ccode-hooks/permission_chain.rs | deny-first | 修改默认决策为 Deny |
+| ccode-hooks/permission_rules.rs | deny-first | 新增安全白名单 |
+| ccode-hooks/pre_filter.rs | deny-first | 增强预过滤规则 |
+| ccode-shell/turn.rs | 技能模型切换 | 加载技能后调用模型切换 |
+| ccode-shell/model_switch.rs | 技能模型切换 | 新增简化模型切换入口 |
+| ccode-shell/compaction.rs | 7 层压缩 | 新增 fileCache 层 |
+| ccode-shell/tool_calls.rs | toolCallBudget | 新增配额扣减逻辑 |
+| ccode-shell/tool_calls.rs | 循环检测 | 扩展熔断检测逻辑 |
 
 ## 风险与注意
-- ⚠️ 删除模块前需确认无其他代码引用
-- ⚠️ permission_chain 和 hook_rewrite 集成时需保持与现有权限规则的兼容
-- ⚠️ loop_state 集成时需确认现有 run_loop 的状态流转与新状态机不冲突
-- 💡 Skill-Model 切换应作为可选功能，不影响不声明模型的技能
+- ⚠️ 显式状态机重构涉及主循环核心代码，需确保不破坏现有 happy path
+- ⚠️ deny-first 改为默认拒绝可能影响现有用户体验，需保留 auto_mode 快速放行
+- ⚠️ 技能模型切换需要完整 SamplerConfig，需通过现有 `chat_state_handle` 获取
+- 💡 7 层压缩和 toolCallBudget 为 P1，可在 P0 完成后独立迭代
