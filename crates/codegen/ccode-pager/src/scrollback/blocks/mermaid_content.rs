@@ -825,7 +825,7 @@ mod tests {
     // -- theme mapping + cache filename --------------------------------------
 
     #[test]
-    fn theme_is_dark_maps_ccode-day_to_light_only() {
+    fn theme_is_dark_maps_ccode_day_to_light_only() {
         assert!(
             !theme_is_dark(ThemeKind::CcodeDay),
             "CcodeDay is the light theme"

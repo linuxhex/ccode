@@ -2528,10 +2528,10 @@ mod tests {
 
     /// Pins CcodeNight via the shared test-lock guard; hold it for the whole
     /// test so a concurrent theme flip can't skew the compared highlighter walks.
-    fn pin_ccode-night_syntect() -> std::sync::MutexGuard<'static, ()> {
+    fn pin_ccode_night_syntect() -> std::sync::MutexGuard<'static, ()> {
         let guard = crate::theme::cache::pin_theme();
         assert!(
-            !Theme::ccode-night().diff_uses_line_fg(),
+            !Theme::ccode_night().diff_uses_line_fg(),
             "CcodeNight must be banded for Equal-line syntect path in render"
         );
         guard
@@ -2562,7 +2562,7 @@ mod tests {
     }
 
     /// Hunk-only: fresh highlighter, only the given lines in order (prod path).
-    /// Caller pins the theme via `pin_ccode-night_syntect` (lock is not reentrant).
+    /// Caller pins the theme via `pin_ccode_night_syntect` (lock is not reentrant).
     fn hunk_only_raw_styles(path: &Path, lines: &[&str]) -> Vec<SyntectSpans> {
         let syntect = get_syntect();
         let mut hl = syntect
@@ -2575,7 +2575,7 @@ mod tests {
     }
 
     /// Full-file then slice: silent HL from line 1, return styles for all lines.
-    /// Caller pins the theme via `pin_ccode-night_syntect` (lock is not reentrant).
+    /// Caller pins the theme via `pin_ccode_night_syntect` (lock is not reentrant).
     fn full_file_raw_styles(path: &Path, file_text: &str) -> Vec<SyntectSpans> {
         let syntect = get_syntect();
         let mut hl = syntect
@@ -2613,7 +2613,7 @@ class ProcessQueueItem(BaseModel):
     /// Control: self-contained Rust line → keyword RGB ≠ string RGB (raw syntect).
     #[test]
     fn syntax_highlight_splits_keyword_and_string_fg() {
-        let _guard = pin_ccode-night_syntect();
+        let _guard = pin_ccode_night_syntect();
         let path = Path::new("probe.rs");
         let lines = hunk_only_raw_styles(path, &["let x = \"hello\";"]);
         assert_eq!(lines.len(), 1);
@@ -2638,10 +2638,10 @@ class ProcessQueueItem(BaseModel):
     /// added line highlights. The two diff sides are highlighted independently.
     #[test]
     fn delete_side_multiline_string_does_not_leak_into_insert() {
-        let _guard = pin_ccode-night_syntect();
+        let _guard = pin_ccode_night_syntect();
         let path = Path::new("probe.py");
         let config = DiffRenderConfig::default();
-        let theme = Theme::ccode-night();
+        let theme = Theme::ccode_night();
 
         // Content spans of the added `def` line, given the removed line above it.
         let added_def = |removed: &str| -> Vec<(ratatui::style::Color, String)> {
@@ -2711,7 +2711,7 @@ class ProcessQueueItem(BaseModel):
     /// (and differ from cold hunk-only spill) after a mid-file closing `"""`.
     #[test]
     fn file_scoped_matches_full_file_on_field_line() {
-        let _guard = pin_ccode-night_syntect();
+        let _guard = pin_ccode_night_syntect();
         let path = Path::new("queue_item.py");
         let (file, hunk, field_ln) = fixture_python_close_hunk();
         let close_ln = hunk[0].ln;
@@ -2788,7 +2788,7 @@ class ProcessQueueItem(BaseModel):
     /// baked under another theme it must not paint — hunk-only output.
     #[test]
     fn file_scoped_stale_theme_falls_back_to_hunk_only() {
-        let _guard = pin_ccode-night_syntect();
+        let _guard = pin_ccode_night_syntect();
         let path = Path::new("queue_item.py");
         let (file, hunk, field_ln) = fixture_python_close_hunk();
         // Real computed map: paintable by construction (line keys and texts
@@ -2898,7 +2898,7 @@ class ProcessQueueItem(BaseModel):
     /// after a mid-file closing `"""`.
     #[test]
     fn triple_quote_hunk_only_differs_from_full_file_today() {
-        let _guard = pin_ccode-night_syntect();
+        let _guard = pin_ccode_night_syntect();
         let path = Path::new("queue_item.py");
         let (file, hunk, field_ln) = fixture_python_close_hunk();
         let close_ln = hunk[0].ln;

@@ -214,13 +214,13 @@ mod tests {
     }
 
     #[test]
-    fn to_theme_kind_dark_defaults_to_ccode-night() {
+    fn to_theme_kind_dark_defaults_to_ccode_night() {
         let result = to_theme_kind(SystemAppearance::Dark, None, None);
         assert_eq!(result, ThemeKind::CcodeNight);
     }
 
     #[test]
-    fn to_theme_kind_light_defaults_to_ccode-day() {
+    fn to_theme_kind_light_defaults_to_ccode_day() {
         let result = to_theme_kind(SystemAppearance::Light, None, None);
         assert_eq!(result, ThemeKind::CcodeDay);
     }

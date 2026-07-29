@@ -73,9 +73,9 @@ impl ThemeKind {
     /// Human-readable display name.
     pub fn display_name(self) -> &'static str {
         match self {
-            Self::CcodeNight => "ccode-night",
+            Self::CcodeNight => "ccode_night",
             Self::TokyoNight => "tokyonight",
-            Self::CcodeDay => "ccode-day",
+            Self::CcodeDay => "ccode_day",
             Self::RosePineMoon => "rosepine-moon",
             Self::OscuraMidnight => "oscura-midnight",
             Self::Auto => "auto",
@@ -105,9 +105,9 @@ impl ThemeKind {
         let lower = name.to_lowercase();
         match lower.as_str() {
             "auto" | "system" => Some(Self::Auto),
-            "ccode-night" | "ccode-night" | "dark" => Some(Self::CcodeNight),
+            "ccode-night" | "ccode_night" | "dark" => Some(Self::CcodeNight),
             "tokyonight" | "tokyo-night" | "tokyo" => Some(Self::TokyoNight),
-            "ccode-day" | "ccode-day" | "light" | "day" => Some(Self::CcodeDay),
+            "ccode-day" | "ccode_day" | "light" | "day" => Some(Self::CcodeDay),
             "rosepine" | "rose-pine" | "rosepine-moon" | "rose-pine-moon" => {
                 Some(Self::RosePineMoon)
             }
@@ -139,12 +139,12 @@ pub fn canonical_name(value: &str) -> Option<&'static str> {
 }
 
 /// Human-friendly display name for a canonical theme value (e.g.
-/// `"ccode-night"` → `"Ccode Night"`). Falls back to `value` verbatim.
+/// `"ccode_night"` → `"Ccode Night"`). Falls back to `value` verbatim.
 pub fn display_name_for_canonical(value: &str) -> &str {
     match value {
         "auto" => "Auto",
-        "ccode-night" => "Ccode Night",
-        "ccode-day" => "Ccode Day",
+        "ccode_night" => "Ccode Night",
+        "ccode_day" => "Ccode Day",
         "tokyonight" => "Tokyo Night",
         "rosepine-moon" => "Rose Pine Moon",
         other => other,
@@ -153,7 +153,7 @@ pub fn display_name_for_canonical(value: &str) -> &str {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::ccode-night()
+        Self::ccode_night()
     }
 }
 
@@ -270,14 +270,14 @@ impl Theme {
             return Self::terminal_default().quantized(level);
         }
         let base = match cache::current_kind() {
-            ThemeKind::CcodeNight => Self::ccode-night(),
+            ThemeKind::CcodeNight => Self::ccode_night(),
             ThemeKind::TokyoNight => Self::tokyonight(),
-            ThemeKind::CcodeDay => Self::ccode-day(),
+            ThemeKind::CcodeDay => Self::ccode_day(),
             ThemeKind::RosePineMoon => Self::rosepine_moon(),
             ThemeKind::OscuraMidnight => Self::oscura_midnight(),
             // Auto is resolved to a concrete theme before being stored;
             // if reached, fall back to CcodeNight.
-            ThemeKind::Auto => Self::ccode-night(),
+            ThemeKind::Auto => Self::ccode_night(),
         };
         // Sample polarity pre-quantization — post-quantize `bg_base` may
         // land on a named/indexed entry whose luminance is host-palette-
@@ -431,7 +431,7 @@ impl Theme {
     /// 2. **Semantic accents (running/error/success/etc.).** Naive
     ///    RGB-distance quantization collapses pastel theme hues onto
     ///    the gray ramp (audit: 18/27 fields became DarkGray or silver
-    ///    on ccode-night, erasing every state signal). We pin each
+    ///    on ccode_night, erasing every state signal). We pin each
     ///    semantic field to a hue-preserving ANSI16 slot, polarity-aware:
     ///    bright variants (`Light*`, idx 9–15) on a dark canvas; normal
     ///    variants (idx 1–7, ~50% luminance) on a light canvas. This
@@ -699,17 +699,17 @@ mod tests {
     #[test]
     fn is_dark_classifies_built_in_themes() {
         // Sanity-check the polarity sampler against the theme catalog.
-        assert!(Theme::ccode-night().is_dark());
+        assert!(Theme::ccode_night().is_dark());
         assert!(Theme::tokyonight().is_dark());
         assert!(Theme::rosepine_moon().is_dark());
         assert!(Theme::oscura_midnight().is_dark());
-        assert!(!Theme::ccode-day().is_dark());
+        assert!(!Theme::ccode_day().is_dark());
     }
 
     #[test]
     fn ansi16_overrides_dark_uses_bright_white_high_contrast() {
         use ratatui::style::Color;
-        let t = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t.bg_light, Color::DarkGray);
         assert_eq!(t.bg_highlight, Color::DarkGray);
         // Idle prompt border sits at `dim_fg` (DarkGray on dark canvas);
@@ -732,7 +732,7 @@ mod tests {
         // flips to silver — see
         // `ansi16_overrides_gray_hierarchy_collapses_to_two_slots`.
         use ratatui::style::Color;
-        let t = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t = Theme::ccode_day().ansi16_chrome_overrides(false);
         assert_eq!(t.bg_light, Color::Gray);
         assert_eq!(t.bg_highlight, Color::Gray);
         assert_eq!(t.prompt_border, Color::Gray);
@@ -749,7 +749,7 @@ mod tests {
         // (`bg_dark`, `md_code_bg`, `paste_bg`, `scrollbar_bg`) are
         // tested separately in
         // `ansi16_overrides_canvas_matching_surfaces_use_theme_polarity`.
-        let base = Theme::ccode-night();
+        let base = Theme::ccode_night();
         let t = base.ansi16_chrome_overrides(true);
         assert_eq!(t.bg_base, base.bg_base);
     }
@@ -762,12 +762,12 @@ mod tests {
         // pastel RGBs collapse onto silver/DarkGray and every state
         // signal becomes the same gray.
         use ratatui::style::Color;
-        let t_dark = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t_dark = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t_dark.accent_error, Color::LightRed);
         assert_eq!(t_dark.accent_success, Color::LightGreen);
         assert_eq!(t_dark.accent_running, Color::LightMagenta);
 
-        let t_light = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t_light = Theme::ccode_day().ansi16_chrome_overrides(false);
         assert_eq!(t_light.accent_error, Color::Red);
         assert_eq!(t_light.accent_success, Color::Green);
         assert_eq!(t_light.accent_running, Color::Magenta);
@@ -781,7 +781,7 @@ mod tests {
         // onto it together — they live in different surfaces so the
         // collision doesn't cause confusion.
         use ratatui::style::Color;
-        let t = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t.accent_assistant, Color::LightMagenta);
         assert_eq!(t.accent_thinking, Color::LightMagenta);
         assert_eq!(t.accent_running, Color::LightMagenta);
@@ -796,7 +796,7 @@ mod tests {
         // semantic is more important than per-accent differentiation
         // that the palette cannot represent.
         use ratatui::style::Color;
-        let t_dark = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t_dark = Theme::ccode_night().ansi16_chrome_overrides(true);
         for f in [
             t_dark.command,
             t_dark.warning,
@@ -806,7 +806,7 @@ mod tests {
             assert_eq!(f, Color::LightYellow);
         }
 
-        let t_light = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t_light = Theme::ccode_day().ansi16_chrome_overrides(false);
         for f in [
             t_light.command,
             t_light.warning,
@@ -824,7 +824,7 @@ mod tests {
         // from the magenta `accent_running` used for subagents) also
         // lives here.
         use ratatui::style::Color;
-        let t = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t.accent_feedback, Color::LightCyan);
         assert_eq!(t.accent_model, Color::LightCyan);
         assert_eq!(t.running, Color::LightCyan);
@@ -835,12 +835,12 @@ mod tests {
         // System messages, skill invocations, and fuzzy-search matches
         // all carry the same blue family in truecolor.
         use ratatui::style::Color;
-        let t_dark = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t_dark = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t_dark.accent_system, Color::LightBlue);
         assert_eq!(t_dark.accent_skill, Color::LightBlue);
         assert_eq!(t_dark.fuzzy_accent, Color::LightBlue);
 
-        let t_light = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t_light = Theme::ccode_day().ansi16_chrome_overrides(false);
         assert_eq!(t_light.accent_system, Color::Blue);
         assert_eq!(t_light.accent_skill, Color::Blue);
         assert_eq!(t_light.fuzzy_accent, Color::Blue);
@@ -852,11 +852,11 @@ mod tests {
         // ANSI16 (the subtle pastel bg tints don't survive quantization).
         // Pin fg to red / green so deletes and inserts stay legible.
         use ratatui::style::Color;
-        let t_dark = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t_dark = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t_dark.diff_delete_fg, Color::LightRed);
         assert_eq!(t_dark.diff_insert_fg, Color::LightGreen);
 
-        let t_light = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t_light = Theme::ccode_day().ansi16_chrome_overrides(false);
         assert_eq!(t_light.diff_delete_fg, Color::Red);
         assert_eq!(t_light.diff_insert_fg, Color::Green);
     }
@@ -869,10 +869,10 @@ mod tests {
         //   - dark canvas → Color::White
         //   - light canvas → Color::Black
         use ratatui::style::Color;
-        let t_dark = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t_dark = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t_dark.accent_user, Color::White);
 
-        let t_light = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t_light = Theme::ccode_day().ansi16_chrome_overrides(false);
         assert_eq!(t_light.accent_user, Color::Black);
     }
 
@@ -881,7 +881,7 @@ mod tests {
         // Without these pins, every dark RGB bg quantizes to Color::Black
         // and the hover/visual/highlight bands collapse onto the canvas.
         use ratatui::style::Color;
-        let t = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t.bg_hover, Color::DarkGray);
         assert_eq!(t.bg_visual, Color::DarkGray);
     }
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn ansi16_overrides_extended_light_pins_elevated_bg_to_gray() {
         use ratatui::style::Color;
-        let t = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t = Theme::ccode_day().ansi16_chrome_overrides(false);
         assert_eq!(t.bg_hover, Color::Gray);
         assert_eq!(t.bg_visual, Color::Gray);
     }
@@ -903,13 +903,13 @@ mod tests {
         // the theme disagrees with the terminal profile (e.g. CcodeNight
         // running on a white-canvas terminal).
         use ratatui::style::Color;
-        let t_dark = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t_dark = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t_dark.bg_dark, Color::Black);
         assert_eq!(t_dark.md_code_bg, Color::Black);
         assert_eq!(t_dark.paste_bg, Color::Black);
         assert_eq!(t_dark.scrollbar_bg, Color::Black);
 
-        let t_light = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t_light = Theme::ccode_day().ansi16_chrome_overrides(false);
         assert_eq!(t_light.bg_dark, Color::White);
         assert_eq!(t_light.md_code_bg, Color::White);
         assert_eq!(t_light.paste_bg, Color::White);
@@ -928,14 +928,14 @@ mod tests {
         // both take `DarkGray`. The selection-vs-active distinction
         // survives in both polarities via `prompt_border_active`.
         use ratatui::style::Color;
-        let t_dark = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t_dark = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t_dark.hover_border, Color::DarkGray);
         assert_eq!(t_dark.prompt_border, Color::DarkGray);
         assert_eq!(t_dark.selection_border, Color::Gray);
         assert_eq!(t_dark.prompt_border_active, Color::White);
         assert_ne!(t_dark.selection_border, t_dark.prompt_border_active);
 
-        let t_light = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t_light = Theme::ccode_day().ansi16_chrome_overrides(false);
         assert_eq!(t_light.hover_border, Color::DarkGray);
         assert_eq!(t_light.prompt_border, Color::Gray);
         assert_eq!(t_light.selection_border, Color::DarkGray);
@@ -948,11 +948,11 @@ mod tests {
         // scrollbar_fg must not equal scrollbar_bg or the thumb is
         // invisible against the canvas-pinned track.
         use ratatui::style::Color;
-        let t_dark = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t_dark = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t_dark.scrollbar_fg, Color::Gray);
         assert_ne!(t_dark.scrollbar_fg, t_dark.scrollbar_bg);
 
-        let t_light = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t_light = Theme::ccode_day().ansi16_chrome_overrides(false);
         assert_eq!(t_light.scrollbar_fg, Color::DarkGray);
         assert_ne!(t_light.scrollbar_fg, t_light.scrollbar_bg);
     }
@@ -980,8 +980,8 @@ mod tests {
         };
         for &kind in ThemeKind::ALL {
             let theme = match kind {
-                ThemeKind::CcodeNight => Theme::ccode-night(),
-                ThemeKind::CcodeDay => Theme::ccode-day(),
+                ThemeKind::CcodeNight => Theme::ccode_night(),
+                ThemeKind::CcodeDay => Theme::ccode_day(),
                 ThemeKind::TokyoNight => Theme::tokyonight(),
                 ThemeKind::RosePineMoon => Theme::rosepine_moon(),
                 ThemeKind::OscuraMidnight => Theme::oscura_midnight(),
@@ -1007,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn ansi16_quantize_without_override_collapses_ccode-night_backgrounds() {
+    fn ansi16_quantize_without_override_collapses_ccode_night_backgrounds() {
         // Regression-ratchet for the override gate in `Theme::current`:
         // naive `Basic` quantization maps every dark CcodeNight bg field
         // to `Color::Black`, erasing the hierarchy. This test exists to
@@ -1016,7 +1016,7 @@ mod tests {
         // an ANSI24/ANSI32 level), this test will start failing and the
         // override scope should be revisited.
         use ratatui::style::Color;
-        let q = Theme::ccode-night().quantized(color_support::ColorLevel::Basic);
+        let q = Theme::ccode_night().quantized(color_support::ColorLevel::Basic);
         for (name, color) in [
             ("bg_base", q.bg_base),
             ("bg_light", q.bg_light),
@@ -1052,13 +1052,13 @@ mod tests {
         // brighter slot keeps secondary text legible while still
         // separating "dim" from "muted".
         use ratatui::style::Color;
-        let t_dark = Theme::ccode-night().ansi16_chrome_overrides(true);
+        let t_dark = Theme::ccode_night().ansi16_chrome_overrides(true);
         assert_eq!(t_dark.gray, Color::Gray);
         assert_eq!(t_dark.gray_bright, Color::Gray);
         assert_eq!(t_dark.gray_dim, Color::DarkGray);
         assert_ne!(t_dark.gray, t_dark.gray_dim);
 
-        let t_light = Theme::ccode-day().ansi16_chrome_overrides(false);
+        let t_light = Theme::ccode_day().ansi16_chrome_overrides(false);
         assert_eq!(t_light.gray, Color::DarkGray);
         assert_eq!(t_light.gray_bright, Color::DarkGray);
         assert_eq!(t_light.gray_dim, Color::Gray);
@@ -1111,11 +1111,11 @@ mod tests {
     #[test]
     fn from_name_concrete_variants_still_work() {
         assert_eq!(
-            ThemeKind::from_name("ccode-night"),
+            ThemeKind::from_name("ccode_night"),
             Some(ThemeKind::CcodeNight)
         );
         assert_eq!(ThemeKind::from_name("dark"), Some(ThemeKind::CcodeNight));
-        assert_eq!(ThemeKind::from_name("ccode-day"), Some(ThemeKind::CcodeDay));
+        assert_eq!(ThemeKind::from_name("ccode_day"), Some(ThemeKind::CcodeDay));
         assert_eq!(ThemeKind::from_name("light"), Some(ThemeKind::CcodeDay));
         assert_eq!(
             ThemeKind::from_name("tokyonight"),
@@ -1142,14 +1142,14 @@ mod tests {
         let cases = [
             ("auto", ThemeKind::Auto),
             ("system", ThemeKind::Auto),
-            ("ccode-night", ThemeKind::CcodeNight),
-            ("ccode-night", ThemeKind::CcodeNight),
+            ("ccode_night", ThemeKind::CcodeNight),
+            ("ccode_night", ThemeKind::CcodeNight),
             ("dark", ThemeKind::CcodeNight),
             ("tokyonight", ThemeKind::TokyoNight),
             ("tokyo-night", ThemeKind::TokyoNight),
             ("tokyo", ThemeKind::TokyoNight),
-            ("ccode-day", ThemeKind::CcodeDay),
-            ("ccode-day", ThemeKind::CcodeDay),
+            ("ccode_day", ThemeKind::CcodeDay),
+            ("ccode_day", ThemeKind::CcodeDay),
             ("light", ThemeKind::CcodeDay),
             ("day", ThemeKind::CcodeDay),
             ("rosepine", ThemeKind::RosePineMoon),

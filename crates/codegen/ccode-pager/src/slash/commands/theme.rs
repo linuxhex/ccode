@@ -253,14 +253,14 @@ mod tests {
                 screen_mode: crate::app::ScreenMode::Fullscreen,
             };
             let items = cmd.suggest_args(&ctx, "").expect("should return items");
-            let ccode-night = items
+            let ccode_night = items
                 .iter()
                 .find(|i| i.insert_text == "ccode-night")
                 .expect("ccode-night should be in list");
             assert!(
-                ccode-night.description.contains("(active)"),
+                ccode_night.description.contains("(active)"),
                 "explicit theme should show (active), got: {}",
-                ccode-night.description
+                ccode_night.description
             );
         });
     }

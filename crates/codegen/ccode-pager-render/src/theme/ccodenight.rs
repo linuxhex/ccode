@@ -64,7 +64,7 @@ impl Theme {
     ///
     /// Colors are defined in RGB. Call [`Theme::quantized`] to downgrade
     /// them to the terminal's supported color level before rendering.
-    pub const fn ccode-night() -> Self {
+    pub const fn ccode_night() -> Self {
         Self {
             bg_base: BG_STORM,
             bg_light: BG_HIGHLIGHT,
@@ -157,8 +157,8 @@ mod tests {
 
     #[test]
     #[ignore = "known broken: expected accent values drift from runtime theme"]
-    fn test_ccode-night_theme() {
-        let theme = Theme::ccode-night();
+    fn test_ccode_night_theme() {
+        let theme = Theme::ccode_night();
         assert!(matches!(theme.bg_base, Color::Rgb(20, 20, 20)));
         assert!(matches!(theme.accent_user, Color::Rgb(225, 225, 225)));
         assert!(matches!(theme.text_primary, Color::Rgb(225, 225, 225)));

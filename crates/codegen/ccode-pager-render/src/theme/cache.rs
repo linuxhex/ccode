@@ -374,7 +374,7 @@ mod tests {
             assert_eq!(theme.accent_user, native.accent_user);
             assert_ne!(
                 theme.text_primary,
-                super::super::Theme::ccode-day().text_primary,
+                super::super::Theme::ccode_day().text_primary,
                 "must not serve the cached (CcodeDay) theme"
             );
         });
@@ -412,7 +412,7 @@ mod tests {
             set_terminal_native_lock(true);
             assert!(color_support::detect() <= color_support::ColorLevel::Basic);
             for input in [
-                Color::Rgb(0x26, 0x26, 0x26), // ccode-day text_primary
+                Color::Rgb(0x26, 0x26, 0x26), // ccode_day text_primary
                 Color::Rgb(122, 162, 247),
                 Color::Indexed(141),
             ] {
@@ -477,7 +477,7 @@ mod tests {
     // -- resolve_auto --------------------------------------------------------
 
     #[test]
-    fn resolve_auto_dark_system_returns_ccode-night() {
+    fn resolve_auto_dark_system_returns_ccode_night() {
         with_test_env(|| {
             system_appearance::set_mock(Some(system_appearance::SystemAppearance::Dark));
             let result = resolve_auto();
@@ -486,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auto_light_system_returns_ccode-day() {
+    fn resolve_auto_light_system_returns_ccode_day() {
         with_test_env(|| {
             system_appearance::set_mock(Some(system_appearance::SystemAppearance::Light));
             let result = resolve_auto();
@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auto_detection_failure_returns_ccode-night() {
+    fn resolve_auto_detection_failure_returns_ccode_night() {
         with_test_env(|| {
             system_appearance::set_mock(None);
             let result = resolve_auto();
@@ -528,7 +528,7 @@ mod tests {
     // -- resolve_from_config (resolve_initial_theme inner logic) ---------------
 
     #[test]
-    fn resolve_from_config_no_config_returns_ccode-night() {
+    fn resolve_from_config_no_config_returns_ccode_night() {
         with_test_env(|| {
             let result = resolve_from_config(None, true);
             assert_eq!(result, ThemeKind::CcodeNight);

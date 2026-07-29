@@ -290,7 +290,7 @@ mod tests {
     fn rgb_theme_muted_keeps_explicit_gray_without_forced_dim() {
         use ratatui::style::Modifier;
         // CcodeNight paints real RGB grays; muted/dim must not invent DIM.
-        let theme = Theme::ccode-night();
+        let theme = Theme::ccode_night();
         assert!(!matches!(theme.gray, Color::Reset));
         let muted = theme.muted();
         assert_eq!(muted.fg, Some(theme.gray));

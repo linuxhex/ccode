@@ -662,7 +662,7 @@ mod tests {
             2,
             0,
         );
-        let t = Theme::ccode-night();
+        let t = Theme::ccode_night();
         let line = goal_status_line(&g, &t, false, 0, None, 0);
         // The label span is the one whose content starts with "Goal:".
         let label_span = line
@@ -685,7 +685,7 @@ mod tests {
             2,
             0,
         );
-        let t = Theme::ccode-night();
+        let t = Theme::ccode_night();
         let line = goal_status_line(&g, &t, false, 0, None, 0);
         let label_span = line
             .spans
@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn mcp_status_line_uses_dim_directory_color() {
         // The chip must render in `theme.gray_dim` to match the directory path.
-        let t = Theme::ccode-night();
+        let t = Theme::ccode_night();
         let progress = McpInitProgress {
             total: 2,
             connected: 0,

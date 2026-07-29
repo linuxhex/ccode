@@ -1,8 +1,8 @@
 //! Syntax highlighting initialization.
 //!
 //! Provides lazily-initialized `Syntect` instances for code highlighting.
-//! Dark themes (CcodeNight, TokyoNight) share `ccode-night.tmTheme`;
-//! CcodeDay uses `ccode-day.tmTheme` with deepened colors for light backgrounds.
+//! Dark themes (CcodeNight, TokyoNight) share `ccode_night.tmTheme`;
+//! CcodeDay uses `ccode_day.tmTheme` with deepened colors for light backgrounds.
 //!
 //! ## Minimal / terminal-native lock
 //!
@@ -149,11 +149,11 @@ pub fn get_syntect() -> &'static Syntect {
         | ThemeKind::RosePineMoon
         | ThemeKind::OscuraMidnight
         | ThemeKind::Auto => SYNTECT_CCODE_NIGHT
-            .get_or_init(|| Syntect::new(include_bytes!("../assets/ccode-night.tmTheme"))),
+            .get_or_init(|| Syntect::new(include_bytes!("../assets/grok-night.tmTheme"))),
         ThemeKind::TokyoNight => SYNTECT_TOKYONIGHT
             .get_or_init(|| Syntect::new(include_bytes!("../assets/tokyo-night.tmTheme"))),
         ThemeKind::CcodeDay => SYNTECT_CCODE_DAY
-            .get_or_init(|| Syntect::new(include_bytes!("../assets/ccode-day.tmTheme"))),
+            .get_or_init(|| Syntect::new(include_bytes!("../assets/grok-day.tmTheme"))),
     }
 }
 

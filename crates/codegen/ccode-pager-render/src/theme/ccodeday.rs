@@ -52,7 +52,7 @@ mod palette {
 use palette::*;
 
 impl Theme {
-    pub const fn ccode-day() -> Self {
+    pub const fn ccode_day() -> Self {
         Self {
             bg_base: BG_STORM,
             bg_light: BG_HIGHLIGHT,

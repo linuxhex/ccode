@@ -1113,7 +1113,7 @@ mod tests {
     fn prompt_band_color_native_vs_rgb() {
         use ratatui::style::Color;
 
-        let theme = Theme::ccode-night();
+        let theme = Theme::ccode_night();
         assert_eq!(
             UserPromptBlock::prompt_band_color_for(&theme, false, true),
             Some(Color::DarkGray)

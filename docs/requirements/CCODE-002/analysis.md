@@ -1,67 +1,107 @@
-# 需求分析（ccode 视角）— 第二轮：6 项 Claude Code 优秀设计集成
+# 需求分析（仿生架构重构）
 
 ## 需求概述
-> 将 Claude Code 的 6 项核心架构能力完整集成到 ccode，消除安全缺陷和功能缺口
+> 参考"人有眼睛耳朵嘴巴鼻子和手"的仿生学原理，将现有 agent 架构重构为感官-运动-反射闭环系统，让 agent 具备自主感知、反射响应、闭环学习的能力。
 
 ## 业务背景
-- 第一轮已完成：hook_rewrite 接入、permission_chain 接入、循环失败熔断、loop_state 删除、技能 model/effort 日志记录
-- 经推演模拟分析，仍有 6 项 Claude Code 优秀设计未集成，其中 3 项为 P0 级安全/核心能力缺口
+- 当前 agent 是"只有大脑"的生物——没有感官，没有反射弧，全靠 LLM 轮询处理一切
+- 消息总线已存在（ROS 1 风格），但仅做控制面路由，Agent 业务不经过总线
+- A+ 增强模块（持久化/可观测性/错误恢复/性能/配置热更新）已实现但集成深度不足
 
-## 6 项缺口分析
+## 核心设计决策
 
-### 缺口 1：显式状态机 queryLoop（P0）
+| 决策 | 结论 | 理由 |
+|------|------|------|
+| 范围 | 全器官 + 反射弧 | 用户明确选择 |
+| 反射弧位置 | Kernel 内 ReflexRouter | 集中管理，可访问全局状态 |
+| 运动器官 | HandNode + LimbNode 两 Node | 用户明确选择 |
+| 信号协议 | 各器官自定义 topic | 用户明确选择 |
+| A+ 融合 | 能力分配到对应器官 | 消除重复，架构统一 |
+| LLM 参与准则 | L0 反射/L1 本能/L2 思考 三级 | 明确哪些不经 LLM |
+| 学习闭环 | 预置规则 + 成功率计数器 + 经历回放 | 务实，无 ML |
 
-**现状**：`handle_prompt` 中使用隐式 `loop {}` 驱动主循环，无统一状态对象，无可观测性
-**风险**：无法断点恢复、无法 deny recovery、无法跨轮次追踪状态
-**目标**：引入 `LoopState` 枚举 + `LoopAction` 驱动主循环，使状态变迁可观测、可中断、可恢复
+## LLM 参与准则
 
-### 缺口 2：deny-first 权限模型（P0）
+| 级别 | 定义 | 处理方式 |
+|------|------|---------|
+| L0 反射 | 确定性高、风险低、模式固定 | 脊髓反射，不经 LLM |
+| L1 本能 | 需简单判断，有固定模式 | 器官内置规则，不经 LLM 但记录供审查 |
+| L2 思考 | 不确定性高、需理解上下文 | 必须经 LLM |
 
-**现状**：`permission_chain` 已接入但默认 allow-first，YOLO 模式下 `rm -rf /` 等危险命令可直达执行
-**风险**：安全漏洞，危险命令绕过所有检查
-**目标**：实现 deny-first 语义——不在安全白名单中的操作默认 Deny，逐层放行
+### 信号分级
 
-### 缺口 3：技能模型切换执行（P0）
+| 信号 | 级别 |
+|------|------|
+| 缺分号/括号/引号 | L0 |
+| 缺 import/模块引用 | L0 |
+| 文件变化 → 重索引 | L0 |
+| 心跳超时 → 重启 | L0 |
+| 内存压力 → 回收 | L0 |
+| 简单类型不匹配 | L1 |
+| 变量未定义（拼写错误） | L1 |
+| 测试失败 → 重跑 | L1 |
+| Git merge 简单冲突 | L1 |
+| 复杂编译错误 | L2 |
+| 修改业务逻辑 | L2 |
+| 编写新功能 | L2 |
+| 重构代码 | L2 |
 
-**现状**：`SkillInfo.model/effort` 已读取但只记日志，未触发 `handle_set_session_model`
-**风险**：技能声明的模型切换功能形同虚设
-**目标**：技能加载后通过 `SetSessionModel` 命令完成完整模型切换
+### 反射弧路由
 
-### 缺口 4：7 层上下文压缩管线（P1）
+```
+sensor signal → Kernel ReflexRouter
+  ├─ L0 → 直接发 motor 指令（不通知 ThinkerNode）
+  ├─ L1 → 发 motor 指令 + 发 sensory/summary 给 ThinkerNode
+  └─ L2 → 转发给 ThinkerNode
+```
 
-**现状**：有 3 级压缩（Code/Intra/Inter），缺 fileCache 缓存和渐进裁剪
-**风险**：重复读取消耗 Token，大项目上下文利用率低
-**目标**：增加 fileCache 层，避免重复读文件；增加 compactSnapshots 断点快照
+约束：L1 同一问题最多 3 次，超过升级为 L2
 
-### 缺口 5：toolCallBudget 配额扣减（P1）
+## 器官映射表
 
-**现状**：有 token 预算和 max_turns，但无单轮工具调用配额
-**风险**：模型可在单轮中无限调用工具，成本失控
-**目标**：引入 `tool_call_budget`，每次工具调用扣减配额，耗尽时结束 turn
+| 器官 | Node | 功能 | A+ 融合 | Topics |
+|------|------|------|---------|--------|
+| 眼睛 | EyeNode | 读代码/看文件变化/观终端 | config hot-reload | eye/observe, eye/file_changed, eye/terminal_output |
+| 耳朵 | EarNode | 听用户指令/收通知/收心跳 | — | ear/hear, ear/notification, ear/heartbeat |
+| 鼻子 | NoseNode | 嗅编译错误/测试失败/性能退化 | — | nose/smell, nose/compile_error, nose/test_failure |
+| 皮肤 | SkinNode | 触觉反馈：工具结果/进程退出/内存压力 | persistence（触觉记忆） | skin/touch, skin/process_exit, skin/memory_pressure |
+| 嘴巴 | MouthNode | 写代码/生成回复/报告状态 | tracing/json_formatter | mouth/speak, mouth/code_write, mouth/status |
+| 手 | HandNode | 编辑文件/搜索定位/重构移动 | degradation → ReflexRouter | hand/edit, hand/search, hand/restructure |
+| 肢体 | LimbNode | 运行命令/构建测试/Git 操作 | retry/backoff（肌肉记忆） | limb/execute, limb/build, limb/git |
+| 大脑皮层 | ThinkerNode（重构 AgentNode） | 规划/推理/决策 | metrics → 各器官 | cortex/think, cortex/plan, cortex/decide |
+| 脊髓反射 | Kernel::ReflexRouter | 模式匹配 → 自动响应 | degradation 策略 | 内部路由 |
+| 自主神经 | Kernel::AutonomicNervousSystem | 心跳/健康/内存回收 | SelfHealingManager | 内部管理 |
 
-### 缺口 6：循环检测（P1）
+## 记忆架构
 
-**现状**：只检测"连续失败"，不检测"相同工具调用循环"
-**风险**：模型反复执行同一命令但不失败时（如反复读同一文件），不会熔断
-**目标**：检测连续 N 次相同（tool_name + 相似 input）的工具调用，触发熔断
+| 层级 | 人体 | 对应组件 | 实现 |
+|------|------|---------|------|
+| 感觉记忆 | 各感官缓冲 | 各 Sensory Node 内部缓冲 | 瞬时（<1s） |
+| 工作记忆 | 前额叶皮层 | ThinkerNode WorkingMemory | 当前对话上下文 |
+| 短期记忆 | 海马体 | SkinNode ShortTermMemory | 近期工具结果/编译输出 |
+| 长期记忆 | 大脑皮层 | StateNode（海马体） | 跨会话快照/规则/知识 |
+| 肌肉记忆 | 小脑/基底节 | LimbNode | 重复操作模式记忆 |
+| 反射记忆 | 脊髓 | Kernel ReflexRouter | L0/L1 反射规则库 |
+
+## 学习闭环（务实版）
+
+1. **预置规则模板**：出厂自带常见 L0/L1 规则（reflex_rules.toml，人类可读可编辑）
+2. **成功率计数器**：每个规则记 use_count / success_count / consecutive_fails，consecutive_fails >= 2 → 禁用 + 升级 L2
+3. **经历回放提规则**：会话结束扫描 L2 经历，同类问题成功 3 次 → 提议新 L1_trial 规则，确认 3 次 → 升级 L1 正式
 
 ## 改动范围
-
-| 模块 | 缺口 | 操作 |
-|------|------|------|
-| ccode-agent | 显式状态机 | 新增 loop_state.rs |
-| ccode-shell/turn.rs | 显式状态机 | 重构主循环为状态机驱动 |
-| ccode-hooks/permission_chain.rs | deny-first | 修改默认决策为 Deny |
-| ccode-hooks/permission_rules.rs | deny-first | 新增安全白名单 |
-| ccode-hooks/pre_filter.rs | deny-first | 增强预过滤规则 |
-| ccode-shell/turn.rs | 技能模型切换 | 加载技能后调用模型切换 |
-| ccode-shell/model_switch.rs | 技能模型切换 | 新增简化模型切换入口 |
-| ccode-shell/compaction.rs | 7 层压缩 | 新增 fileCache 层 |
-| ccode-shell/tool_calls.rs | toolCallBudget | 新增配额扣减逻辑 |
-| ccode-shell/tool_calls.rs | 循环检测 | 扩展熔断检测逻辑 |
+- [ ] 新增：6 个器官 Node（Eye/Ear/Nose/Skin/Mouth/Hand/Limb = 7 个，Thinker 重构自 AgentNode）
+- [ ] 新增：Kernel::ReflexRouter + Kernel::AutonomicNervousSystem
+- [ ] 新增：ReflexRule 数据结构 + 规则加载/匹配/统计
+- [ ] 新增：ExperienceLog 经历记录 + 回放提规则
+- [ ] 重构：AgentNode → ThinkerNode
+- [ ] 重构：SelfHealingManager → AutonomicNervousSystem
+- [ ] 融合：A+ 模块能力分配到对应器官
+- [ ] 新增：仿生 Topic 命名（eye/*, ear/*, nose/*, skin/*, mouth/*, hand/*, limb/*, cortex/*）
+- [ ] 更新：NodeType 枚举新增器官类型
 
 ## 风险与注意
-- ⚠️ 显式状态机重构涉及主循环核心代码，需确保不破坏现有 happy path
-- ⚠️ deny-first 改为默认拒绝可能影响现有用户体验，需保留 auto_mode 快速放行
-- ⚠️ 技能模型切换需要完整 SamplerConfig，需通过现有 `chat_state_handle` 获取
-- 💡 7 层压缩和 toolCallBudget 为 P1，可在 P0 完成后独立迭代
+- ⚠️ 大规模重构风险：7 个新 Node + 2 个新 Kernel 模块，需分阶段实施
+- ⚠️ 与现有 session 路径兼容：ccode-shell 的 session/turn.rs 路径需保留，双轨过渡
+- ⚠️ 反射规则的副作用：L0/L1 自动操作可能引入错误，必须有回退机制
+- 💡 先实现器官 + 反射弧骨架，再逐步填充器官的具体感官/运动逻辑
