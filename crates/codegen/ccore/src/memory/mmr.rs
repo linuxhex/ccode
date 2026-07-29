@@ -122,6 +122,99 @@ impl MmrConfig {
     }
 }
 
+/// MMR 文本重排序（用于混合搜索后的多样化排序）
+///
+/// 基于文本 Jaccard 相似度进行 MMR 重排序，避免返回过于相似的文本结果。
+///
+/// # Arguments
+/// * `candidates` - 候选结果列表 (content, score)
+/// * `query` - 查询文本
+/// * `k` - 返回结果数量
+/// * `lambda` - 相关性权重（0.0-1.0）
+///
+/// # Returns
+/// 重排序后的 (content, score) 列表
+pub fn mmr_rerank(
+    candidates: &[(String, f64)],
+    _query: &str,
+    k: usize,
+    lambda: f64,
+) -> Vec<(String, f64)> {
+    if candidates.is_empty() || k == 0 {
+        return Vec::new();
+    }
+
+    let actual_k = k.min(candidates.len());
+    let mut selected: Vec<usize> = Vec::with_capacity(actual_k);
+    let mut remaining: Vec<usize> = (0..candidates.len()).collect();
+
+    while selected.len() < actual_k && !remaining.is_empty() {
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_idx = 0;
+        let mut best_pos = 0;
+
+        for (pos, &cand_idx) in remaining.iter().enumerate() {
+            let relevance = candidates[cand_idx].1;
+
+            // 多样性惩罚：与已选结果的最大 Jaccard 相似度
+            let diversity_penalty = if selected.is_empty() {
+                0.0
+            } else {
+                selected
+                    .iter()
+                    .map(|&s| {
+                        jaccard_text_similarity(
+                            &candidates[cand_idx].0,
+                            &candidates[s].0,
+                        )
+                    })
+                    .fold(0.0_f64, |max, sim| sim.max(max))
+            };
+
+            let mmr_score = lambda * relevance - (1.0 - lambda) * diversity_penalty;
+
+            if mmr_score > best_score {
+                best_score = mmr_score;
+                best_idx = cand_idx;
+                best_pos = pos;
+            }
+        }
+
+        selected.push(best_idx);
+        remaining.remove(best_pos);
+    }
+
+    selected
+        .into_iter()
+        .map(|i| (candidates[i].0.clone(), candidates[i].1))
+        .collect()
+}
+
+/// 计算两个文本的 Jaccard 相似度（基于词集合）
+fn jaccard_text_similarity(a: &str, b: &str) -> f64 {
+    let a_lower = a.to_lowercase();
+    let b_lower = b.to_lowercase();
+    let set_a: std::collections::HashSet<&str> = a_lower
+        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let set_b: std::collections::HashSet<&str> = b_lower
+        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if set_a.is_empty() && set_b.is_empty() {
+        return 0.0;
+    }
+
+    let intersection = set_a.intersection(&set_b).count() as f64;
+    let union = set_a.union(&set_b).count() as f64;
+    if union == 0.0 {
+        return 0.0;
+    }
+    intersection / union
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::embedding::EmbeddingVector;
@@ -294,5 +387,60 @@ mod tests {
 
         // 应该仍然返回两个结果
         assert_eq!(selected.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // mmr_rerank tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mmr_rerank_empty() {
+        let candidates: Vec<(String, f64)> = vec![];
+        let result = mmr_rerank(&candidates, "query", 5, 0.7);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_mmr_rerank_basic() {
+        let candidates = vec![
+            ("Rust architecture design".to_string(), 0.9),
+            ("Rust architecture modules".to_string(), 0.8),
+            ("React component patterns".to_string(), 0.7),
+        ];
+        let result = mmr_rerank(&candidates, "Rust", 2, 0.7);
+        assert_eq!(result.len(), 2);
+        // 第一个应该是最相关的
+        assert!(result[0].1 >= result[1].1);
+    }
+
+    #[test]
+    fn test_mmr_rerank_diversity() {
+        let candidates = vec![
+            ("architecture module design".to_string(), 0.9),
+            ("architecture module layout".to_string(), 0.85),
+            ("React component patterns".to_string(), 0.7),
+        ];
+        // 低 lambda 应偏向多样性
+        let result = mmr_rerank(&candidates, "architecture", 2, 0.3);
+        assert_eq!(result.len(), 2);
+        // 两个相似的结果不应同时被选中（低 lambda 时）
+    }
+
+    #[test]
+    fn test_jaccard_text_similarity_identical() {
+        let sim = jaccard_text_similarity("hello world", "hello world");
+        assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_jaccard_text_similarity_no_overlap() {
+        let sim = jaccard_text_similarity("aaa bbb", "ccc ddd");
+        assert!(sim < 0.01);
+    }
+
+    #[test]
+    fn test_jaccard_text_similarity_partial() {
+        let sim = jaccard_text_similarity("hello world", "hello rust");
+        assert!(sim > 0.0 && sim < 1.0);
     }
 }

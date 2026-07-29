@@ -2,8 +2,14 @@
 //!
 //! 从 L1 短期记忆中提取冷条目，总结为知识条目存入 L2 长期记忆，
 //! 整理后从 L1 中移除原条目，释放短期记忆空间
+//!
+//! 增强功能：
+//! - PID 文件锁：防止多实例并发整理
+//! - LLM 整合摘要：将多个冷条目整合为精简摘要
+//! - 自动触发检测：检查是否应自动触发整理
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use crate::memory::long_term::{KnowledgeCategory, KnowledgeEntry, LongTermMemory};
 use crate::memory::short_term::ShortTermMemory;
@@ -29,6 +35,17 @@ impl Default for DreamConfig {
     }
 }
 
+/// 整理锁（RAII，drop 时自动释放）
+pub struct DreamLock {
+    path: std::path::PathBuf,
+}
+
+impl Drop for DreamLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Dream 整理器
 pub struct DreamOrganizer {
     /// 整理配置
@@ -46,6 +63,84 @@ impl DreamOrganizer {
     /// 使用自定义配置创建
     pub fn with_config(config: DreamConfig) -> Self {
         Self { config }
+    }
+
+    /// 尝试获取整理锁（PID 文件，防止多实例并发整理）
+    ///
+    /// 如果锁文件存在且持有进程仍活跃，返回 None（锁被占用）。
+    /// 否则写入当前进程 PID 并返回 DreamLock（RAII 释放）。
+    pub async fn try_acquire_lock(&self, lock_dir: &Path) -> anyhow::Result<Option<DreamLock>> {
+        let lock_path = lock_dir.join("dream.lock");
+
+        if lock_path.exists() {
+            // 检查持有锁的进程是否仍活跃
+            let content = tokio::fs::read_to_string(&lock_path).await?;
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                // Unix: 使用 kill(pid, 0) 检查进程是否存活
+                #[cfg(unix)]
+                {
+                    // SAFETY: kill(pid, 0) 不发送信号，仅检查进程存在性
+                    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+                        return Ok(None); // 锁被活跃进程持有
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    // 非 Unix 平台：简单忽略，总是允许获取锁
+                    let _ = pid;
+                }
+            }
+        }
+
+        // 写入当前进程 PID
+        let pid = std::process::id();
+        tokio::fs::create_dir_all(lock_dir).await?;
+        tokio::fs::write(&lock_path, pid.to_string()).await?;
+        Ok(Some(DreamLock {
+            path: lock_path,
+        }))
+    }
+
+    /// 使用 LLM 整合摘要（构建 prompt）
+    ///
+    /// 将多个冷条目构建为 LLM 整合 prompt，用于后续调用 LLM 生成精简摘要。
+    pub fn build_consolidation_prompt(&self, entries: &[&str]) -> String {
+        format!(
+            r#"Consolidate the following memory entries into a concise summary.
+Remove redundancy, keep unique information, and maintain the most important points.
+
+Entries:
+{}
+
+Output a single consolidated markdown section:"#,
+            entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("[{}] {}", i, e))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        )
+    }
+
+    /// 解析 LLM 整合响应
+    pub fn parse_consolidation_response(response: &str) -> String {
+        response.trim().to_string()
+    }
+
+    /// 检查是否应该自动触发整理
+    pub fn should_auto_trigger(&self, short_term: &ShortTermMemory) -> bool {
+        let current_turn = short_term.current_turn();
+        let all_entries = short_term.all_entries();
+
+        let cold_count = all_entries
+            .iter()
+            .filter(|entry| {
+                let heat = self.compute_simple_heat(entry, current_turn);
+                heat < self.config.heat_threshold
+            })
+            .count();
+
+        cold_count >= self.config.min_cold_entries
     }
 
     /// 执行一轮 Dream 整理
@@ -168,4 +263,141 @@ pub struct DreamResult {
     pub consolidated: usize,
     /// 从 L1 中移除的条目数
     pub removed_from_l1: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_build_consolidation_prompt() {
+        let organizer = DreamOrganizer::new();
+        let entries = vec!["Entry one about architecture", "Entry two about decisions"];
+        let prompt = organizer.build_consolidation_prompt(&entries);
+
+        assert!(prompt.contains("Consolidate"));
+        assert!(prompt.contains("[0] Entry one"));
+        assert!(prompt.contains("[1] Entry two"));
+        assert!(prompt.contains("consolidated markdown section"));
+    }
+
+    #[test]
+    fn test_build_consolidation_prompt_empty() {
+        let organizer = DreamOrganizer::new();
+        let entries: Vec<&str> = vec![];
+        let prompt = organizer.build_consolidation_prompt(&entries);
+
+        assert!(prompt.contains("Consolidate"));
+        assert!(prompt.contains("Entries:"));
+    }
+
+    #[test]
+    fn test_parse_consolidation_response() {
+        let response = "  ## Summary\n\nKey points here.  \n";
+        let parsed = DreamOrganizer::parse_consolidation_response(response);
+        assert_eq!(parsed, "## Summary\n\nKey points here.");
+    }
+
+    #[test]
+    fn test_should_auto_trigger_below_threshold() {
+        let mut short_term = ShortTermMemory::new();
+        // 添加少量条目（不够触发阈值）
+        for _ in 0..3 {
+            short_term.store("user".into(), "some content".into(), 10, false);
+        }
+
+        let organizer = DreamOrganizer::with_config(DreamConfig {
+            min_cold_entries: 5,
+            heat_threshold: 0.3,
+            decay_lambda: 0.1,
+        });
+
+        // 条目数不足，不应触发
+        // 注意：这些条目的 turn 很近，热度可能不低
+        assert!(!organizer.should_auto_trigger(&short_term));
+    }
+
+    #[test]
+    fn test_should_auto_trigger_sufficient_cold() {
+        let mut short_term = ShortTermMemory::new();
+        // 添加大量条目
+        for _ in 0..10 {
+            short_term.store("user".into(), "some content".into(), 10, false);
+        }
+
+        let organizer = DreamOrganizer::with_config(DreamConfig {
+            min_cold_entries: 3,
+            heat_threshold: 0.99, // 极高阈值，几乎所有条目都被视为冷条目
+            decay_lambda: 0.1,
+        });
+
+        assert!(organizer.should_auto_trigger(&short_term));
+    }
+
+    #[tokio::test]
+    async fn test_try_acquire_lock() {
+        let tmp = TempDir::new().unwrap();
+        let organizer = DreamOrganizer::new();
+
+        // 首次获取应成功
+        let lock = organizer.try_acquire_lock(tmp.path()).await.unwrap();
+        assert!(lock.is_some());
+
+        // 锁在 RAII drop 后应释放
+        drop(lock);
+
+        // 再次获取应成功
+        let lock2 = organizer.try_acquire_lock(tmp.path()).await.unwrap();
+        assert!(lock2.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_try_acquire_lock_existing_stale() {
+        let tmp = TempDir::new().unwrap();
+        let lock_dir = tmp.path().join("locks");
+        tokio::fs::create_dir_all(&lock_dir).await.unwrap();
+
+        // 写入一个不存在的 PID（过期锁）
+        let lock_path = lock_dir.join("dream.lock");
+        tokio::fs::write(&lock_path, "999999999").await.unwrap(); // 不存在的 PID
+
+        let organizer = DreamOrganizer::new();
+        let lock = organizer.try_acquire_lock(&lock_dir).await.unwrap();
+
+        #[cfg(unix)]
+        {
+            // Unix 下应能获取锁（PID 不存在）
+            assert!(lock.is_some());
+        }
+        #[cfg(not(unix))]
+        {
+            // 非 Unix 平台总是允许
+            assert!(lock.is_some());
+        }
+    }
+
+    #[test]
+    fn test_infer_category() {
+        assert!(matches!(
+            DreamOrganizer::infer_category("", "系统架构设计"),
+            KnowledgeCategory::Architecture
+        ));
+        assert!(matches!(
+            DreamOrganizer::infer_category("", "决定使用 Rust"),
+            KnowledgeCategory::Decision
+        ));
+        assert!(matches!(
+            DreamOrganizer::infer_category("", "用户偏好暗色主题"),
+            KnowledgeCategory::UserPreference
+        ));
+        assert!(matches!(
+            DreamOrganizer::infer_category("", "修复了空指针 bug"),
+            KnowledgeCategory::ErrorFix
+        ));
+        assert!(matches!(
+            DreamOrganizer::infer_category("", "使用 Builder 模式"),
+            KnowledgeCategory::CodePattern
+        ));
+    }
 }

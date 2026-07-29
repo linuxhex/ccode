@@ -9,3 +9,6 @@ pub mod dream;
 pub mod recall;
 pub mod embedding;
 pub mod mmr;
+pub mod chunker;
+pub mod storage;
+pub mod watcher;
