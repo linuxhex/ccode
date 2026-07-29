@@ -31,6 +31,7 @@ serde_json = { workspace = true }
 sqlite-vec = "=0.1.7-alpha.2"
 tar = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+regex = { workspace = true }
 tracing = { workspace = true }
 ccode-auth = { workspace = true }
 ccode-config-types = { workspace = true }

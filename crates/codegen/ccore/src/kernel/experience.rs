@@ -175,12 +175,125 @@ impl ExperienceLog {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    // -----------------------------------------------------------------------
+    // LLM 模式提取
+    // -----------------------------------------------------------------------
+
+    /// 构建 LLM 模式提取 prompt
+    ///
+    /// 将最近的经验条目发送给 LLM，让 LLM 识别深层模式，
+    /// 超越简单的 (topic, action) 统计。
+    pub fn build_pattern_extraction_prompt(&self, recent_n: usize) -> Option<String> {
+        let entries = self.recent_entries(recent_n);
+        if entries.len() < 3 {
+            return None;
+        }
+
+        let entry_text = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                format!(
+                    "[{}] signal={}, topic={}, action={}, result={}",
+                    i,
+                    e.signal,
+                    e.signal_topic,
+                    e.action,
+                    if e.result { "ok" } else { "fail" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Some(format!(
+            r#"Analyze the following experience entries and identify deeper patterns that simple statistics might miss.
+
+Look for:
+1. Sequential patterns (action A often leads to action B)
+2. Conditional patterns (when signal contains X, action Y works better)
+3. Contextual patterns (certain conditions correlate with success/failure)
+
+Experience entries:
+{}
+
+Output patterns as JSON array:
+```json
+[
+  {{"pattern": "description", "condition": "when/where", "action": "what to do", "confidence": 0.8}}
+]
+```"#,
+            entry_text
+        ))
+    }
+
+    /// 解析 LLM 模式提取响应
+    pub fn parse_pattern_extraction_response(response: &str) -> Vec<ProposedRule> {
+        let json_str = extract_json_array(response);
+
+        #[derive(Deserialize)]
+        struct PatternItem {
+            pattern: String,
+            condition: String,
+            action: String,
+            confidence: f64,
+        }
+
+        match serde_json::from_str::<Vec<PatternItem>>(&json_str) {
+            Ok(items) => items
+                .into_iter()
+                .filter(|item| item.confidence >= 0.7)
+                .map(|item| ProposedRule {
+                    signal_topic: item.condition,
+                    pattern_hint: item.pattern.chars().take(100).collect(),
+                    action: item.action,
+                    success_rate: item.confidence,
+                    sample_count: 0, // LLM extracted, no direct sample count
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 与 auto_extract 的集成
+    // -----------------------------------------------------------------------
+
+    /// 将经验条目转换为可提取知识的消息列表
+    ///
+    /// 将最近的失败经历转换为消息，供 KnowledgeExtractor 提取。
+    pub fn failed_experiences_as_messages(&self, n: usize) -> Vec<String> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|e| !e.result)
+            .take(n)
+            .map(|e| {
+                format!(
+                    "Signal: {} | Topic: {} | Action: {} | Result: FAILED",
+                    e.signal, e.signal_topic, e.action
+                )
+            })
+            .collect()
+    }
 }
 
 impl Default for ExperienceLog {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 从 LLM 响应中提取 JSON 数组
+fn extract_json_array(response: &str) -> String {
+    if let Some(start) = response.find('[') {
+        if let Some(end) = response.rfind(']') {
+            if end > start {
+                return response[start..=end].to_string();
+            }
+        }
+    }
+    response.to_string()
 }
 
 #[cfg(test)]
@@ -329,5 +442,153 @@ mod tests {
         log.record(make_entry("s2", "nose/a", "hand/edit", true));
         let patterns = log.extract_patterns();
         assert!(patterns.is_empty());
+    }
+
+    // =======================================================================
+    // LLM 模式提取测试
+    // =======================================================================
+
+    #[test]
+    fn test_build_pattern_extraction_prompt_too_few_entries() {
+        let mut log = ExperienceLog::new();
+        log.record(make_entry("s1", "t", "a", true));
+        log.record(make_entry("s2", "t", "a", true));
+        assert!(log.build_pattern_extraction_prompt(10).is_none());
+    }
+
+    #[test]
+    fn test_build_pattern_extraction_prompt_enough_entries() {
+        let mut log = ExperienceLog::new();
+        for i in 0..5 {
+            log.record(make_entry(&format!("sig_{}", i), "nose/compile_error", "hand/edit", i % 2 == 0));
+        }
+        let prompt = log.build_pattern_extraction_prompt(10);
+        assert!(prompt.is_some());
+        let prompt = prompt.unwrap();
+        assert!(prompt.contains("Experience entries:"));
+        assert!(prompt.contains("[0]"));
+        assert!(prompt.contains("[4]"));
+        assert!(prompt.contains("nose/compile_error"));
+    }
+
+    #[test]
+    fn test_build_pattern_extraction_prompt_respects_recent_n() {
+        let mut log = ExperienceLog::new();
+        for i in 0..10 {
+            log.record(make_entry(&format!("sig_{}", i), "t", "a", true));
+        }
+        let prompt = log.build_pattern_extraction_prompt(5).unwrap();
+        // 应只包含最近 5 条（编号 [0]-[4]）
+        assert!(prompt.contains("[4]"));
+        assert!(!prompt.contains("[5]"));
+    }
+
+    #[test]
+    fn test_parse_pattern_extraction_response_valid() {
+        let response = r#"
+Here are the patterns:
+
+```json
+[
+  {"pattern": "compile errors after edit", "condition": "when signal contains expected", "action": "hand/fix_semicolon", "confidence": 0.85},
+  {"pattern": "type errors need cast", "condition": "when signal contains mismatched types", "action": "hand/type_cast", "confidence": 0.75}
+]
+```
+"#;
+        let rules = ExperienceLog::parse_pattern_extraction_response(response);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].signal_topic, "when signal contains expected");
+        assert_eq!(rules[0].action, "hand/fix_semicolon");
+        assert!((rules[0].success_rate - 0.85).abs() < f64::EPSILON);
+        assert_eq!(rules[0].sample_count, 0);
+        assert_eq!(rules[1].signal_topic, "when signal contains mismatched types");
+    }
+
+    #[test]
+    fn test_parse_pattern_extraction_response_filters_low_confidence() {
+        let response = r#"[{"pattern": "weak pattern", "condition": "cond", "action": "act", "confidence": 0.5}]"#;
+        let rules = ExperienceLog::parse_pattern_extraction_response(response);
+        assert!(rules.is_empty(), "置信度低于 0.7 的模式应被过滤");
+    }
+
+    #[test]
+    fn test_parse_pattern_extraction_response_invalid_json() {
+        let rules = ExperienceLog::parse_pattern_extraction_response("not json at all");
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pattern_extraction_response_truncates_long_pattern() {
+        let long_pattern: String = "x".repeat(200);
+        let response = format!(
+            r#"[{{"pattern": "{}", "condition": "cond", "action": "act", "confidence": 0.8}}]"#,
+            long_pattern
+        );
+        let rules = ExperienceLog::parse_pattern_extraction_response(&response);
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].pattern_hint.len() <= 100);
+    }
+
+    // =======================================================================
+    // failed_experiences_as_messages 测试
+    // =======================================================================
+
+    #[test]
+    fn test_failed_experiences_as_messages_empty() {
+        let log = ExperienceLog::new();
+        let msgs = log.failed_experiences_as_messages(5);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_failed_experiences_as_messages_filters_success() {
+        let mut log = ExperienceLog::new();
+        log.record(make_entry("err1", "nose/compile_error", "hand/edit", true));
+        log.record(make_entry("err2", "nose/compile_error", "hand/edit", false));
+        log.record(make_entry("err3", "nose/type_error", "hand/cast", false));
+        log.record(make_entry("err4", "nose/test_fail", "hand/fix", true));
+
+        let msgs = log.failed_experiences_as_messages(5);
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].contains("FAILED"));
+        assert!(msgs[0].contains("err3") || msgs[0].contains("err2"));
+    }
+
+    #[test]
+    fn test_failed_experiences_as_messages_respects_n() {
+        let mut log = ExperienceLog::new();
+        for i in 0..5 {
+            log.record(make_entry(&format!("fail_{}", i), "nose/err", "hand/edit", false));
+        }
+        let msgs = log.failed_experiences_as_messages(2);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn test_failed_experiences_as_messages_format() {
+        let mut log = ExperienceLog::new();
+        log.record(make_entry("expected `;`", "nose/compile_error", "hand/edit", false));
+        let msgs = log.failed_experiences_as_messages(1);
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].contains("Signal: expected `;`"));
+        assert!(msgs[0].contains("Topic: nose/compile_error"));
+        assert!(msgs[0].contains("Action: hand/edit"));
+        assert!(msgs[0].contains("FAILED"));
+    }
+
+    // =======================================================================
+    // extract_json_array 测试
+    // =======================================================================
+
+    #[test]
+    fn test_extract_json_array_brackets() {
+        let result = extract_json_array("text [1,2,3] end");
+        assert_eq!(result, "[1,2,3]");
+    }
+
+    #[test]
+    fn test_extract_json_array_no_brackets() {
+        let result = extract_json_array("no json here");
+        assert_eq!(result, "no json here");
     }
 }
