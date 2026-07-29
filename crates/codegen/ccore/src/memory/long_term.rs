@@ -367,13 +367,59 @@ impl LongTermMemory {
     }
 }
 
-/// 文本分词：按空白符和标点拆分为小写关键词，过滤单字符词
+/// 判断是否为 CJK 统一汉字字符
+fn is_cjk_ideograph(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}' |   // CJK Unified Ideographs
+        '\u{3400}'..='\u{4DBF}' |   // CJK Unified Ideographs Extension A
+        '\u{F900}'..='\u{FAFF}'     // CJK Compatibility Ideographs
+    )
+}
+
+/// 判断是否为 CJK 标点符号
+fn is_cjk_punctuation(c: char) -> bool {
+    matches!(c,
+        '\u{3000}'..='\u{303F}' |   // CJK Symbols and Punctuation（。，、：「」等）
+        '\u{FF00}'..='\u{FFEF}' |   // Halfwidth and Fullwidth Forms（全角标点、全角字母）
+        '—' | '…' | '·'           // 常见排版符号（～已在全角范围内）
+    )
+}
+
+/// 文本分词：按空白符和标点拆分为小写关键词
+///
+/// 对 CJK 文本使用 bigram 策略（相邻两字组合），提升关键词匹配召回率。
+/// 对非 CJK 文本保留原词（过滤单字符词）。
 fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
-        .filter(|s| s.len() >= 2)
-        .map(|s| s.to_string())
-        .collect()
+    let mut result = Vec::new();
+
+    for token in text
+        .to_lowercase()
+        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation() || is_cjk_punctuation(c))
+        .filter(|s| !s.is_empty())
+    {
+        let has_cjk = token.chars().any(is_cjk_ideograph);
+
+        if has_cjk {
+            // CJK 文本：生成 bigram（相邻两字组合），提升召回率
+            let chars: Vec<char> = token.chars().collect();
+            if chars.len() >= 2 {
+                for window in chars.windows(2) {
+                    let bigram: String = window.iter().collect();
+                    result.push(bigram);
+                }
+            } else if !chars.is_empty() {
+                // 单字 CJK 也保留
+                result.push(token.to_string());
+            }
+        } else {
+            // 非 CJK：保留原词，过滤单字节词
+            if token.len() >= 2 {
+                result.push(token.to_string());
+            }
+        }
+    }
+
+    result
 }
 
 /// 计算关键词匹配相似度：查询词在条目词中的命中率
@@ -492,8 +538,11 @@ mod tests {
     #[test]
     fn test_tokenize() {
         let tokens = tokenize("Rust 是一门系统编程语言!");
-        assert!(tokens.contains(&"rust".to_string()));
-        assert!(tokens.contains(&"系统编程语言".to_string()));
+        assert!(tokens.contains(&"rust".to_string()), "应包含 rust，实际: {:?}", tokens);
+        // CJK bigram 策略：相邻两字组合
+        assert!(tokens.contains(&"系统".to_string()), "应包含 bigram 系统，实际: {:?}", tokens);
+        assert!(tokens.contains(&"编程".to_string()), "应包含 bigram 编程，实际: {:?}", tokens);
+        assert!(tokens.contains(&"语言".to_string()), "应包含 bigram 语言，实际: {:?}", tokens);
     }
 
     #[test]

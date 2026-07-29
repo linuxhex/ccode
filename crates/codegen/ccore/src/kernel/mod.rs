@@ -37,6 +37,7 @@ pub mod self_healing;
 pub mod autonomic;
 pub mod reflex;
 pub mod experience;
+pub mod panic_hook;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -140,6 +141,9 @@ pub struct Kernel {
 
 impl Kernel {
     pub fn new(config: KernelConfig) -> Self {
+        // 安装全局 panic 钩子，捕获 panic 并记录日志而非直接崩溃
+        panic_hook::install_panic_hook();
+
         let broker = broker::Broker::new(
             config.router_addr.clone(),
             config.pub_addr.clone(),
@@ -1210,6 +1214,8 @@ impl Kernel {
         };
 
         // 在独立 tokio task 中启动 SubAgentNode
+        // tokio::spawn 提供 panic 隔离：子 Agent panic 不会拖垮 Kernel
+        // 全局 panic_hook 已在 Kernel::new() 中安装，会记录 panic 到 tracing
         let sub_id = new_id.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::node::transport::run_node(subagent, ctx).await {

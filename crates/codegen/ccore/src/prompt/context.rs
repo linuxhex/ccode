@@ -124,6 +124,7 @@ impl std::fmt::Debug for TemplateWatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TemplateWatcher")
             .field("template_dir", &self.template_dir)
+            // SAFETY: RwLock is never poisoned in this module
             .field("templates_count", &self.templates.read().unwrap().len())
             .finish()
     }
@@ -148,15 +149,17 @@ impl TemplateWatcher {
                 let path = entry.path();
                 if path.extension().map(|e| e == "md").unwrap_or(false) {
                     let name = path.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .to_string();
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        initial_templates.insert(name, content);
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if !name.is_empty() {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            initial_templates.insert(name, content);
+                        }
                     }
                 }
             }
         }
+        // SAFETY: RwLock is never poisoned in this module
         *templates.write().unwrap() = initial_templates;
 
         // 创建文件监听器
@@ -169,11 +172,12 @@ impl TemplateWatcher {
                         if path.extension().map(|e| e == "md").unwrap_or(false) {
                             if let Ok(content) = std::fs::read_to_string(path) {
                                 let name = path.file_name()
-                                    .unwrap()
-                                    .to_string_lossy()
-                                    .to_string();
-                                if let Ok(mut guard) = templates_clone.write() {
-                                    guard.insert(name, content);
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                if !name.is_empty() {
+                                    if let Ok(mut guard) = templates_clone.write() {
+                                        guard.insert(name, content);
+                                    }
                                 }
                             }
                         }
@@ -201,6 +205,7 @@ impl TemplateWatcher {
     /// # 返回
     /// 模板内容的克隆
     pub fn get(&self, name: &str) -> Option<String> {
+        // SAFETY: RwLock is never poisoned in this module
         self.templates.read().unwrap().get(name).cloned()
     }
 

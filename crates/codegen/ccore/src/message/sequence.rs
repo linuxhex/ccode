@@ -63,49 +63,59 @@ impl SequenceChecker {
     /// 检查消息序列号
     ///
     /// 返回检查结果：
-    /// - `Ok(true)`：正常顺序
-    /// - `Ok(false)`：序列号跳跃（可能丢包），但仍接受
-    /// - `Err`：序列号回退（乱序），拒绝接受
+    /// - `Ok(InOrder)`：正常顺序
+    /// - `Ok(Gap(n))`：序列号跳跃（可能丢包），但仍接受
+    /// - `Err(Duplicate)`：重复消息
+    /// - `Err(OutOfOrder)`：序列号回退（乱序），拒绝接受
     pub fn check(&mut self, node_id: &NodeId, sequence: u64) -> Result<SequenceCheckResult, SequenceError> {
-        let last = self.last_received.get(node_id).copied().unwrap_or(0);
+        let last_opt = self.last_received.get(node_id).copied();
 
-        if sequence > last {
-            // 正常：序列号递增
-            let gap = sequence - last;
-            self.last_received.insert(node_id.clone(), sequence);
-
-            if gap > self.window_size {
-                // 序列号跳跃过大，可能丢包
-                tracing::warn!(
-                    "Node {} 序列号跳跃：从 {} 到 {}（差距 {}），可能丢包",
-                    node_id, last, sequence, gap
-                );
-                Ok(SequenceCheckResult::Gap(gap))
-            } else if gap > 1 {
-                // 序列号跳跃，但可接受
-                tracing::debug!(
-                    "Node {} 序列号跳跃：从 {} 到 {}（差距 {}）",
-                    node_id, last, sequence, gap
-                );
-                Ok(SequenceCheckResult::Gap(gap))
-            } else {
-                // 完美顺序
+        match last_opt {
+            None => {
+                // 首次收到此 Node 的消息，始终接受
+                self.last_received.insert(node_id.clone(), sequence);
                 Ok(SequenceCheckResult::InOrder)
             }
-        } else if sequence == last {
-            // 重复消息
-            tracing::warn!("Node {} 序列号重复：{}", node_id, sequence);
-            Err(SequenceError::Duplicate)
-        } else {
-            // 序列号回退（乱序）
-            tracing::warn!(
-                "Node {} 序列号回退：从 {} 到 {}（乱序）",
-                node_id, last, sequence
-            );
-            Err(SequenceError::OutOfOrder {
-                expected: last + 1,
-                actual: sequence,
-            })
+            Some(last) => {
+                if sequence > last {
+                    // 正常：序列号递增
+                    let gap = sequence - last;
+                    self.last_received.insert(node_id.clone(), sequence);
+
+                    if gap > self.window_size {
+                        // 序列号跳跃过大，可能丢包
+                        tracing::warn!(
+                            "Node {} 序列号跳跃：从 {} 到 {}（差距 {}），可能丢包",
+                            node_id, last, sequence, gap
+                        );
+                        Ok(SequenceCheckResult::Gap(gap))
+                    } else if gap > 1 {
+                        // 序列号跳跃，但可接受
+                        tracing::debug!(
+                            "Node {} 序列号跳跃：从 {} 到 {}（差距 {}）",
+                            node_id, last, sequence, gap
+                        );
+                        Ok(SequenceCheckResult::Gap(gap))
+                    } else {
+                        // 完美顺序
+                        Ok(SequenceCheckResult::InOrder)
+                    }
+                } else if sequence == last {
+                    // 重复消息
+                    tracing::warn!("Node {} 序列号重复：{}", node_id, sequence);
+                    Err(SequenceError::Duplicate)
+                } else {
+                    // 序列号回退（乱序）
+                    tracing::warn!(
+                        "Node {} 序列号回退：从 {} 到 {}（乱序）",
+                        node_id, last, sequence
+                    );
+                    Err(SequenceError::OutOfOrder {
+                        expected: last + 1,
+                        actual: sequence,
+                    })
+                }
+            }
         }
     }
 
