@@ -214,6 +214,8 @@ impl SubAgentNode {
             reasoning_effort: None,
             max_tokens: None,
             temperature: None,
+            system_prompt: None,
+            tool_choice: None,
         }
     }
 

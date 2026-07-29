@@ -1,26 +1,19 @@
-//! OpenAI Chat Completions 兼容适配器
+//! DeepSeek API 兼容适配器
 //!
-//! 适用于：OpenAI、DeepSeek、Qoder、ccode Ccode 等原生兼容 /v1/chat/completions 的后端
+//! 适用于：DeepSeek 系列模型（deepseek-chat / deepseek-reasoner）
+//!
+//! DeepSeek API 基于 OpenAI Chat Completions 格式，但有独特扩展：
+//! - deepseek-reasoner 在 delta 中同时返回 `content` 和 `reasoning_content`
+//! - `reasoning_content` 包含思维链内容，映射到 StreamChannel::Reasoning
+//! - deepseek-chat 使用标准 OpenAI 格式
+//! - API 端点：https://api.deepseek.com/v1/chat/completions
 //!
 //! 流式解析基于 SSE (Server-Sent Events) 协议：
 //! - 每行以 "data: " 开头
 //! - 内容为 JSON 格式的 chunk
 //! - 流结束标记为 "data: [DONE]"
-//!
-//! OpenAI 流式 chunk 格式：
-//! ```json
-//! {
-//!   "id": "chatcmpl-xxx",
-//!   "choices": [{
-//!     "index": 0,
-//!     "delta": { "role": "assistant" | "content": "..." | "tool_calls": [...] },
-//!     "finish_reason": null | "stop" | "tool_calls"
-//!   }],
-//!   "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
-//! }
-//! ```
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use futures::stream::StreamExt;
 use futures::Stream;
 use serde::Deserialize;
@@ -31,23 +24,27 @@ use super::provider::{
     TokenUsage, ToolCallChunk, CancellationHandle,
 };
 
-/// OpenAI 兼容 Provider 配置
+/// DeepSeek Provider 配置
 #[derive(Debug, Clone)]
-pub struct OpenAICompatConfig {
+pub struct DeepSeekCompatConfig {
+    /// Provider 名称
     pub name: String,
+    /// DeepSeek API Key
     pub api_key: String,
+    /// API 基础 URL（默认 https://api.deepseek.com）
     pub base_url: String,
+    /// 支持的模型列表
     pub models: Vec<String>,
 }
 
-/// OpenAI 兼容适配器
-pub struct OpenAICompatProvider {
-    config: OpenAICompatConfig,
+/// DeepSeek 兼容适配器
+pub struct DeepSeekCompatProvider {
+    config: DeepSeekCompatConfig,
     client: reqwest::Client,
 }
 
-impl OpenAICompatProvider {
-    pub fn new(config: OpenAICompatConfig) -> Self {
+impl DeepSeekCompatProvider {
+    pub fn new(config: DeepSeekCompatConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()
@@ -60,7 +57,12 @@ impl OpenAICompatProvider {
         format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'))
     }
 
-    /// 将 SampleRequest 转换为 OpenAI API 请求体
+    /// 判断是否为推理模型（deepseek-reasoner）
+    fn is_reasoner_model(model: &str) -> bool {
+        model.contains("reasoner") || model.contains("r1")
+    }
+
+    /// 将 SampleRequest 转换为 DeepSeek API 请求体
     fn build_request_body(&self, request: &SampleRequest) -> serde_json::Value {
         // 构建消息列表：如果有 system_prompt，将其插入为第一条 system 消息
         let mut messages = Vec::new();
@@ -123,6 +125,7 @@ impl OpenAICompatProvider {
     }
 
     /// 解析 SSE 行，提取 data 部分并转换为 StreamChunk
+    /// DeepSeek 的 reasoning_content 在 delta 中与 content 并列
     fn parse_sse_line(request_id: &str, line: &str) -> Option<Result<StreamChunk>> {
         let line = line.trim();
 
@@ -140,14 +143,14 @@ impl OpenAICompatProvider {
         }
 
         // 解析 JSON
-        let chunk: OpenAIStreamChunk = match serde_json::from_str(data) {
+        let chunk: DeepSeekStreamChunk = match serde_json::from_str(data) {
             Ok(c) => c,
             Err(e) => {
                 return Some(Err(anyhow!("SSE chunk JSON 解析失败：{}", e)));
             }
         };
 
-        // 提取 usage（某些 API 在最后一个 chunk 中返回 usage）
+        // 提取 usage（DeepSeek 在最后一个 chunk 或 stream_options 开启时返回 usage）
         let usage = chunk.usage.map(|u| TokenUsage {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
@@ -160,25 +163,26 @@ impl OpenAICompatProvider {
         // 转换 delta 为 StreamChunk
         let delta = &choice.delta;
 
-        if let Some(content) = &delta.content {
-            if !content.is_empty() {
-                return Some(Ok(StreamChunk {
-                    request_id: request_id.to_string(),
-                    channel: StreamChannel::Text,
-                    content: content.clone(),
-                    tool_call: None,
-                    usage: usage.clone(),
-                }));
-            }
-        }
-
-        // 推理内容（某些模型支持）
+        // 优先处理 reasoning_content（DeepSeek reasoner 特有）
         if let Some(reasoning_content) = &delta.reasoning_content {
             if !reasoning_content.is_empty() {
                 return Some(Ok(StreamChunk {
                     request_id: request_id.to_string(),
                     channel: StreamChannel::Reasoning,
                     content: reasoning_content.clone(),
+                    tool_call: None,
+                    usage: usage.clone(),
+                }));
+            }
+        }
+
+        // 普通文本内容
+        if let Some(content) = &delta.content {
+            if !content.is_empty() {
+                return Some(Ok(StreamChunk {
+                    request_id: request_id.to_string(),
+                    channel: StreamChannel::Text,
+                    content: content.clone(),
                     tool_call: None,
                     usage: usage.clone(),
                 }));
@@ -218,101 +222,105 @@ impl OpenAICompatProvider {
     }
 }
 
-// ---- OpenAI API 数据结构 ----
+// ---- DeepSeek API 数据结构 ----
 
-/// OpenAI 流式 chunk 原始格式
+/// DeepSeek 流式 chunk 原始格式（与 OpenAI 兼容，但含 reasoning_content）
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIStreamChunk {
-    choices: Vec<OpenAIChoice>,
-    usage: Option<OpenAIUsage>,
+struct DeepSeekStreamChunk {
+    choices: Vec<DeepSeekChoice>,
+    usage: Option<DeepSeekUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIChoice {
+struct DeepSeekChoice {
     index: u32,
-    delta: OpenAIDelta,
+    delta: DeepSeekDelta,
     finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIDelta {
+struct DeepSeekDelta {
     role: Option<String>,
     content: Option<String>,
+    /// DeepSeek 特有：推理内容（deepseek-reasoner 返回）
     #[serde(default)]
     reasoning_content: Option<String>,
-    tool_calls: Option<Vec<OpenAIToolCallDelta>>,
+    tool_calls: Option<Vec<DeepSeekToolCallDelta>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIToolCallDelta {
+struct DeepSeekToolCallDelta {
     index: u32,
     id: Option<String>,
     #[serde(default)]
     r#type: Option<String>,
-    function: Option<OpenAIFunctionDelta>,
+    function: Option<DeepSeekFunctionDelta>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIFunctionDelta {
+struct DeepSeekFunctionDelta {
     name: String,
     arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIUsage {
+struct DeepSeekUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
 }
 
-/// OpenAI 非流式响应
+/// DeepSeek 非流式响应
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIResponse {
+struct DeepSeekResponse {
     id: String,
-    choices: Vec<OpenAIResponseChoice>,
-    usage: OpenAIUsage,
+    choices: Vec<DeepSeekResponseChoice>,
+    usage: DeepSeekUsage,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIResponseChoice {
+struct DeepSeekResponseChoice {
     index: u32,
-    message: OpenAIResponseMessage,
+    message: DeepSeekResponseMessage,
     finish_reason: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIResponseMessage {
+struct DeepSeekResponseMessage {
     role: String,
     content: Option<String>,
-    tool_calls: Option<Vec<OpenAIResponseToolCall>>,
+    /// DeepSeek 特有：推理内容
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<DeepSeekResponseToolCall>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIResponseToolCall {
+struct DeepSeekResponseToolCall {
     id: String,
     r#type: String,
-    function: OpenAIResponseFunction,
+    function: DeepSeekResponseFunction,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct OpenAIResponseFunction {
+struct DeepSeekResponseFunction {
     name: String,
     arguments: String,
 }
 
 #[async_trait::async_trait]
-impl Provider for OpenAICompatProvider {
+impl Provider for DeepSeekCompatProvider {
     async fn stream(
         &self,
         request: SampleRequest,
@@ -336,10 +344,8 @@ impl Provider for OpenAICompatProvider {
             return Err(anyhow!("API 返回错误 {}：{}", status, body));
         }
 
-        // 将 response body 转为字节流，然后按 SSE 行解析
         let byte_stream = response.bytes_stream();
 
-        // 使用 buffer + 行分割解析 SSE
         let rid = request_id.clone();
         let stream = byte_stream
             .scan(String::new(), move |buffer, chunk_result| {
@@ -359,7 +365,6 @@ impl Provider for OpenAICompatProvider {
 
                 let mut results = Vec::new();
 
-                // 按行分割
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].to_string();
                     buffer.drain(..=pos);
@@ -395,7 +400,7 @@ impl Provider for OpenAICompatProvider {
             return Err(anyhow!("API 返回错误 {}：{}", status, body_text));
         }
 
-        let resp: OpenAIResponse = response
+        let resp: DeepSeekResponse = response
             .json()
             .await
             .map_err(|e| anyhow!("响应 JSON 解析失败：{}", e))?;
@@ -432,124 +437,97 @@ mod tests {
     #[test]
     fn test_parse_sse_text_chunk() {
         let line = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let chunk = OpenAICompatProvider::parse_sse_line("req-1", line)
+        let chunk = DeepSeekCompatProvider::parse_sse_line("req-1", line)
             .unwrap()
             .unwrap();
         assert_eq!(chunk.request_id, "req-1");
         assert!(matches!(chunk.channel, StreamChannel::Text));
         assert_eq!(chunk.content, "Hello");
-        assert!(chunk.usage.is_none());
+    }
+
+    #[test]
+    fn test_parse_sse_reasoning_content() {
+        let line = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"Let me reason through this..."},"finish_reason":null}]}"#;
+        let chunk = DeepSeekCompatProvider::parse_sse_line("req-1", line)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(chunk.channel, StreamChannel::Reasoning));
+        assert_eq!(chunk.content, "Let me reason through this...");
+    }
+
+    #[test]
+    fn test_parse_sse_reasoning_before_content() {
+        // DeepSeek reasoner 先发 reasoning_content，再发 content
+        let line1 = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"Step 1: Analyze"},"finish_reason":null}]}"#;
+        let chunk1 = DeepSeekCompatProvider::parse_sse_line("req-1", line1)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(chunk1.channel, StreamChannel::Reasoning));
+
+        let line2 = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"The answer is"},"finish_reason":null}]}"#;
+        let chunk2 = DeepSeekCompatProvider::parse_sse_line("req-1", line2)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(chunk2.channel, StreamChannel::Text));
     }
 
     #[test]
     fn test_parse_sse_done() {
         let line = "data: [DONE]";
-        assert!(OpenAICompatProvider::parse_sse_line("req-1", line).is_none());
+        assert!(DeepSeekCompatProvider::parse_sse_line("req-1", line).is_none());
     }
 
     #[test]
-    fn test_parse_sse_tool_call() {
-        let line = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]},"finish_reason":null}]}"#;
-        let chunk = OpenAICompatProvider::parse_sse_line("req-1", line)
+    fn test_parse_sse_with_usage() {
+        let line = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"thinking..."},"finish_reason":null}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}"#;
+        let chunk = DeepSeekCompatProvider::parse_sse_line("req-1", line)
             .unwrap()
             .unwrap();
-        assert!(matches!(chunk.channel, StreamChannel::ToolCall));
-        assert!(chunk.tool_call.is_some());
-        let tc = chunk.tool_call.unwrap();
-        assert_eq!(tc.tool_name, "bash");
+        assert!(chunk.usage.is_some());
+        let usage = chunk.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens, 150);
     }
 
     #[test]
-    fn test_build_request_body() {
-        let config = OpenAICompatConfig {
-            name: "test".into(),
-            api_key: "key".into(),
-            base_url: "https://api.ccode.dev/v1".into(),
-            models: vec!["ccode-3".into()],
+    fn test_is_reasoner_model() {
+        assert!(DeepSeekCompatProvider::is_reasoner_model("deepseek-reasoner"));
+        assert!(DeepSeekCompatProvider::is_reasoner_model("deepseek-r1"));
+        assert!(!DeepSeekCompatProvider::is_reasoner_model("deepseek-chat"));
+    }
+
+    #[test]
+    fn test_build_request_body_with_system_prompt() {
+        let config = DeepSeekCompatConfig {
+            name: "deepseek".into(),
+            api_key: "sk-test".into(),
+            base_url: "https://api.deepseek.com/v1".into(),
+            models: vec!["deepseek-reasoner".into()],
         };
-        let provider = OpenAICompatProvider::new(config);
+        let provider = DeepSeekCompatProvider::new(config);
 
         let request = SampleRequest {
             request_id: "req-1".into(),
             agent_id: "agent-1".into(),
-            model: "ccode-3".into(),
-            messages: vec![
-                super::super::provider::ChatMessage {
-                    role: "user".into(),
-                    content: "Hello".into(),
-                },
-            ],
+            model: "deepseek-reasoner".into(),
+            messages: vec![super::super::provider::ChatMessage {
+                role: "user".into(),
+                content: "Hello".into(),
+            }],
             tools: Vec::new(),
             stream: true,
             reasoning_effort: None,
             max_tokens: None,
             temperature: None,
-            system_prompt: None,
+            system_prompt: Some("You are a coding assistant.".into()),
             tool_choice: None,
         };
 
         let body = provider.build_request_body(&request);
-        assert_eq!(body["model"], "ccode-3");
-        assert_eq!(body["stream"], true);
-    }
-
-    #[test]
-    fn test_parse_sse_reasoning_chunk() {
-        let line = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"Let me think..."},"finish_reason":null}]}"#;
-        let chunk = OpenAICompatProvider::parse_sse_line("req-1", line)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(chunk.channel, StreamChannel::Reasoning));
-        assert_eq!(chunk.content, "Let me think...");
-    }
-
-    #[test]
-    fn test_parse_sse_chunk_with_usage() {
-        let line = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#;
-        // delta content is empty, so this should return None (no content to emit)
-        assert!(OpenAICompatProvider::parse_sse_line("req-1", line).is_none());
-    }
-
-    #[test]
-    fn test_build_request_body_with_system_prompt_and_tool_choice() {
-        let config = OpenAICompatConfig {
-            name: "test".into(),
-            api_key: "key".into(),
-            base_url: "https://api.ccode.dev/v1".into(),
-            models: vec!["ccode-3".into()],
-        };
-        let provider = OpenAICompatProvider::new(config);
-
-        let request = SampleRequest {
-            request_id: "req-1".into(),
-            agent_id: "agent-1".into(),
-            model: "ccode-3".into(),
-            messages: vec![
-                super::super::provider::ChatMessage {
-                    role: "user".into(),
-                    content: "Hello".into(),
-                },
-            ],
-            tools: vec![super::super::provider::ToolDefinition {
-                name: "bash".into(),
-                description: "Execute bash".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            }],
-            stream: true,
-            reasoning_effort: None,
-            max_tokens: None,
-            temperature: None,
-            system_prompt: Some("You are a helpful assistant.".into()),
-            tool_choice: Some(super::super::provider::ToolChoice::Auto),
-        };
-
-        let body = provider.build_request_body(&request);
-        // 系统提示应作为第一条 system 消息
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[0]["content"], "You are a helpful assistant.");
+        assert_eq!(messages[0]["content"], "You are a coding assistant.");
         assert_eq!(messages[1]["role"], "user");
-        // 工具选择
-        assert_eq!(body["tool_choice"], "auto");
     }
 }

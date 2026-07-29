@@ -6,9 +6,12 @@
 //! 3. 调用 Provider 的 stream 方法获取 LLM 响应
 //! 4. 将每个 StreamChunk 封装为消息，发布到 sampler/{req_id}/stream topic
 //! 5. 流式结束后发送 SampleResponse（含 token usage）
+//! 6. 支持取消信号（sampler/{req_id}/cancel）
+//! 7. 发射 SamplerEvent 供外部消费
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use std::collections::HashMap;
 use tokio::time::sleep;
 
 use crate::message::frame::FrameCodec;
@@ -17,7 +20,7 @@ use crate::message::Topic;
 use crate::metrics::AgentMetrics;
 use crate::node::{Node, NodeId, NodeType, NodeContext};
 use crate::node::transport::NodeTransportHandle;
-use crate::sampler::provider::{SampleRequest, StreamChunk};
+use crate::sampler::provider::{SampleRequest, StreamChunk, TokenUsage, CancellationHandle, SamplerEvent};
 use crate::sampler::router::ProviderRouter;
 use crate::sampler::retry::{classify_sampler_error, resolve_max_retries, RetryDecision};
 use crate::config::provider::ProviderConfig;
@@ -29,6 +32,8 @@ pub struct SamplerNode {
     router: ProviderRouter,
     /// 最大重试次数（从环境变量或默认值解析）
     max_retries: u32,
+    /// 活跃请求的取消句柄（request_id → CancellationHandle）
+    cancel_handles: HashMap<String, CancellationHandle>,
 }
 
 impl SamplerNode {
@@ -36,14 +41,14 @@ impl SamplerNode {
     pub fn new(id: NodeId) -> Self {
         let router = ProviderRouter::from_configs(&[]);
         let max_retries = resolve_max_retries(None);
-        Self { id, router, max_retries }
+        Self { id, router, max_retries, cancel_handles: HashMap::new() }
     }
 
     /// 使用配置列表创建 SamplerNode
     pub fn with_configs(id: NodeId, configs: &[ProviderConfig]) -> Self {
         let router = ProviderRouter::from_configs(configs);
         let max_retries = resolve_max_retries(None);
-        Self { id, router, max_retries }
+        Self { id, router, max_retries, cancel_handles: HashMap::new() }
     }
 
     /// 尝试从指定 Provider 获取流式响应，失败时自动 fallback
@@ -52,6 +57,7 @@ impl SamplerNode {
     async fn try_stream_with_fallback(
         &mut self,
         request: &SampleRequest,
+        cancel: CancellationHandle,
     ) -> anyhow::Result<(std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamChunk>> + Send>>, String)> {
         // 第一次尝试：主 Provider
         let model = &request.model;
@@ -60,7 +66,7 @@ impl SamplerNode {
             let name = provider_name.clone();
             let provider = self.router.get_provider_mut(&provider_name)
                 .ok_or_else(|| anyhow::anyhow!("Provider {} 不存在", provider_name))?;
-            match provider.stream(request.clone()).await {
+            match provider.stream(request.clone(), cancel.clone()).await {
                 Ok(stream) => return Ok((stream, name)),
                 Err(e) => {
                     tracing::warn!("Provider {} 采样失败：{}, 尝试 fallback", name, e);
@@ -75,7 +81,7 @@ impl SamplerNode {
                 let fallback_name = provider_name.clone();
                 tracing::info!("Fallback 到 Provider：{}", fallback_name);
                 if let Some(provider) = self.router.get_provider_mut(&provider_name) {
-                    match provider.stream(request.clone()).await {
+                    match provider.stream(request.clone(), cancel.clone()).await {
                         Ok(stream) => return Ok((stream, fallback_name)),
                         Err(e) => {
                             tracing::warn!("Fallback Provider {} 也失败：{}", fallback_name, e);
@@ -95,13 +101,44 @@ impl SamplerNode {
         model: &str,
         mut stream: std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamChunk>> + Send>>,
         transport: &NodeTransportHandle,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<TokenUsage> {
         tracing::debug!("开始采样：model={}, request_id={}", model, request_id);
+
+        // 累积 token 使用量
+        let mut accumulated_usage = TokenUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        };
 
         // 逐 chunk 读取流式响应
         while let Some(chunk_result) = stream.next().await {
+            // 检查取消信号
+            if let Some(handle) = self.cancel_handles.get(request_id) {
+                if handle.is_cancelled() {
+                    // 发射取消事件
+                    let cancel_event = SamplerEvent::Cancelled {
+                        request_id: request_id.to_string(),
+                    };
+                    let _ = self.emit_event(&cancel_event, transport).await;
+                    tracing::info!("采样已取消：request_id={}", request_id);
+                    break;
+                }
+            }
+
             match chunk_result {
                 Ok(chunk) => {
+                    // 累积 usage
+                    if let Some(ref usage) = chunk.usage {
+                        // 对于 prompt_tokens，取最大值（通常只在 message_start 时设置一次）
+                        accumulated_usage.prompt_tokens = accumulated_usage.prompt_tokens.max(usage.prompt_tokens);
+                        // 对于 completion_tokens，累加（message_delta 中逐步返回）
+                        if usage.completion_tokens > 0 {
+                            accumulated_usage.completion_tokens = accumulated_usage.completion_tokens.max(usage.completion_tokens);
+                        }
+                        accumulated_usage.total_tokens = accumulated_usage.prompt_tokens + accumulated_usage.completion_tokens;
+                    }
+
                     let stream_topic = Topic::sampler_stream(&chunk.request_id);
                     let chunk_msg = FrameCodec::new_message(
                         stream_topic,
@@ -120,6 +157,14 @@ impl SamplerNode {
                 Err(e) => {
                     tracing::warn!("Stream chunk 错误：{}", e);
                     AgentMetrics::global().record_error("sampler_stream_chunk_error");
+
+                    // 发射错误事件
+                    let error_event = SamplerEvent::Error {
+                        request_id: request_id.to_string(),
+                        error: format!("{}", e),
+                    };
+                    let _ = self.emit_event(&error_event, transport).await;
+
                     let err_msg = FrameCodec::new_message(
                         Topic::sampler_stream(request_id),
                         self.id.as_str(),
@@ -136,7 +181,7 @@ impl SamplerNode {
             }
         }
 
-        // 流式结束，发送 done 消息
+        // 流式结束，发送 done 消息（使用累积的 usage）
         let done_msg = FrameCodec::new_message(
             Topic::sampler_stream(request_id),
             self.id.as_str(),
@@ -144,9 +189,9 @@ impl SamplerNode {
                 "type": "done",
                 "request_id": request_id,
                 "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
+                    "prompt_tokens": accumulated_usage.prompt_tokens,
+                    "completion_tokens": accumulated_usage.completion_tokens,
+                    "total_tokens": accumulated_usage.total_tokens,
                 },
                 "finish_reason": "stop",
             }),
@@ -155,7 +200,47 @@ impl SamplerNode {
             transport.send_message(&done_msg).await?;
         }
 
+        // 发射完成事件
+        let completed_event = SamplerEvent::Completed {
+            request_id: request_id.to_string(),
+            usage: accumulated_usage.clone(),
+            finish_reason: "stop".to_string(),
+        };
+        let _ = self.emit_event(&completed_event, transport).await;
+
+        // 清理取消句柄
+        self.cancel_handles.remove(request_id);
+
         tracing::debug!("采样完成：model={}, request_id={}", model, request_id);
+        Ok(accumulated_usage)
+    }
+
+    /// 发射 SamplerEvent 到消息总线
+    async fn emit_event(
+        &self,
+        event: &SamplerEvent,
+        transport: &NodeTransportHandle,
+    ) -> anyhow::Result<()> {
+        let request_id = match event {
+            SamplerEvent::Started { request_id, .. } => request_id,
+            SamplerEvent::TextDelta { request_id, .. } => request_id,
+            SamplerEvent::ThinkingDelta { request_id, .. } => request_id,
+            SamplerEvent::ToolCallStart { request_id, .. } => request_id,
+            SamplerEvent::ToolCallDelta { request_id, .. } => request_id,
+            SamplerEvent::ToolCallEnd { request_id, .. } => request_id,
+            SamplerEvent::Completed { request_id, .. } => request_id,
+            SamplerEvent::Error { request_id, .. } => request_id,
+            SamplerEvent::Cancelled { request_id, .. } => request_id,
+        };
+        let event_topic = Topic::new(format!("sampler/{}/stream/event", request_id));
+        let event_msg = FrameCodec::new_message(
+            event_topic,
+            self.id.as_str(),
+            event,
+        )?;
+        if let Err(_) = transport.publish_data(&event_msg).await {
+            transport.send_message(&event_msg).await?;
+        }
         Ok(())
     }
 
@@ -170,17 +255,28 @@ impl SamplerNode {
         // 记录采样起始时间，用于计算推理延迟（从请求到响应的耗时）
         let start = std::time::Instant::now();
 
+        // 创建取消句柄并注册
+        let cancel_handle = CancellationHandle::new();
+        self.cancel_handles.insert(request_id.clone(), cancel_handle.clone());
+
+        // 发射开始事件
+        let started_event = SamplerEvent::Started {
+            request_id: request_id.clone(),
+            model: model.clone(),
+        };
+        let _ = self.emit_event(&started_event, transport).await;
+
         let mut retry_count: u32 = 0;
 
         loop {
-            match self.try_stream_with_fallback(&request).await {
+            match self.try_stream_with_fallback(&request, cancel_handle.clone()).await {
                 Ok((stream, provider_name)) => {
                     tracing::info!("采样开始：model={}, provider={}", model, provider_name);
                     let result = self.stream_to_bus(&request_id, &model, stream, transport).await;
                     // 采样完成，记录推理延迟（从请求到响应的耗时）
                     AgentMetrics::global()
                         .record_inference_latency(start.elapsed().as_millis() as f64);
-                    return result;
+                    return result.map(|_| ());
                 }
                 Err(e) => {
                     let error_message = format!("{}", e);
@@ -222,6 +318,14 @@ impl SamplerNode {
                         RetryDecision::Fatal(reason) => {
                             tracing::error!("采样致命错误：{}", reason);
                             AgentMetrics::global().record_error("sampler_fatal");
+
+                            // 发射错误事件
+                            let error_event = SamplerEvent::Error {
+                                request_id: request_id.clone(),
+                                error: reason.clone(),
+                            };
+                            let _ = self.emit_event(&error_event, transport).await;
+
                             let err_msg = FrameCodec::new_message(
                                 Topic::sampler_stream(&request_id),
                                 self.id.as_str(),
@@ -232,6 +336,8 @@ impl SamplerNode {
                                 }),
                             )?;
                             transport.send_message(&err_msg).await?;
+                            // 清理取消句柄
+                            self.cancel_handles.remove(&request_id);
                             return Err(e);
                         }
                     }
@@ -279,15 +385,29 @@ impl Node for SamplerNode {
     }
 
     async fn handle_message(&mut self, msg: Message, transport: &NodeTransportHandle) -> anyhow::Result<()> {
-        if msg.topic.as_str() == "sampler/request" {
+        let topic = msg.topic.as_str();
+        if topic == "sampler/request" {
             let request: SampleRequest = FrameCodec::decode_payload(&msg)?;
             self.handle_sample_request(request, transport).await?;
+        } else if topic.starts_with("sampler/") && topic.ends_with("/cancel") {
+            // 提取 request_id：sampler/{req_id}/cancel → req_id
+            let trimmed = topic.strip_prefix("sampler/").unwrap_or("");
+            let req_id = trimmed.strip_suffix("/cancel").unwrap_or("");
+            if !req_id.is_empty() {
+                if let Some(handle) = self.cancel_handles.get(req_id) {
+                    handle.cancel();
+                    tracing::info!("收到取消信号：request_id={}", req_id);
+                }
+            }
         }
         Ok(())
     }
 
     fn subscriptions(&self) -> Vec<String> {
-        vec!["sampler/request".into()]
+        vec![
+            "sampler/request".into(),
+            "sampler/*/cancel".into(),
+        ]
     }
 
     /// Sampler 发布的 topic（数据面 PUB）

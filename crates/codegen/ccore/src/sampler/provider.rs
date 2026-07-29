@@ -4,6 +4,8 @@ use anyhow::Result;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// 采样请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +28,10 @@ pub struct SampleRequest {
     pub max_tokens: Option<u32>,
     /// 温度
     pub temperature: Option<f64>,
+    /// 系统提示（独立于 messages）
+    pub system_prompt: Option<String>,
+    /// 工具选择策略
+    pub tool_choice: Option<ToolChoice>,
 }
 
 /// 聊天消息
@@ -54,6 +60,8 @@ pub struct StreamChunk {
     pub content: String,
     /// 工具调用信息（仅 tool_call 通道）
     pub tool_call: Option<ToolCallChunk>,
+    /// Token 使用量（最后一个 chunk 或包含 usage 的 chunk 中携带）
+    pub usage: Option<TokenUsage>,
 }
 
 /// 流式通道
@@ -81,7 +89,7 @@ pub struct SampleResponse {
 }
 
 /// Token 使用量
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -91,10 +99,11 @@ pub struct TokenUsage {
 /// Provider trait - 所有 LLM 后端必须实现
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
-    /// 流式采样
+    /// 流式采样（支持取消信号）
     async fn stream(
         &self,
         request: SampleRequest,
+        cancel: CancellationHandle,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>>;
 
     /// 非流式采样
@@ -105,4 +114,234 @@ pub trait Provider: Send + Sync {
 
     /// Provider 名称
     fn name(&self) -> &str;
+}
+
+/// 工具选择策略
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ToolChoice {
+    /// 自动决定
+    Auto,
+    /// 必须调用工具
+    Required,
+    /// 不调用工具
+    None,
+    /// 指定工具
+    Specific { name: String },
+}
+
+/// 采样器事件（供外部消费）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SamplerEvent {
+    /// 采样开始
+    Started { request_id: String, model: String },
+    /// 文本增量
+    TextDelta { request_id: String, delta: String },
+    /// 思考/推理增量
+    ThinkingDelta { request_id: String, delta: String },
+    /// 工具调用开始
+    ToolCallStart { request_id: String, tool_call_id: String, tool_name: String },
+    /// 工具调用参数增量
+    ToolCallDelta { request_id: String, tool_call_id: String, delta: String },
+    /// 工具调用结束
+    ToolCallEnd { request_id: String, tool_call_id: String },
+    /// 采样完成
+    Completed { request_id: String, usage: TokenUsage, finish_reason: String },
+    /// 采样错误
+    Error { request_id: String, error: String },
+    /// 采样取消
+    Cancelled { request_id: String },
+}
+
+/// 取消句柄
+#[derive(Debug, Clone)]
+pub struct CancellationHandle {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationHandle {
+    pub fn new() -> Self {
+        Self { cancelled: Arc::new(AtomicBool::new(false)) }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for CancellationHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 内容块类型
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ContentBlock {
+    /// 文本内容
+    Text { text: String },
+    /// 工具调用
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// 思考内容（Claude extended thinking / DeepSeek reasoning）
+    Thinking { thinking: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sampler_event_serialization() {
+        let event = SamplerEvent::Started {
+            request_id: "req-1".into(),
+            model: "gpt-4".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("Started"));
+        assert!(json.contains("req-1"));
+
+        let event = SamplerEvent::TextDelta {
+            request_id: "req-1".into(),
+            delta: "Hello".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("TextDelta"));
+
+        let event = SamplerEvent::ThinkingDelta {
+            request_id: "req-1".into(),
+            delta: "Let me think".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("ThinkingDelta"));
+
+        let event = SamplerEvent::ToolCallStart {
+            request_id: "req-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("ToolCallStart"));
+
+        let event = SamplerEvent::Completed {
+            request_id: "req-1".into(),
+            usage: TokenUsage { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+            finish_reason: "stop".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("Completed"));
+
+        let event = SamplerEvent::Cancelled { request_id: "req-1".into() };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("Cancelled"));
+
+        // 往返测试
+        let event = SamplerEvent::Error {
+            request_id: "req-1".into(),
+            error: "timeout".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: SamplerEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, SamplerEvent::Error { .. }));
+    }
+
+    #[test]
+    fn test_cancellation_handle() {
+        let handle = CancellationHandle::new();
+        assert!(!handle.is_cancelled());
+
+        handle.cancel();
+        assert!(handle.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancellation_handle_clone() {
+        let handle = CancellationHandle::new();
+        let cloned = handle.clone();
+
+        assert!(!handle.is_cancelled());
+        assert!(!cloned.is_cancelled());
+
+        handle.cancel();
+        assert!(handle.is_cancelled());
+        assert!(cloned.is_cancelled()); // 共享同一个 AtomicBool
+    }
+
+    #[test]
+    fn test_cancellation_handle_default() {
+        let handle = CancellationHandle::default();
+        assert!(!handle.is_cancelled());
+    }
+
+    #[test]
+    fn test_content_block_serialization() {
+        let block = ContentBlock::Text { text: "Hello".into() };
+        let json = serde_json::to_string(&block).unwrap();
+        let deserialized: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ContentBlock::Text { .. }));
+
+        let block = ContentBlock::ToolUse {
+            id: "tool-1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let deserialized: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ContentBlock::ToolUse { .. }));
+
+        let block = ContentBlock::Thinking { thinking: "Let me reason...".into() };
+        let json = serde_json::to_string(&block).unwrap();
+        let deserialized: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ContentBlock::Thinking { .. }));
+    }
+
+    #[test]
+    fn test_tool_choice_serialization() {
+        let tc = ToolChoice::Auto;
+        let json = serde_json::to_string(&tc).unwrap();
+        let deserialized: ToolChoice = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ToolChoice::Auto));
+
+        let tc = ToolChoice::Required;
+        let json = serde_json::to_string(&tc).unwrap();
+        let deserialized: ToolChoice = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ToolChoice::Required));
+
+        let tc = ToolChoice::None;
+        let json = serde_json::to_string(&tc).unwrap();
+        let deserialized: ToolChoice = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ToolChoice::None));
+
+        let tc = ToolChoice::Specific { name: "bash".into() };
+        let json = serde_json::to_string(&tc).unwrap();
+        let deserialized: ToolChoice = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ToolChoice::Specific { .. }));
+    }
+
+    #[test]
+    fn test_token_usage_equality() {
+        let u1 = TokenUsage { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 };
+        let u2 = TokenUsage { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 };
+        assert_eq!(u1, u2);
+    }
+
+    #[test]
+    fn test_stream_chunk_with_usage() {
+        let chunk = StreamChunk {
+            request_id: "req-1".into(),
+            channel: StreamChannel::Text,
+            content: "Hello".into(),
+            tool_call: None,
+            usage: Some(TokenUsage { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }),
+        };
+        assert!(chunk.usage.is_some());
+        let usage = chunk.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 5);
+    }
 }

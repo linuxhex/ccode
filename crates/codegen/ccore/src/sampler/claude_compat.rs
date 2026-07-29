@@ -27,6 +27,7 @@ use std::pin::Pin;
 
 use super::provider::{
     Provider, SampleRequest, SampleResponse, StreamChannel, StreamChunk, TokenUsage, ToolCallChunk,
+    CancellationHandle,
 };
 
 /// Claude 兼容 Provider 配置
@@ -80,6 +81,11 @@ impl ClaudeCompatProvider {
             "max_tokens": request.max_tokens.unwrap_or(8192),
         });
 
+        // 系统提示作为顶层 system 字段（而非放在 messages 中）
+        if let Some(ref system_prompt) = request.system_prompt {
+            body["system"] = serde_json::json!(system_prompt);
+        }
+
         // 工具定义
         if !request.tools.is_empty() {
             body["tools"] = serde_json::json!(
@@ -91,6 +97,19 @@ impl ClaudeCompatProvider {
                     })
                 }).collect::<Vec<_>>()
             );
+
+            // 工具选择策略
+            if let Some(ref tool_choice) = request.tool_choice {
+                body["tool_choice"] = match tool_choice {
+                    super::provider::ToolChoice::Auto => serde_json::json!({"type": "auto"}),
+                    super::provider::ToolChoice::Required => serde_json::json!({"type": "any"}),
+                    super::provider::ToolChoice::None => serde_json::json!({"type": "none"}),
+                    super::provider::ToolChoice::Specific { name } => serde_json::json!({
+                        "type": "tool",
+                        "name": name
+                    }),
+                };
+            }
         }
 
         // 温度
@@ -134,6 +153,7 @@ impl ClaudeCompatProvider {
                                 channel: StreamChannel::Text,
                                 content: delta.delta.text,
                                 tool_call: None,
+                                usage: None,
                             }));
                         }
                     }
@@ -149,6 +169,7 @@ impl ClaudeCompatProvider {
                                     tool_name: tool.tool_name.clone(),
                                     arguments: delta.delta.partial_json,
                                 }),
+                                usage: None,
                             }));
                         }
                     }
@@ -160,6 +181,7 @@ impl ClaudeCompatProvider {
                                 channel: StreamChannel::Reasoning,
                                 content: delta.delta.thinking,
                                 tool_call: None,
+                                usage: None,
                             }));
                         }
                     }
@@ -182,13 +204,59 @@ impl ClaudeCompatProvider {
                         tool_call_id: block_start.content_block.id,
                         tool_name: block_start.content_block.name,
                     });
+                } else if block_start.content_block.r#type == "thinking" {
+                    // Extended thinking 块开始 - 不需要特殊处理，后续 thinking_delta 会发送内容
                 }
             }
             "content_block_stop" => {
                 // 内容块结束 - 清除活跃工具调用
                 *active_tool = None;
             }
-            // message_start / message_delta / message_stop / ping 等事件不需要转换为 StreamChunk
+            "message_start" => {
+                // 消息开始 - 包含初始 usage 信息
+                let msg_start: ClaudeMessageStart = match serde_json::from_str(data) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        results.push(Err(anyhow!("message_start JSON 解析失败：{}", e)));
+                        return results;
+                    }
+                };
+                // 发送包含 usage 的 chunk
+                results.push(Ok(StreamChunk {
+                    request_id: request_id.to_string(),
+                    channel: StreamChannel::Text,
+                    content: String::new(),
+                    tool_call: None,
+                    usage: Some(TokenUsage {
+                        prompt_tokens: msg_start.message.usage.input_tokens,
+                        completion_tokens: 0,
+                        total_tokens: msg_start.message.usage.input_tokens,
+                    }),
+                }));
+            }
+            "message_delta" => {
+                // 消息级增量 - 包含 stop_reason 和 output_tokens usage
+                let msg_delta: ClaudeMessageDelta = match serde_json::from_str(data) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        results.push(Err(anyhow!("message_delta JSON 解析失败：{}", e)));
+                        return results;
+                    }
+                };
+                // 发送包含 output usage 的 chunk
+                results.push(Ok(StreamChunk {
+                    request_id: request_id.to_string(),
+                    channel: StreamChannel::Text,
+                    content: String::new(),
+                    tool_call: None,
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 0,
+                        completion_tokens: msg_delta.usage.output_tokens,
+                        total_tokens: msg_delta.usage.output_tokens,
+                    }),
+                }));
+            }
+            // message_stop / ping 等事件不需要转换为 StreamChunk
             _ => {}
         }
 
@@ -333,6 +401,7 @@ impl Provider for ClaudeCompatProvider {
     async fn stream(
         &self,
         request: SampleRequest,
+        cancel: CancellationHandle,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let body = self.build_request_body(&request);
         let request_id = request.request_id.clone();
@@ -369,6 +438,11 @@ impl Provider for ClaudeCompatProvider {
             .scan(
                 SseParserState::default(),
                 move |state, chunk_result| {
+                    // 检查取消信号
+                    if cancel.is_cancelled() {
+                        return std::future::ready(None);
+                    }
+
                     let chunk = match chunk_result {
                         Ok(c) => c,
                         Err(e) => {
@@ -493,6 +567,7 @@ mod tests {
         assert_eq!(chunk.request_id, "req-1");
         assert!(matches!(chunk.channel, StreamChannel::Text));
         assert_eq!(chunk.content, "Hello");
+        assert!(chunk.usage.is_none());
     }
 
     #[test]
@@ -559,6 +634,8 @@ mod tests {
             reasoning_effort: None,
             max_tokens: None,
             temperature: None,
+            system_prompt: None,
+            tool_choice: None,
         };
 
         let body = provider.build_request_body(&request);
@@ -566,6 +643,8 @@ mod tests {
         assert_eq!(body["stream"], true);
         // max_tokens 默认 8192
         assert_eq!(body["max_tokens"], 8192);
+        // 无 system prompt 时不应该有 system 字段
+        assert!(body.get("system").is_none());
     }
 
     #[test]
@@ -596,6 +675,8 @@ mod tests {
             reasoning_effort: None,
             max_tokens: Some(4096),
             temperature: Some(0.5),
+            system_prompt: Some("You are a helpful assistant.".into()),
+            tool_choice: Some(super::super::provider::ToolChoice::Auto),
         };
 
         let body = provider.build_request_body(&request);
@@ -606,5 +687,34 @@ mod tests {
         assert!(tools[0].get("parameters").is_none());
         assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["temperature"], 0.5);
+        // 系统提示作为顶层 system 字段
+        assert_eq!(body["system"], "You are a helpful assistant.");
+        // 工具选择
+        assert_eq!(body["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn test_parse_message_start_with_usage() {
+        let mut active_tool = None;
+        let data = r#"{"type":"message_start","message":{"id":"msg_abc","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-20250514","stop_reason":null,"usage":{"input_tokens":25,"output_tokens":0}}}"#;
+        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "message_start", data, &mut active_tool);
+        assert_eq!(chunks.len(), 1);
+        let chunk = chunks[0].as_ref().unwrap();
+        assert!(chunk.usage.is_some());
+        let usage = chunk.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 25);
+        assert_eq!(usage.completion_tokens, 0);
+    }
+
+    #[test]
+    fn test_parse_message_delta_with_usage() {
+        let mut active_tool = None;
+        let data = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}"#;
+        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "message_delta", data, &mut active_tool);
+        assert_eq!(chunks.len(), 1);
+        let chunk = chunks[0].as_ref().unwrap();
+        assert!(chunk.usage.is_some());
+        let usage = chunk.usage.as_ref().unwrap();
+        assert_eq!(usage.completion_tokens, 15);
     }
 }

@@ -339,6 +339,8 @@ impl ThinkerNode {
             reasoning_effort: self.doom_loop_detector.current_reasoning_effort(),
             max_tokens: None,
             temperature: None,
+            system_prompt: None,
+            tool_choice: None,
         }
     }
 

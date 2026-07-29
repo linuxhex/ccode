@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use super::provider::Provider;
 use super::openai_compat::OpenAICompatProvider;
 use super::claude_compat::ClaudeCompatProvider;
+use super::deepseek_compat::DeepSeekCompatProvider;
 
 use crate::config::provider::ProviderConfig;
 
@@ -81,8 +82,16 @@ impl ProviderRouter {
 
         for config in configs {
             let provider: Box<dyn Provider> = match config.provider_type.as_str() {
-                "openai" | "openai-compat" | "ccode" | "deepseek" => {
+                "openai" | "openai-compat" | "ccode" => {
                     Box::new(OpenAICompatProvider::new(super::openai_compat::OpenAICompatConfig {
+                        name: config.name.clone(),
+                        api_key: config.api_key.clone(),
+                        base_url: config.base_url.clone(),
+                        models: config.models.clone(),
+                    }))
+                }
+                "deepseek" => {
+                    Box::new(DeepSeekCompatProvider::new(super::deepseek_compat::DeepSeekCompatConfig {
                         name: config.name.clone(),
                         api_key: config.api_key.clone(),
                         base_url: config.base_url.clone(),
