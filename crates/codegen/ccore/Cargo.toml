@@ -7,6 +7,10 @@ description = "ccode 核心库 - 消息总线驱动的终端 AI 编程代理"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+dashboard = ["axum", "tower", "tower-http"]
+
 [dependencies]
 # 异步运行时
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -65,6 +69,11 @@ regex = "1"
 
 # Git 支持
 git2 = "0.20"
+
+# Dashboard HTTP 服务器
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

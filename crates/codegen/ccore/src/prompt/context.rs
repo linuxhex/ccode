@@ -3,8 +3,12 @@
 //! Borrowed from Claude Code's PromptContext design, adapted for ccore's
 //! message-bus architecture without ToolBridge dependency.
 
+use notify::Watcher;
 use serde::{Deserialize, Serialize};
-use crate::memory::working::WorkingMemory;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use crate::memory::working::{WorkingMemory, MessageRole};
 use crate::prompt::agents_md::AgentConfigFile;
 use crate::prompt::skills::SkillInfo;
 use crate::prompt::personas::PersonaInfo;
@@ -22,8 +26,246 @@ pub enum TemplateMode {
     Subagent,
 }
 
+/// 模板文件监听器（热重载）
+///
+/// 借鉴 Claude Code 的模板热重载机制，但简化实现：
+/// - 使用 notify crate 监听模板文件变化
+/// - 文件变更时重新加载模板内容
+/// - 无需加密（ccore 是开源项目）
+pub struct TemplateWatcher {
+    /// 文件系统监听器
+    watcher: notify::RecommendedWatcher,
+    /// 当前模板内容缓存
+    templates: Arc<RwLock<HashMap<String, String>>>,
+    /// 模板目录路径
+    template_dir: PathBuf,
+}
+
+impl std::fmt::Debug for TemplateWatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TemplateWatcher")
+            .field("template_dir", &self.template_dir)
+            .field("templates_count", &self.templates.read().unwrap().len())
+            .finish()
+    }
+}
+
+impl TemplateWatcher {
+    /// 创建新的模板监听器
+    ///
+    /// # 参数
+    /// - `template_dir`: 模板目录路径
+    ///
+    /// # 返回
+    /// 成功返回 TemplateWatcher，失败返回错误
+    pub fn new(template_dir: PathBuf) -> Result<Self, anyhow::Error> {
+        let templates = Arc::new(RwLock::new(HashMap::new()));
+
+        // 初始加载所有模板
+        let mut initial_templates = HashMap::new();
+        if template_dir.exists() {
+            for entry in std::fs::read_dir(&template_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().map(|e| e == "md").unwrap_or(false) {
+                    let name = path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        initial_templates.insert(name, content);
+                    }
+                }
+            }
+        }
+        *templates.write().unwrap() = initial_templates;
+
+        // 创建文件监听器
+        let templates_clone = Arc::clone(&templates);
+        let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                if event.kind.is_modify() || event.kind.is_create() {
+                    // 重新加载变更的模板
+                    for path in &event.paths {
+                        if path.extension().map(|e| e == "md").unwrap_or(false) {
+                            if let Ok(content) = std::fs::read_to_string(path) {
+                                let name = path.file_name()
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .to_string();
+                                if let Ok(mut guard) = templates_clone.write() {
+                                    guard.insert(name, content);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })?;
+
+        if template_dir.exists() {
+            watcher.watch(&template_dir, notify::RecursiveMode::NonRecursive)?;
+        }
+
+        Ok(Self {
+            watcher,
+            templates,
+            template_dir,
+        })
+    }
+
+    /// 获取模板内容
+    ///
+    /// # 参数
+    /// - `name`: 模板文件名
+    ///
+    /// # 返回
+    /// 模板内容的克隆
+    pub fn get(&self, name: &str) -> Option<String> {
+        self.templates.read().unwrap().get(name).cloned()
+    }
+
+    /// 获取模板目录路径
+    pub fn template_dir(&self) -> &PathBuf {
+        &self.template_dir
+    }
+}
+
+/// 动态模板渲染器（超越 Claude Code）
+///
+/// 核心能力：
+/// 1. 热重载：模板文件变更时自动更新
+/// 2. 动态注入：根据运行时状态注入内容
+/// 3. 条件渲染：根据 agent 类型选择不同模板片段
+pub struct DynamicTemplateRenderer {
+    /// 模板监听器
+    watcher: TemplateWatcher,
+}
+
+impl std::fmt::Debug for DynamicTemplateRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicTemplateRenderer")
+            .field("watcher", &self.watcher)
+            .finish()
+    }
+}
+
+impl DynamicTemplateRenderer {
+    /// 创建新的动态模板渲染器
+    ///
+    /// # 参数
+    /// - `template_dir`: 模板目录路径
+    ///
+    /// # 返回
+    /// 成功返回渲染器，失败返回错误
+    pub fn new(template_dir: PathBuf) -> Result<Self, anyhow::Error> {
+        let watcher = TemplateWatcher::new(template_dir)?;
+        Ok(Self { watcher })
+    }
+
+    /// 渲染系统提示（动态）
+    ///
+    /// 借鉴 Claude Code 的 render_with_extra，但更灵活：
+    /// 1. 加载基础模板
+    /// 2. 注入动态内容（工具定义、当前日期、工作目录）
+    /// 3. 条件渲染（如果是 subagent，跳过某些部分）
+    ///
+    /// # 参数
+    /// - `context`: 提示上下文
+    /// - `working_memory`: 工作记忆
+    ///
+    /// # 返回
+    /// 渲染后的提示字符串
+    pub fn render(&self, context: &PromptContext, working_memory: &WorkingMemory) -> String {
+        let template_name = match context.template_mode {
+            TemplateMode::Full => "full.md",
+            TemplateMode::Compact => "compact.md",
+            TemplateMode::Subagent => "subagent.md",
+        };
+
+        // 尝试从监听器获取模板，失败则使用内嵌模板
+        let mut template = self.watcher.get(template_name)
+            .unwrap_or_else(|| match context.template_mode {
+                TemplateMode::Full => include_str!("templates/full.md").to_string(),
+                TemplateMode::Compact => include_str!("templates/compact.md").to_string(),
+                TemplateMode::Subagent => include_str!("templates/subagent.md").to_string(),
+            });
+
+        // 动态注入占位符
+        template = self.inject_dynamic_content(template, context);
+
+        // 注入工作记忆
+        template = self.inject_working_memory(template, working_memory);
+
+        template
+    }
+
+    /// 注入动态内容（工具、日期、工作目录等）
+    fn inject_dynamic_content(&self, mut template: String, context: &PromptContext) -> String {
+        // 替换占位符：${{ tools_section }}
+        if let Some(ref tools) = context.tools_section {
+            template = template.replace("${{ tools_section }}", tools);
+        } else {
+            template = template.replace("${{ tools_section }}", "");
+        }
+
+        // 替换占位符：${{ current_date }}
+        if let Some(ref date) = context.current_date {
+            template = template.replace("${{ current_date }}", date);
+        } else {
+            template = template.replace("${{ current_date }}", "");
+        }
+
+        // 替换占位符：${{ working_directory }}
+        if let Some(ref wd) = context.working_directory {
+            template = template.replace("${{ working_directory }}", wd);
+        } else {
+            template = template.replace("${{ working_directory }}", "");
+        }
+
+        // 替换占位符：${{ custom_instructions }}
+        if let Some(ref instructions) = context.custom_instructions {
+            template = template.replace("${{ custom_instructions }}", instructions);
+        } else {
+            template = template.replace("${{ custom_instructions }}", "");
+        }
+
+        // 替换占位符：${{ os_name }}
+        if let Some(ref os) = context.os_name {
+            template = template.replace("${{ os_name }}", os);
+        } else {
+            template = template.replace("${{ os_name }}", "");
+        }
+
+        // 替换占位符：${{ shell_path }}
+        if let Some(ref shell) = context.shell_path {
+            template = template.replace("${{ shell_path }}", shell);
+        } else {
+            template = template.replace("${{ shell_path }}", "");
+        }
+
+        template
+    }
+
+    /// 注入工作记忆（热条目摘要）
+    fn inject_working_memory(&self, mut template: String, working_memory: &WorkingMemory) -> String {
+        // 注入热条目摘要
+        let hot_summary = working_memory.hot_entries_summary();
+        if !hot_summary.is_empty() {
+            template = template.replace("${{ recent_context }}", &format!(
+                "\n## Recent Context\n\n{}\n",
+                hot_summary
+            ));
+        } else {
+            template = template.replace("${{ recent_context }}", "");
+        }
+
+        template
+    }
+}
+
 /// Agent-specific inputs for system prompt rendering.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PromptContext {
     /// Which template mode to use
     pub template_mode: TemplateMode,
@@ -47,6 +289,28 @@ pub struct PromptContext {
     pub skills: Vec<SkillInfo>,
     /// Active personas for system prompt injection
     pub active_personas: Vec<PersonaInfo>,
+    /// Dynamic template renderer (optional, for hot reload)
+    #[serde(skip)]
+    pub renderer: Option<DynamicTemplateRenderer>,
+}
+
+impl Clone for PromptContext {
+    fn clone(&self) -> Self {
+        Self {
+            template_mode: self.template_mode.clone(),
+            working_directory: self.working_directory.clone(),
+            current_date: self.current_date.clone(),
+            os_name: self.os_name.clone(),
+            shell_path: self.shell_path.clone(),
+            custom_instructions: self.custom_instructions.clone(),
+            tools_section: self.tools_section.clone(),
+            memory_enabled: self.memory_enabled,
+            agents_md_files: self.agents_md_files.clone(),
+            skills: self.skills.clone(),
+            active_personas: self.active_personas.clone(),
+            renderer: None, // Renderer 不参与 Clone，设为 None
+        }
+    }
 }
 
 impl Default for PromptContext {
@@ -65,6 +329,7 @@ impl Default for PromptContext {
             agents_md_files: Vec::new(),
             skills: Vec::new(),
             active_personas: Vec::new(),
+            renderer: None,
         }
     }
 }
@@ -75,8 +340,26 @@ impl PromptContext {
         Self::default()
     }
 
+    /// Enable hot reload for templates
+    ///
+    /// # 参数
+    /// - `template_dir`: 模板目录路径
+    ///
+    /// # 返回
+    /// 更新后的 PromptContext
+    pub fn with_hot_reload(mut self, template_dir: PathBuf) -> Self {
+        self.renderer = DynamicTemplateRenderer::new(template_dir).ok();
+        self
+    }
+
     /// Render the full system prompt
     pub fn render(&self, working_memory: &WorkingMemory) -> String {
+        // 如果有动态渲染器，使用它
+        if let Some(ref renderer) = self.renderer {
+            return renderer.render(self, working_memory);
+        }
+
+        // 否则使用原有的静态渲染方式
         let mut prompt = String::new();
 
         // 1. Base template header
@@ -165,9 +448,203 @@ impl PromptContext {
         self
     }
 
+    /// Set working directory
+    pub fn with_working_directory(mut self, dir: impl Into<String>) -> Self {
+        self.working_directory = Some(dir.into());
+        self
+    }
+
     /// Add a persona to active personas
     pub fn with_persona(mut self, persona: PersonaInfo) -> Self {
         self.active_personas.push(persona);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::io::Write;
+
+    /// 测试 TemplateWatcher 基本功能
+    #[test]
+    fn test_template_watcher_basic() {
+        // 创建临时目录
+        let temp_dir = TempDir::new().unwrap();
+        let template_dir = temp_dir.path().to_path_buf();
+
+        // 创建测试模板文件
+        let template_path = template_dir.join("test.md");
+        let mut file = std::fs::File::create(&template_path).unwrap();
+        file.write_all(b"Test template content").unwrap();
+
+        // 创建监听器
+        let watcher = TemplateWatcher::new(template_dir.clone()).unwrap();
+
+        // 验证可以读取模板
+        let content = watcher.get("test.md");
+        assert!(content.is_some());
+        assert_eq!(content.unwrap(), "Test template content");
+    }
+
+    /// 测试 TemplateWatcher 处理不存在的目录
+    #[test]
+    fn test_template_watcher_nonexistent_dir() {
+        let watcher = TemplateWatcher::new(PathBuf::from("/nonexistent/path")).unwrap();
+        // 应该不会崩溃，但返回 None
+        assert!(watcher.get("test.md").is_none());
+    }
+
+    /// 测试 DynamicTemplateRenderer 注入内容
+    #[test]
+    fn test_dynamic_renderer_injection() {
+        let temp_dir = TempDir::new().unwrap();
+        let template_dir = temp_dir.path().to_path_buf();
+
+        // 创建包含占位符的模板
+        let template_path = template_dir.join("full.md");
+        let mut file = std::fs::File::create(&template_path).unwrap();
+        file.write_all(b"Template: ${{ tools_section }} - ${{ current_date }}").unwrap();
+
+        let renderer = DynamicTemplateRenderer::new(template_dir).unwrap();
+
+        let context = PromptContext {
+            template_mode: TemplateMode::Full,
+            tools_section: Some("my_tools".to_string()),
+            current_date: Some("2025-01-15".to_string()),
+            ..Default::default()
+        };
+
+        let working_memory = WorkingMemory::new(100);
+
+        let result = renderer.render(&context, &working_memory);
+
+        assert!(result.contains("my_tools"));
+        assert!(result.contains("2025-01-15"));
+        assert!(!result.contains("${{"));
+    }
+
+    /// 测试 PromptContext 使用动态渲染器
+    #[test]
+    fn test_prompt_context_with_hot_reload() {
+        let temp_dir = TempDir::new().unwrap();
+        let template_dir = temp_dir.path().to_path_buf();
+
+        // 创建模板
+        let template_path = template_dir.join("full.md");
+        let mut file = std::fs::File::create(&template_path).unwrap();
+        file.write_all(b"Dynamic template: ${{ working_directory }}").unwrap();
+
+        let context = PromptContext::new()
+            .with_hot_reload(template_dir)
+            .with_working_directory("/test/path");
+
+        let working_memory = WorkingMemory::new(100);
+        let result = context.render(&working_memory);
+
+        assert!(result.contains("/test/path"));
+    }
+
+    /// 测试占位符替换为空值
+    #[test]
+    fn test_injection_with_none_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let template_dir = temp_dir.path().to_path_buf();
+
+        // 创建模板
+        let template_path = template_dir.join("full.md");
+        let mut file = std::fs::File::create(&template_path).unwrap();
+        file.write_all(b"Template: ${{ tools_section }}-${{ current_date }}").unwrap();
+
+        let renderer = DynamicTemplateRenderer::new(template_dir).unwrap();
+
+        let context = PromptContext {
+            template_mode: TemplateMode::Full,
+            tools_section: None,
+            current_date: None,
+            ..Default::default()
+        };
+
+        let working_memory = WorkingMemory::new(100);
+        let result = renderer.render(&context, &working_memory);
+
+        // 占位符应该被替换为空字符串
+        assert!(!result.contains("${{"));
+        assert!(!result.contains("tools_section"));
+        assert!(!result.contains("current_date"));
+    }
+
+    /// 测试工作记忆注入
+    #[test]
+    fn test_working_memory_injection() {
+        use crate::memory::working::MessageRole;
+
+        let temp_dir = TempDir::new().unwrap();
+        let template_dir = temp_dir.path().to_path_buf();
+
+        // 创建模板
+        let template_path = template_dir.join("full.md");
+        let mut file = std::fs::File::create(&template_path).unwrap();
+        file.write_all(b"Template: ${{ recent_context }}").unwrap();
+
+        let renderer = DynamicTemplateRenderer::new(template_dir).unwrap();
+
+        let context = PromptContext::default();
+        let mut working_memory = WorkingMemory::new(100);
+
+        // 添加热条目
+        working_memory.push_hot(MessageRole::User, "test entry".to_string(), 10);
+
+        let result = renderer.render(&context, &working_memory);
+
+        // 应该包含 Recent Context 部分
+        assert!(result.contains("Recent Context"));
+        assert!(result.contains("test entry"));
+    }
+
+    /// 测试不同模板模式
+    #[test]
+    fn test_different_template_modes() {
+        let temp_dir = TempDir::new().unwrap();
+        let template_dir = temp_dir.path().to_path_buf();
+
+        // 创建三个模板
+        for (name, content) in &[
+            ("full.md", "Full template"),
+            ("compact.md", "Compact template"),
+            ("subagent.md", "Subagent template"),
+        ] {
+            let template_path = template_dir.join(name);
+            let mut file = std::fs::File::create(&template_path).unwrap();
+            file.write_all(content.as_bytes()).unwrap();
+        }
+
+        let renderer = DynamicTemplateRenderer::new(template_dir).unwrap();
+
+        // 测试 Full 模式
+        let full_context = PromptContext {
+            template_mode: TemplateMode::Full,
+            ..Default::default()
+        };
+        let working_memory = WorkingMemory::new(100);
+        let result = renderer.render(&full_context, &working_memory);
+        assert!(result.contains("Full template"));
+
+        // 测试 Compact 模式
+        let compact_context = PromptContext {
+            template_mode: TemplateMode::Compact,
+            ..Default::default()
+        };
+        let result = renderer.render(&compact_context, &working_memory);
+        assert!(result.contains("Compact template"));
+
+        // 测试 Subagent 模式
+        let subagent_context = PromptContext {
+            template_mode: TemplateMode::Subagent,
+            ..Default::default()
+        };
+        let result = renderer.render(&subagent_context, &working_memory);
+        assert!(result.contains("Subagent template"));
     }
 }
