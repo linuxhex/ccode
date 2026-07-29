@@ -84,3 +84,15 @@ tower-http = { version = "0.5", optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"
+
+[[test]]
+name = "tool_chain"
+path = "tests/integration/tool_chain.rs"
+
+[[test]]
+name = "memory_lifecycle"
+path = "tests/integration/memory_lifecycle.rs"
+
+[[test]]
+name = "error_handling"
+path = "tests/integration/error_handling.rs"

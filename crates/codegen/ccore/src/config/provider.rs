@@ -29,7 +29,7 @@ pub struct ProviderConfig {
 }
 
 /// Provider 适配器类型
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderAdapter {
     /// OpenAI 原生兼容
     OpenAI,

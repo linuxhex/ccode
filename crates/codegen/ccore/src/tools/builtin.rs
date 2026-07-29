@@ -20,6 +20,7 @@ use super::output_formatter;
 use super::path_validator;
 use super::read_tracker;
 use super::gitignore_filter::GitignoreFilter;
+use super::file_transaction::TempFileGuard;
 
 /// 全局 Gitignore 过滤器
 static GITIGNORE: std::sync::OnceLock<GitignoreFilter> = std::sync::OnceLock::new();
@@ -173,16 +174,41 @@ impl ToolExecutor for BashExecutor {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let result = tokio::time::timeout(
+        // 使用 spawn() 而非 output()，以便在超时时可以 kill 子进程
+        let mut child = cmd.spawn()
+            .map_err(|e| anyhow::anyhow!("bash: 启动进程失败：{}", e))?;
+
+        // 先取走 stdout/stderr 管道，避免 wait() 后无法读取
+        let child_stdout = child.stdout.take();
+        let child_stderr = child.stderr.take();
+
+        // 带超时等待进程退出
+        let wait_result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            cmd.output(),
+            child.wait(),
         )
         .await;
 
-        match result {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+        match wait_result {
+            Ok(Ok(status)) => {
+                // 进程正常退出，读取输出
+                let stdout = match child_stdout {
+                    Some(mut out) => {
+                        let mut buf = Vec::new();
+                        let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
+                        String::from_utf8_lossy(&buf).to_string()
+                    }
+                    None => String::new(),
+                };
+                let stderr = match child_stderr {
+                    Some(mut err) => {
+                        let mut buf = Vec::new();
+                        let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
+                        String::from_utf8_lossy(&buf).to_string()
+                    }
+                    None => String::new(),
+                };
+
                 let mut result = String::new();
                 if !stdout.is_empty() {
                     result.push_str(&stdout);
@@ -194,23 +220,34 @@ impl ToolExecutor for BashExecutor {
                     result.push_str("[stderr]\n");
                     result.push_str(&stderr);
                 }
-                if !output.status.success() {
-                    result.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
+                if !status.success() {
+                    result.push_str(&format!("\n[exit code: {}]", status.code().unwrap_or(-1)));
                 }
 
                 // 缓存只读命令结果
-                if is_readonly_command(command) && output.status.success() {
-                    Self::store_cache(command, working_dir, &stdout, output.status.code().unwrap_or(-1));
+                if is_readonly_command(command) && status.success() {
+                    Self::store_cache(command, working_dir, &stdout, status.code().unwrap_or(-1));
                 }
 
                 // 输出截断
                 Ok(output_formatter::truncate_output(&result, 50_000))
             }
             Ok(Err(e)) => Err(anyhow::anyhow!("bash 执行失败：{}", e)),
-            Err(_) => Err(anyhow::anyhow!(
-                "bash 执行超时（{}秒），建议增加 timeout 参数或使用后台执行",
-                timeout_secs
-            )),
+            Err(_) => {
+                // 超时 - kill 子进程并回收僵尸
+                tracing::warn!(
+                    target: "ccore::bash",
+                    command = %command,
+                    timeout_secs,
+                    "bash command timed out, killing process"
+                );
+                let _ = child.kill().await;
+                let _ = child.wait().await; // 回收僵尸进程
+                Err(anyhow::anyhow!(
+                    "bash 执行超时（{}秒），建议增加 timeout 参数或使用后台执行",
+                    timeout_secs
+                ))
+            }
         }
     }
 
@@ -379,15 +416,16 @@ impl ToolExecutor for WriteExecutor {
 
         // 原子写入：先写临时文件，再 rename
         let tmp_path = validation.canonical.with_extension("tmp");
+        let _guard = TempFileGuard::new(&tmp_path);
         tokio::fs::write(&tmp_path, content).await
             .map_err(|e| anyhow::anyhow!("write: 写入临时文件失败：{}", e))?;
 
         tokio::fs::rename(&tmp_path, &validation.canonical).await
-            .map_err(|e| {
-                // rename 失败时清理临时文件
-                let _ = std::fs::remove_file(&tmp_path);
-                anyhow::anyhow!("write: 重命名到目标路径失败：{}", e)
-            })?;
+            .map_err(|e| anyhow::anyhow!("write: 重命名到目标路径失败：{}", e))?;
+
+        // rename 成功，标记 guard 已提交（临时文件不再存在，无需清理）
+        // _guard 在此处 drop，但文件已 rename 走，TempFileGuard 检查 exists() 为 false
+        drop(_guard);
 
         // 写入后验证
         let verified = tokio::fs::read_to_string(&validation.canonical).await
@@ -559,13 +597,13 @@ impl EditExecutor {
     /// 原子写入
     async fn atomic_write(&self, path: &Path, content: &str) -> anyhow::Result<()> {
         let tmp_path = path.with_extension("tmp");
+        let _guard = TempFileGuard::new(&tmp_path);
         tokio::fs::write(&tmp_path, content).await
             .map_err(|e| anyhow::anyhow!("写入临时文件失败：{}", e))?;
         tokio::fs::rename(&tmp_path, path).await
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                anyhow::anyhow!("重命名失败：{}", e)
-            })?;
+            .map_err(|e| anyhow::anyhow!("重命名失败：{}", e))?;
+        // rename 成功后 _guard drop 时文件已不存在，无需清理
+        drop(_guard);
         Ok(())
     }
 
@@ -1039,6 +1077,8 @@ pub fn register_builtin_executors(bridge: &mut super::bridge::ToolBridge) {
     bridge.register_executor(Box::new(ListDirExecutor));
     bridge.register_executor(Box::new(WebSearchExecutor));
     bridge.register_executor(Box::new(WebFetchExecutor));
+    bridge.register_executor(Box::new(super::lsp::LspExecutor));
+    bridge.register_executor(Box::new(super::skill::SkillExecutor));
 
     // 注册 post_hook：Write/Edit 后对 .rs 文件运行 rustfmt --check 做增量验证
     bridge.register_post_hook(Box::new(super::rustfmt_hook::RustfmtHook));
@@ -1146,5 +1186,23 @@ mod tests {
 
         // 清理
         read_tracker::global_read_tracker().clear();
+    }
+
+    #[test]
+    fn test_bash_cache_concurrent_access() {
+        use std::thread;
+        
+        let mut handles = vec![];
+        for i in 0..5 {
+            handles.push(thread::spawn(move || {
+                // These should all be safe to call concurrently
+                let cmd = format!("echo test_{}", i);
+                let _ = is_readonly_command(&cmd);
+            }));
+        }
+        
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

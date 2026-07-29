@@ -47,6 +47,8 @@ pub struct NodeLauncher {
     ccode_config: CcodeConfig,
     /// 已启动的 Node 描述
     launched_nodes: Vec<NodeDescriptor>,
+    /// 已启动的 Node 任务 JoinHandle（用于优雅关闭）
+    task_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl NodeLauncher {
@@ -55,6 +57,7 @@ impl NodeLauncher {
             kernel_config,
             ccode_config,
             launched_nodes: Vec::new(),
+            task_handles: Vec::new(),
         }
     }
 
@@ -85,11 +88,12 @@ impl NodeLauncher {
         let sampler_ctx = self.node_context();
         let sampler_id = NodeId::new();
         let sampler = SamplerNode::with_configs(sampler_id.clone(), &self.ccode_config.providers);
-        tokio::spawn(async move {
+        let sampler_handle = tokio::spawn(async move {
             if let Err(e) = run_node(sampler, sampler_ctx).await {
                 tracing::error!("Sampler Node 异常退出：{}", e);
             }
         });
+        self.task_handles.push(sampler_handle);
         self.launched_nodes.push(NodeDescriptor {
             id: sampler_id,
             node_type: NodeType::Sampler,
@@ -101,11 +105,12 @@ impl NodeLauncher {
         let state_ctx = self.node_context();
         let state_id = NodeId::new();
         let state = StateNode::new(state_id.clone());
-        tokio::spawn(async move {
+        let state_handle = tokio::spawn(async move {
             if let Err(e) = run_node(state, state_ctx).await {
                 tracing::error!("State Node 异常退出：{}", e);
             }
         });
+        self.task_handles.push(state_handle);
         self.launched_nodes.push(NodeDescriptor {
             id: state_id,
             node_type: NodeType::State,
@@ -117,11 +122,12 @@ impl NodeLauncher {
         let tool_ctx = self.node_context();
         let tool_id = NodeId::new();
         let tool = ToolNode::new(tool_id.clone());
-        tokio::spawn(async move {
+        let tool_handle = tokio::spawn(async move {
             if let Err(e) = run_node(tool, tool_ctx).await {
                 tracing::error!("Tool Node 异常退出：{}", e);
             }
         });
+        self.task_handles.push(tool_handle);
         self.launched_nodes.push(NodeDescriptor {
             id: tool_id,
             node_type: NodeType::Tool,
@@ -144,11 +150,12 @@ impl NodeLauncher {
             tools: Vec::new(), // 将通过 tool/register 消息动态填充
         };
         let thinker = ThinkerNode::new(thinker_id.clone(), thinker_config);
-        tokio::spawn(async move {
+        let thinker_handle = tokio::spawn(async move {
             if let Err(e) = run_node(thinker, thinker_ctx).await {
                 tracing::error!("Thinker Node 异常退出：{}", e);
             }
         });
+        self.task_handles.push(thinker_handle);
         self.launched_nodes.push(NodeDescriptor {
             id: thinker_id,
             node_type: NodeType::Thinker,
@@ -160,11 +167,12 @@ impl NodeLauncher {
         let tui_ctx = self.node_context();
         let tui_id = NodeId::new();
         let tui = TUINode::new(tui_id.clone());
-        tokio::spawn(async move {
+        let tui_handle = tokio::spawn(async move {
             if let Err(e) = crate::node::tui::run_tui_node(tui, tui_ctx).await {
                 tracing::error!("TUI Node 异常退出：{}", e);
             }
         });
+        self.task_handles.push(tui_handle);
         self.launched_nodes.push(NodeDescriptor {
             id: tui_id,
             node_type: NodeType::TUI,
@@ -197,11 +205,12 @@ impl NodeLauncher {
         let agent = AgentNode::new(id.clone(), agent_config);
         let agent_ctx = ctx;
         let sub_id = id.clone();
-        tokio::spawn(async move {
+        let agent_handle = tokio::spawn(async move {
             if let Err(e) = run_node(agent, agent_ctx).await {
                 tracing::error!("子 Agent {} 异常退出：{}", sub_id, e);
             }
         });
+        self.task_handles.push(agent_handle);
 
         let descriptor = NodeDescriptor {
             id: id.clone(),
@@ -229,5 +238,68 @@ impl NodeLauncher {
             .iter()
             .filter(|n| n.node_type == node_type)
             .collect()
+    }
+
+    /// 优雅关闭所有已启动的 Node 任务
+    ///
+    /// 1. 向所有任务发送 abort 信号
+    /// 2. 等待所有任务退出（最多 5 秒超时）
+    /// 3. 超时后记录警告但仍然返回（任务会在进程退出时被清理）
+    pub async fn graceful_shutdown(&mut self) {
+        let handles = std::mem::take(&mut self.task_handles);
+        if handles.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            target: "ccore::kernel",
+            count = handles.len(),
+            "graceful shutdown: aborting {} node tasks",
+            handles.len()
+        );
+
+        // 1. 请求所有任务取消
+        for handle in &handles {
+            handle.abort();
+        }
+
+        // 2. 等待所有任务退出，带超时
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tokio::pin!(deadline);
+
+        for handle in handles {
+            tokio::select! {
+                _ = handle => {},
+                _ = &mut deadline => {
+                    tracing::warn!(
+                        target: "ccore::kernel",
+                        "graceful shutdown timeout, some node tasks didn't finish"
+                    );
+                    break;
+                }
+            }
+        }
+
+        tracing::info!(target: "ccore::kernel", "node tasks shutdown complete");
+    }
+
+    /// 获取已启动任务的数量
+    pub fn task_count(&self) -> usize {
+        self.task_handles.len()
+    }
+}
+
+impl Drop for NodeLauncher {
+    fn drop(&mut self) {
+        if !self.task_handles.is_empty() {
+            tracing::debug!(
+                target: "ccore::kernel",
+                count = self.task_handles.len(),
+                "dropping NodeLauncher, aborting orphaned node tasks"
+            );
+            for handle in &self.task_handles {
+                handle.abort();
+            }
+        }
     }
 }

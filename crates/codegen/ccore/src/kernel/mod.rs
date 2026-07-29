@@ -38,6 +38,7 @@ pub mod autonomic;
 pub mod reflex;
 pub mod experience;
 pub mod panic_hook;
+pub mod lock_order;
 
 use anyhow::Result;
 use bytes::Bytes;

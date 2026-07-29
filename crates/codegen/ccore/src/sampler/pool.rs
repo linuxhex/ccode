@@ -2,6 +2,7 @@
 //!
 //! 提供HTTP连接复用、高级限流（令牌桶 + 漏桶）、重试策略、健康检查
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,7 +33,6 @@ impl Default for PoolConfig {
 
 /// HTTP 连接池
 pub struct ConnectionPool {
-    #[allow(dead_code)]
     config: PoolConfig,
     /// 并发连接数信号量
     semaphore: Arc<Semaphore>,
@@ -42,6 +42,10 @@ pub struct ConnectionPool {
     success_requests: AtomicU64,
     /// 失败请求数统计
     failed_requests: AtomicU64,
+    /// 活跃连接的最后使用时间（连接索引 → 上次活跃时间）
+    active_connections: Mutex<HashMap<usize, Instant>>,
+    /// 下一个连接索引
+    next_connection_id: AtomicU64,
 }
 
 impl ConnectionPool {
@@ -51,6 +55,8 @@ impl ConnectionPool {
             total_requests: AtomicU64::new(0),
             success_requests: AtomicU64::new(0),
             failed_requests: AtomicU64::new(0),
+            active_connections: Mutex::new(HashMap::new()),
+            next_connection_id: AtomicU64::new(0),
             config,
         }
     }
@@ -60,9 +66,18 @@ impl ConnectionPool {
         let permit = self.semaphore.acquire().await
             .map_err(|_| anyhow::anyhow!("ConnectionPool semaphore 已关闭"))?;
         self.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        // 记录连接活跃时间
+        let conn_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) as usize;
+        {
+            let mut active = self.active_connections.lock().await;
+            active.insert(conn_id, Instant::now());
+        }
+
         Ok(ConnectionGuard {
             permit,
             pool: self,
+            conn_id,
         })
     }
 
@@ -77,13 +92,28 @@ impl ConnectionPool {
     }
 
     /// 获取统计信息
-    pub fn stats(&self) -> PoolStats {
+    pub async fn stats(&self) -> PoolStats {
+        let active_count = self.active_connections.lock().await.len();
         PoolStats {
             total_requests: self.total_requests.load(Ordering::Relaxed),
             success_requests: self.success_requests.load(Ordering::Relaxed),
             failed_requests: self.failed_requests.load(Ordering::Relaxed),
             available_connections: self.semaphore.available_permits(),
+            active_connections: active_count,
         }
+    }
+
+    /// 清理空闲超时的连接记录
+    ///
+    /// 返回被清理的连接数。不会关闭实际的 HTTP 连接（由 reqwest 连接池管理），
+    /// 但会释放追踪记录，防止 `active_connections` 无限增长。
+    pub async fn cleanup_idle(&self) -> usize {
+        let idle_timeout = Duration::from_secs(self.config.idle_timeout_secs);
+        let mut active = self.active_connections.lock().await;
+        let now = Instant::now();
+        let before = active.len();
+        active.retain(|_, last_active| now.duration_since(*last_active) < idle_timeout);
+        before - active.len()
     }
 }
 
@@ -92,6 +122,7 @@ pub struct ConnectionGuard<'a> {
     #[allow(dead_code)]
     permit: tokio::sync::SemaphorePermit<'a>,
     pool: &'a ConnectionPool,
+    conn_id: usize,
 }
 
 impl<'a> ConnectionGuard<'a> {
@@ -106,6 +137,16 @@ impl<'a> ConnectionGuard<'a> {
     }
 }
 
+impl<'a> Drop for ConnectionGuard<'a> {
+    fn drop(&mut self) {
+        // 从活跃连接记录中移除（同步删除，避免在 drop 中 await）
+        // 使用 try_lock 避免死锁，失败时静默跳过（记录会在 cleanup_idle 中清理）
+        if let Ok(mut active) = self.pool.active_connections.try_lock() {
+            active.remove(&self.conn_id);
+        }
+    }
+}
+
 /// 连接池统计信息
 #[derive(Debug, Clone)]
 pub struct PoolStats {
@@ -113,6 +154,7 @@ pub struct PoolStats {
     pub success_requests: u64,
     pub failed_requests: u64,
     pub available_connections: usize,
+    pub active_connections: usize,
 }
 
 /// 令牌桶限流器
@@ -345,13 +387,13 @@ mod tests {
     #[tokio::test]
     async fn test_connection_pool() {
         let pool = ConnectionPool::new(PoolConfig::default());
-        
+
         // 获取连接
         let guard = pool.acquire().await.unwrap();
         guard.success();
-        
+
         // 检查统计
-        let stats = pool.stats();
+        let stats = pool.stats().await;
         assert_eq!(stats.total_requests, 1);
         assert_eq!(stats.success_requests, 1);
     }

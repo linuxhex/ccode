@@ -544,17 +544,17 @@ fn test_provider_router_model_lookup() {
     let mut router = ProviderRouter::from_configs(&configs);
 
     // 精确查找 ccode 模型
-    let provider = router.find_provider("ccode-3-fast");
+    let provider = router.find_provider_name("ccode-3-fast");
     assert!(provider.is_some(), "应找到 ccode-3-fast 对应的 Provider");
-    assert_eq!(provider.unwrap().name(), "ccode");
+    assert_eq!(provider.unwrap(), "ccode");
 
     // 查找 deepseek 模型
-    let provider = router.find_provider("deepseek-chat");
+    let provider = router.find_provider_name("deepseek-chat");
     assert!(provider.is_some(), "应找到 deepseek-chat 对应的 Provider");
-    assert_eq!(provider.unwrap().name(), "deepseek");
+    assert_eq!(provider.unwrap(), "deepseek");
 
     // 不存在的模型
-    let provider = router.find_provider("nonexistent-model-xyz");
+    let provider = router.find_provider_name("nonexistent-model-xyz");
     assert!(provider.is_none(), "不存在的模型应返回 None");
 }
 

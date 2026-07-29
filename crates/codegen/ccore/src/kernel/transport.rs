@@ -137,14 +137,17 @@ impl KernelTransport {
     }
 
     /// 优雅关闭传输层
-    pub async fn shutdown(self) {
+    pub async fn shutdown(&mut self) {
         // 关闭发送通道，触发后台任务退出
-        drop(self.router_send_tx);
-        drop(self.pub_send_tx);
-        drop(self.incoming_rx);
+        {
+            let _ = std::mem::replace(&mut self.router_send_tx, mpsc::channel(1).0);
+            let _ = std::mem::replace(&mut self.pub_send_tx, mpsc::channel(1).0);
+            let _ = std::mem::replace(&mut self.incoming_rx, mpsc::channel(1).1);
+        }
 
         // 等待后台任务完成
-        for handle in self.tasks {
+        let handles = std::mem::take(&mut self.tasks);
+        for handle in handles {
             if let Err(e) = handle.await {
                 tracing::debug!("Kernel 后台任务退出异常：{}", e);
             }
@@ -273,5 +276,16 @@ impl KernelTransport {
             tracing::debug!("PUB socket 关闭失败：{:?}", errors);
         }
         tracing::debug!("PUB 广播循环退出");
+    }
+}
+
+impl Drop for KernelTransport {
+    fn drop(&mut self) {
+        tracing::debug!(target: "ccore::kernel", "dropping KernelTransport, aborting ZMQ background tasks");
+        for handle in &self.tasks {
+            handle.abort();
+        }
+        // 注意：abort 只是请求取消，实际终止在任务下次 yield 时发生
+        // 如果 shutdown() 已被调用，tasks 已被消费（moved），此处不会重复 abort
     }
 }

@@ -196,6 +196,46 @@ Parameters:
 - url: The URL to fetch content from
 "#;
 
+/// LSP 工具提示
+pub const LSP_PROMPT: &str = r#"
+Language Server Protocol tool for code intelligence.
+
+**Actions:**
+- goto_definition: Jump to the definition of a symbol at the given position
+- find_references: Find all references to a symbol
+- get_diagnostics: Get compiler/linter diagnostics for a file
+- hover: Get hover information at a position
+
+**Parameters:**
+- action: One of "goto_definition", "find_references", "get_diagnostics", "hover"
+- file_path: Absolute path to the file
+- line: Line number (1-based)
+- column: Column number (1-based)
+
+**Usage notes:**
+- Use this tool when you need code navigation or analysis
+- Falls back to grep-based search if no LSP server is available
+"#;
+
+/// Skill 工具提示
+pub const SKILL_PROMPT: &str = r#"
+Execute a predefined skill (automated workflow).
+
+**Available skills:**
+- commit: Analyze git changes and create a commit
+- test: Run tests and analyze results
+- review: Code review of current changes
+- fix: Auto-fix lint/check errors
+- refactor: Analyze code and suggest refactoring
+
+**Parameters:**
+- skill: Name of the skill to execute
+
+**Usage notes:**
+- Skills provide structured prompts for common workflows
+- The LLM follows the skill's prompt template to complete the task
+"#;
+
 /// 获取所有工具定义（LLM 面向的 JSON Schema）
 ///
 /// 返回包含 name、description、parameters 的工具定义数组
@@ -307,6 +347,31 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
                 "required": ["url"]
             }
         }),
+        serde_json::json!({
+            "name": "lsp",
+            "description": LSP_PROMPT,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["goto_definition", "find_references", "get_diagnostics", "hover"], "description": "LSP 操作" },
+                    "file_path": { "type": "string", "description": "文件绝对路径" },
+                    "line": { "type": "number", "description": "行号（从 1 开始）" },
+                    "column": { "type": "number", "description": "列号（从 1 开始）" }
+                },
+                "required": ["action", "file_path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "skill",
+            "description": SKILL_PROMPT,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill": { "type": "string", "enum": ["commit", "test", "review", "fix", "refactor"], "description": "技能名称" }
+                },
+                "required": ["skill"]
+            }
+        }),
     ]
 }
 
@@ -324,6 +389,8 @@ mod tests {
         assert!(!GLOB_PROMPT.is_empty());
         assert!(!WEB_SEARCH_PROMPT.is_empty());
         assert!(!WEB_FETCH_PROMPT.is_empty());
+        assert!(!LSP_PROMPT.is_empty());
+        assert!(!SKILL_PROMPT.is_empty());
     }
 
     #[test]
@@ -359,7 +426,7 @@ mod tests {
     #[test]
     fn test_get_tool_definitions() {
         let defs = get_tool_definitions();
-        assert_eq!(defs.len(), 8);
+        assert_eq!(defs.len(), 10);
 
         let names: Vec<&str> = defs
             .iter()
@@ -373,6 +440,8 @@ mod tests {
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"web_search"));
         assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"lsp"));
+        assert!(names.contains(&"skill"));
     }
 
     #[test]
