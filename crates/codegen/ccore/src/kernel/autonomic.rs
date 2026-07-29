@@ -118,28 +118,52 @@ impl AutonomicNervousSystem {
             }
 
             if health.is_timed_out(self.heartbeat_timeout) {
+                let status = format!(
+                    "timed_out (elapsed={:?}, threshold={:?})",
+                    health.last_heartbeat.elapsed(),
+                    self.heartbeat_timeout
+                );
+                tracing::debug!(
+                    target: "ccore::autonomic",
+                    agent_id = %agent_id,
+                    status = %status,
+                    "heartbeat check: anomaly detected"
+                );
+
                 warn!(
+                    target: "ccore::autonomic",
+                    anomaly = "heartbeat_timeout",
                     agent_id = %agent_id,
                     elapsed_secs = health.last_heartbeat.elapsed().as_secs(),
-                    "Agent 心跳超时，自主神经触发自愈"
+                    "anomaly detected"
                 );
 
                 if health.can_restart() {
                     health.record_restart();
                     need_restart.push(agent_id.clone());
-                    info!(
+                    tracing::info!(
+                        target: "ccore::autonomic",
+                        action = "self_healing_restart",
                         agent_id = %agent_id,
                         restart_count = health.restart_count,
-                        "Agent 自愈重启已触发"
+                        "self-healing triggered"
                     );
                 } else {
                     health.marked_dead = true;
-                    warn!(
+                    tracing::error!(
+                        target: "ccore::autonomic",
                         agent_id = %agent_id,
                         max_restarts = health.max_restarts,
-                        "Agent 已达最大重启次数，标记为死亡"
+                        "self-healing failed: max restarts reached, agent marked dead"
                     );
                 }
+            } else {
+                tracing::debug!(
+                    target: "ccore::autonomic",
+                    agent_id = %agent_id,
+                    status = "healthy",
+                    "heartbeat check: status=healthy"
+                );
             }
         }
 

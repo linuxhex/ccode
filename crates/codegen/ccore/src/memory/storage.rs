@@ -42,7 +42,13 @@ impl MemoryStorage {
     pub fn with_default_root(cwd: &str) -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let root = PathBuf::from(home).join(".ccode").join("memory");
-        Self::new(root, cwd)
+        let storage = Self::new(root, cwd);
+        tracing::debug!(
+            target: "ccore::storage",
+            root = %storage.root.display(),
+            "storage initialized"
+        );
+        storage
     }
 
     /// 确保 MEMORY.md 文件存在
@@ -90,6 +96,13 @@ impl MemoryStorage {
 
         if path.exists() {
             let content = fs::read_to_string(&path).await?;
+            tracing::debug!(
+                target: "ccore::storage",
+                scope = ?scope,
+                operation = "read",
+                bytes = content.len(),
+                "storage read"
+            );
             Ok(Some(content))
         } else {
             Ok(None)
@@ -113,6 +126,13 @@ impl MemoryStorage {
             }
         };
 
+        tracing::debug!(
+            target: "ccore::storage",
+            scope = ?scope,
+            operation = "write",
+            bytes = content.len(),
+            "storage write"
+        );
         fs::write(&path, content).await?;
         Ok(())
     }

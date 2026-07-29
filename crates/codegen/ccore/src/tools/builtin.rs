@@ -128,6 +128,11 @@ impl ToolExecutor for BashExecutor {
         let command_lower = command.to_lowercase();
         for dangerous in DANGEROUS_COMMANDS {
             if command_lower.contains(&dangerous.to_lowercase()) {
+                tracing::warn!(
+                    target: "ccore::bash",
+                    command = %command,
+                    "dangerous command blocked"
+                );
                 return Ok(format!(
                     "错误：命令被安全策略拒绝\n  命令包含危险模式: '{}'\n  如确需执行，请手动操作",
                     dangerous
@@ -141,7 +146,20 @@ impl ToolExecutor for BashExecutor {
         // 检查缓存（只读命令才缓存）
         if is_readonly_command(command) {
             if let Some(cached) = Self::check_cache(command, working_dir) {
+                tracing::debug!(
+                    target: "ccore::bash",
+                    command = %command,
+                    cache = "hit",
+                    "bash cache"
+                );
                 return Ok(cached);
+            } else {
+                tracing::debug!(
+                    target: "ccore::bash",
+                    command = %command,
+                    cache = "miss",
+                    "bash cache"
+                );
             }
         }
 
@@ -240,6 +258,13 @@ impl ToolExecutor for ReadExecutor {
 
         // gitignore 过滤
         if get_gitignore().should_skip(&validation.canonical) {
+            let skipped = path.to_string();
+            tracing::debug!(
+                target: "ccore::tool",
+                path = %skipped,
+                skipped = %skipped,
+                "gitignore filter"
+            );
             return Err(anyhow::anyhow!("read: 文件 {} 被 .gitignore 忽略", path));
         }
 
@@ -330,6 +355,13 @@ impl ToolExecutor for WriteExecutor {
 
         // 如果文件已存在，检查是否已读取
         if validation.canonical.exists() {
+            let has_been_read = read_tracker::global_read_tracker().has_been_read(path);
+            tracing::debug!(
+                target: "ccore::tool",
+                path = %path,
+                has_been_read = has_been_read,
+                "read-before-write check"
+            );
             read_tracker::require_file_read(path)?;
         }
 
@@ -843,6 +875,12 @@ impl ToolExecutor for WebSearchExecutor {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("web_search: 缺少 query 参数"))?;
 
+        tracing::debug!(
+            target: "ccore::web",
+            url = %format!("search: {}", query),
+            "web request"
+        );
+
         let client = reqwest::Client::new();
 
         // 使用 DuckDuckGo Instant Answer API
@@ -932,6 +970,12 @@ impl ToolExecutor for WebFetchExecutor {
         let url = args["url"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("web_fetch: 缺少 url 参数"))?;
+
+        tracing::debug!(
+            target: "ccore::web",
+            url = %url,
+            "web request"
+        );
 
         // URL 基本校验
         if !url.starts_with("http://") && !url.starts_with("https://") {

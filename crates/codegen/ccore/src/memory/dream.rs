@@ -42,6 +42,10 @@ pub struct DreamLock {
 
 impl Drop for DreamLock {
     fn drop(&mut self) {
+        tracing::debug!(
+            target: "ccore::dream",
+            "lock released"
+        );
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -93,6 +97,10 @@ impl DreamOrganizer {
         }
 
         // 写入当前进程 PID
+        tracing::debug!(
+            target: "ccore::dream",
+            "lock acquired"
+        );
         let pid = std::process::id();
         tokio::fs::create_dir_all(lock_dir).await?;
         tokio::fs::write(&lock_path, pid.to_string()).await?;
@@ -140,7 +148,15 @@ Output a single consolidated markdown section:"#,
             })
             .count();
 
-        cold_count >= self.config.min_cold_entries
+        let result = cold_count >= self.config.min_cold_entries;
+        tracing::debug!(
+            target: "ccore::dream",
+            should_trigger = result,
+            cold_count = cold_count,
+            min_cold_entries = self.config.min_cold_entries,
+            "auto-trigger check"
+        );
+        result
     }
 
     /// 执行一轮 Dream 整理
@@ -175,6 +191,12 @@ Output a single consolidated markdown section:"#,
     ) -> anyhow::Result<DreamResult> {
         let current_turn = short_term.current_turn();
         let all_entries = short_term.all_entries();
+
+        tracing::info!(
+            target: "ccore::dream",
+            entries = all_entries.len(),
+            "dream organizing started"
+        );
 
         // 计算每条条目的简化热度，筛选冷条目
         let cold_ids: Vec<String> = all_entries
@@ -227,6 +249,12 @@ Output a single consolidated markdown section:"#,
 
         // 从 L1 中移除已整理的冷条目
         let removed = short_term.remove_entries(&cold_ids);
+
+        tracing::info!(
+            target: "ccore::dream",
+            entries = consolidated,
+            "dream organizing completed"
+        );
 
         Ok(DreamResult {
             consolidated,

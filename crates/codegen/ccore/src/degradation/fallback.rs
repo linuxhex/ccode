@@ -3,7 +3,7 @@
 //! 工具执行失败时，根据配置尝试降级到备选工具或返回简化结果。
 
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// 降级配置
 #[derive(Debug, Clone)]
@@ -114,20 +114,46 @@ impl DegradationStrategy {
         }
 
         warn!(
+            target: "ccore::degradation",
             tool = tool_name,
             error = error,
-            "工具执行失败，尝试降级"
+            from = "normal",
+            to = "degraded",
+            reason = "tool_execution_failed",
+            "degradation level changed"
         );
 
         // 优先返回简化响应
         if let Some(response) = self.get_simplified_response(tool_name) {
-            info!(tool = tool_name, "降级到简化响应");
+            tracing::info!(
+                target: "ccore::fallback",
+                component = tool_name,
+                strategy = "simplified_response",
+                "fallback activated"
+            );
+            tracing::info!(
+                target: "ccore::degradation",
+                level = "degraded",
+                component = tool_name,
+                "service recovered with simplified response"
+            );
             return Some(response.to_string());
         }
 
         // 如果有降级工具，返回提示（实际降级工具调用由调用方处理）
         if let Some(fallback) = self.get_fallback_tool(tool_name) {
-            info!(tool = tool_name, fallback = fallback, "降级到备选工具");
+            tracing::warn!(
+                target: "ccore::fallback",
+                component = tool_name,
+                strategy = %format!("fallback_to_{}", fallback),
+                "fallback activated"
+            );
+            tracing::info!(
+                target: "ccore::degradation",
+                level = "degraded",
+                component = tool_name,
+                "service recovered with fallback tool"
+            );
             return Some(format!(
                 "工具 {} 失败，建议使用 {} 重试。错误：{}",
                 tool_name, fallback, error

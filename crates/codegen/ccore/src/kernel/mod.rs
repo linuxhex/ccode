@@ -251,7 +251,16 @@ impl Kernel {
             let mut launcher = launcher::NodeLauncher::new(self.config.clone(), ccfg);
             match launcher.spawn_initial_set().await {
                 Ok(nodes) => {
+                    let start_time = std::time::Instant::now();
                     tracing::info!("初始 Node 集合启动完成：{} 个", nodes.len());
+                    for desc in &nodes {
+                        tracing::info!(
+                            target: "ccore::kernel",
+                            node = %desc.name,
+                            duration_ms = start_time.elapsed().as_millis() as u64,
+                            "node started"
+                        );
+                    }
 
                     // 广播每个 Node 的 spawn 事件（让 TUINode 等知道有哪些 Node 上线）
                     // 特别是 ThinkerNode 的 spawn 事件，让 TUINode 能设置 primary_agent_id
@@ -303,7 +312,12 @@ impl Kernel {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("初始 Node 集合启动失败：{}", e);
+                    tracing::error!(
+                        target: "ccore::kernel",
+                        node = "initial_set",
+                        error = %e,
+                        "node failed to start"
+                    );
                 }
             }
         } else {
@@ -467,8 +481,16 @@ impl Kernel {
         }
 
         // 关闭流程
+        tracing::info!(
+            target: "ccore::kernel",
+            "graceful shutdown initiated"
+        );
         Self::broadcast_shutdown(&mut transport).await;
         transport.shutdown().await;
+        tracing::info!(
+            target: "ccore::kernel",
+            "shutdown complete"
+        );
         Ok(())
     }
 

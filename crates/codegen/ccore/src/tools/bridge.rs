@@ -837,8 +837,20 @@ path="tests"
     ) -> ToolCallResult {
         let start = Instant::now();
 
+        tracing::debug!(
+            target: "ccore::tool",
+            tool = %request.tool_name,
+            "executing tool"
+        );
+
         // ── 沙箱前置检查（借鉴 Claude Code，在执行前拦截危险操作）──
         if let Err(sandbox_denied) = self.check_sandbox(&request.tool_name, &request.arguments) {
+            tracing::warn!(
+                target: "ccore::tool",
+                tool = %request.tool_name,
+                error = %sandbox_denied,
+                "tool execution failed"
+            );
             return ToolCallResult {
                 tool_call_id: request.tool_call_id.clone(),
                 output: sandbox_denied,
@@ -852,26 +864,55 @@ path="tests"
         let decision = get_permission_checker().check(&request.tool_name, &request.arguments);
         match decision {
             PermissionDecision::Deny => {
+                let err_msg = format!("权限拒绝：工具 {} 被安全策略阻止", request.tool_name);
+                tracing::debug!(
+                    target: "ccore::tool",
+                    tool = %request.tool_name,
+                    decision = "deny",
+                    "permission check"
+                );
+                tracing::warn!(
+                    target: "ccore::tool",
+                    tool = %request.tool_name,
+                    error = %err_msg,
+                    "tool execution failed"
+                );
                 return ToolCallResult {
                     tool_call_id: request.tool_call_id.clone(),
-                    output: format!("权限拒绝：工具 {} 被安全策略阻止", request.tool_name),
+                    output: err_msg,
                     success: false,
                     duration_ms: start.elapsed().as_millis() as u64,
                     is_partial: false,
                 };
             }
             PermissionDecision::AskUser => {
-                // TODO: 在完整的交互式系统中，这里应该提示用户确认
-                // 当前自动批准但记录警告，避免阻塞非交互式执行
-                tracing::warn!("工具 {} 需要用户确认（当前自动批准）", request.tool_name);
+                tracing::debug!(
+                    target: "ccore::tool",
+                    tool = %request.tool_name,
+                    decision = "ask_user",
+                    "permission check"
+                );
             }
-            PermissionDecision::Allow => {}
+            PermissionDecision::Allow => {
+                tracing::debug!(
+                    target: "ccore::tool",
+                    tool = %request.tool_name,
+                    decision = "allow",
+                    "permission check"
+                );
+            }
         }
 
         // 查找工具执行器
         let executor = match self.executors.get(&request.tool_name) {
             Some(e) => e,
             None => {
+                tracing::warn!(
+                    target: "ccore::tool",
+                    tool = %request.tool_name,
+                    error = "unknown tool",
+                    "tool execution failed"
+                );
                 return ToolCallResult {
                     tool_call_id: request.tool_call_id.clone(),
                     output: format!("未知工具：{}", request.tool_name),
@@ -917,11 +958,19 @@ path="tests"
                             attempt
                         ));
                     }
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    tracing::debug!(
+                        target: "ccore::tool",
+                        tool = %request.tool_name,
+                        duration_ms = elapsed,
+                        success = true,
+                        "tool execution completed"
+                    );
                     return ToolCallResult {
                         tool_call_id: request.tool_call_id.clone(),
                         output: final_output,
                         success: true,
-                        duration_ms: start.elapsed().as_millis() as u64,
+                        duration_ms: elapsed,
                         is_partial: false,
                     };
                 }
@@ -932,6 +981,12 @@ path="tests"
                         && self.retry_config.is_retryable_error(&error_output)
                     {
                         let delay = self.retry_config.calculate_delay(attempt);
+                        tracing::warn!(
+                            target: "ccore::tool",
+                            tool = %request.tool_name,
+                            error = %e,
+                            "tool execution failed"
+                        );
                         tracing::warn!(
                             "工具 {} 第 {} 次执行失败（{}），将在 {}ms 后重试",
                             request.tool_name,
@@ -948,11 +1003,18 @@ path="tests"
                     } else {
                         String::new()
                     };
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    tracing::warn!(
+                        target: "ccore::tool",
+                        tool = %request.tool_name,
+                        error = %e,
+                        "tool execution failed"
+                    );
                     return ToolCallResult {
                         tool_call_id: request.tool_call_id.clone(),
                         output: format!("{}{}", error_output, retry_info),
                         success: false,
-                        duration_ms: start.elapsed().as_millis() as u64,
+                        duration_ms: elapsed,
                         is_partial: false,
                     };
                 }
@@ -963,6 +1025,12 @@ path="tests"
                         && self.retry_config.is_retryable_error(&error_output)
                     {
                         let delay = self.retry_config.calculate_delay(attempt);
+                        tracing::warn!(
+                            target: "ccore::tool",
+                            tool = %request.tool_name,
+                            error = "timeout",
+                            "tool execution failed"
+                        );
                         tracing::warn!(
                             "工具 {} 第 {} 次执行超时，将在 {}ms 后重试",
                             request.tool_name,
@@ -977,11 +1045,18 @@ path="tests"
                     } else {
                         String::new()
                     };
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    tracing::warn!(
+                        target: "ccore::tool",
+                        tool = %request.tool_name,
+                        error = "timeout",
+                        "tool execution failed"
+                    );
                     return ToolCallResult {
                         tool_call_id: request.tool_call_id.clone(),
                         output: format!("{}{}", error_output, retry_info),
                         success: false,
-                        duration_ms: start.elapsed().as_millis() as u64,
+                        duration_ms: elapsed,
                         is_partial: false,
                     };
                 }

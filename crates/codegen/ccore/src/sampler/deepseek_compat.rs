@@ -152,11 +152,27 @@ impl DeepSeekCompatProvider {
         };
 
         // 提取 usage（DeepSeek 在最后一个 chunk 或 stream_options 开启时返回 usage）
-        let usage = chunk.usage.map(|u| TokenUsage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
+        let usage = chunk.usage.map(|u| {
+            tracing::debug!(
+                target: "ccore::sampler",
+                provider = "deepseek",
+                input_tokens = u.prompt_tokens,
+                output_tokens = u.completion_tokens,
+                "token usage"
+            );
+            TokenUsage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+            }
         });
+
+        tracing::trace!(
+            target: "ccore::sampler",
+            provider = "deepseek",
+            chunk_type = "delta",
+            "SSE chunk"
+        );
 
         // 提取第一个 choice 的 delta
         let choice = chunk.choices.first()?;
@@ -330,6 +346,13 @@ impl Provider for DeepSeekCompatProvider {
         let body = self.build_request_body(&request);
         let request_id = request.request_id.clone();
 
+        tracing::debug!(
+            target: "ccore::sampler",
+            provider = %self.config.name,
+            model = %request.model,
+            "sampling request"
+        );
+
         let response = self.client
             .post(self.chat_url())
             .header("Authorization", format!("Bearer {}", self.config.api_key))
@@ -342,6 +365,19 @@ impl Provider for DeepSeekCompatProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            if status.as_u16() == 429 {
+                tracing::warn!(
+                    target: "ccore::sampler",
+                    provider = %self.config.name,
+                    "rate limit hit"
+                );
+            }
+            tracing::error!(
+                target: "ccore::sampler",
+                provider = %self.config.name,
+                error = %format!("API returned error {}: {}", status, body.chars().take(200).collect::<String>()),
+                "sampling request failed"
+            );
             return Err(anyhow!("API 返回错误 {}：{}", status, body));
         }
 

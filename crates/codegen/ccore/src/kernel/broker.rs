@@ -81,11 +81,22 @@ impl Broker {
 
     /// 注册 Node 的 ZMQ identity（控制面）
     pub fn register_identity(&mut self, node_id: NodeId, identity: NodeIdentity) {
+        tracing::trace!(
+            target: "ccore::bus",
+            topic = "identity_register",
+            size = identity.len(),
+            "message published"
+        );
         self.node_identities.insert(node_id, identity);
     }
 
     /// 注销 Node 的 ZMQ identity（控制面 + 数据面清理）
     pub fn deregister_identity(&mut self, node_id: &NodeId) {
+        tracing::warn!(
+            target: "ccore::bus",
+            subscriber = %node_id,
+            "subscriber disconnected"
+        );
         self.node_identities.remove(node_id);
         // 清理该 Node 的所有订阅
         for subscribers in self.subscriptions.values_mut() {
@@ -250,6 +261,12 @@ impl Broker {
         let topic = msg.topic.as_str();
         let subscribers = self.find_subscribers(topic);
         let frames = FrameCodec::encode(msg)?;
+        tracing::trace!(
+            target: "ccore::bus",
+            topic = %topic,
+            size = frames.iter().map(|f| f.len()).sum::<usize>(),
+            "message published"
+        );
         let targets: Vec<(NodeIdentity, Vec<Vec<u8>>)> = subscribers
             .iter()
             .filter(|id| id.as_str() != msg.header.src_node)

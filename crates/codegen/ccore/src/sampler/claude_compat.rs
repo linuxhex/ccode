@@ -136,6 +136,12 @@ impl ClaudeCompatProvider {
         match event_type {
             "content_block_delta" => {
                 // 内容块增量事件
+                tracing::trace!(
+                    target: "ccore::sampler",
+                    provider = "claude",
+                    chunk_type = "content_block_delta",
+                    "SSE chunk"
+                );
                 let delta: ClaudeContentBlockDelta = match serde_json::from_str(data) {
                     Ok(d) => d,
                     Err(e) => {
@@ -214,6 +220,12 @@ impl ClaudeCompatProvider {
             }
             "message_start" => {
                 // 消息开始 - 包含初始 usage 信息
+                tracing::trace!(
+                    target: "ccore::sampler",
+                    provider = "claude",
+                    chunk_type = "message_start",
+                    "SSE chunk"
+                );
                 let msg_start: ClaudeMessageStart = match serde_json::from_str(data) {
                     Ok(m) => m,
                     Err(e) => {
@@ -221,6 +233,13 @@ impl ClaudeCompatProvider {
                         return results;
                     }
                 };
+                tracing::debug!(
+                    target: "ccore::sampler",
+                    provider = "claude",
+                    input_tokens = msg_start.message.usage.input_tokens,
+                    output_tokens = 0u32,
+                    "token usage"
+                );
                 // 发送包含 usage 的 chunk
                 results.push(Ok(StreamChunk {
                     request_id: request_id.to_string(),
@@ -236,6 +255,12 @@ impl ClaudeCompatProvider {
             }
             "message_delta" => {
                 // 消息级增量 - 包含 stop_reason 和 output_tokens usage
+                tracing::trace!(
+                    target: "ccore::sampler",
+                    provider = "claude",
+                    chunk_type = "message_delta",
+                    "SSE chunk"
+                );
                 let msg_delta: ClaudeMessageDelta = match serde_json::from_str(data) {
                     Ok(m) => m,
                     Err(e) => {
@@ -243,6 +268,13 @@ impl ClaudeCompatProvider {
                         return results;
                     }
                 };
+                tracing::debug!(
+                    target: "ccore::sampler",
+                    provider = "claude",
+                    input_tokens = 0u32,
+                    output_tokens = msg_delta.usage.output_tokens,
+                    "token usage"
+                );
                 // 发送包含 output usage 的 chunk
                 results.push(Ok(StreamChunk {
                     request_id: request_id.to_string(),
@@ -406,6 +438,13 @@ impl Provider for ClaudeCompatProvider {
         let body = self.build_request_body(&request);
         let request_id = request.request_id.clone();
 
+        tracing::debug!(
+            target: "ccore::sampler",
+            provider = %self.config.name,
+            model = %request.model,
+            "sampling request"
+        );
+
         let response = self
             .client
             .post(self.messages_url())
@@ -422,6 +461,19 @@ impl Provider for ClaudeCompatProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
+            if status.as_u16() == 429 {
+                tracing::warn!(
+                    target: "ccore::sampler",
+                    provider = %self.config.name,
+                    "rate limit hit"
+                );
+            }
+            tracing::error!(
+                target: "ccore::sampler",
+                provider = %self.config.name,
+                error = %format!("API returned error {}: {}", status, body_text.chars().take(200).collect::<String>()),
+                "sampling request failed"
+            );
             return Err(anyhow!("API 返回错误 {}：{}", status, body_text));
         }
 
@@ -512,6 +564,19 @@ impl Provider for ClaudeCompatProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
+            if status.as_u16() == 429 {
+                tracing::warn!(
+                    target: "ccore::sampler",
+                    provider = %self.config.name,
+                    "rate limit hit"
+                );
+            }
+            tracing::error!(
+                target: "ccore::sampler",
+                provider = %self.config.name,
+                error = %format!("API returned error {}: {}", status, body_text.chars().take(200).collect::<String>()),
+                "sampling request failed"
+            );
             return Err(anyhow!("API 返回错误 {}：{}", status, body_text));
         }
 

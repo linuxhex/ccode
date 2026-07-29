@@ -212,6 +212,8 @@ impl LoopStateMachine {
 
     /// 处理事件，转换状态，返回下一步动作
     pub fn transition(&mut self, event: LoopEvent) -> LoopAction {
+        let old_state = format!("{:?}", self.state);
+
         match event {
             LoopEvent::LLMResponse {
                 stop_reason,
@@ -225,6 +227,13 @@ impl LoopStateMachine {
                     "end_turn" | "stop" => {
                         self.state = super::AgentState::Done;
                         self.done_reason = Some(DoneReason::ModelEndTurn);
+                        tracing::debug!(
+                            target: "ccore::loop",
+                            from = %old_state,
+                            to = "Done",
+                            trigger = "end_turn",
+                            "state transition"
+                        );
                         LoopAction::EndTurn {
                             reason: DoneReason::ModelEndTurn,
                         }
@@ -232,6 +241,13 @@ impl LoopStateMachine {
                     "tool_use" => {
                         if let Some((id, name, _)) = tool_calls.first() {
                             self.state = super::AgentState::AwaitingApproval;
+                            tracing::debug!(
+                                target: "ccore::loop",
+                                from = %old_state,
+                                to = "AwaitingApproval",
+                                trigger = %format!("tool_use({})", name),
+                                "state transition"
+                            );
                             LoopAction::WaitForPermission {
                                 tool_name: name.clone(),
                                 tool_use_id: id.clone(),
@@ -240,6 +256,13 @@ impl LoopStateMachine {
                             // tool_use 但无工具调用，视为 end_turn
                             self.state = super::AgentState::Done;
                             self.done_reason = Some(DoneReason::ModelEndTurn);
+                            tracing::debug!(
+                                target: "ccore::loop",
+                                from = %old_state,
+                                to = "Done",
+                                trigger = "tool_use_empty",
+                                "state transition"
+                            );
                             LoopAction::EndTurn {
                                 reason: DoneReason::ModelEndTurn,
                             }
@@ -250,22 +273,50 @@ impl LoopStateMachine {
                         if !tool_calls.is_empty() {
                             if let Some((id, name, _)) = tool_calls.first() {
                                 self.state = super::AgentState::AwaitingApproval;
+                                tracing::debug!(
+                                    target: "ccore::loop",
+                                    from = %old_state,
+                                    to = "AwaitingApproval",
+                                    trigger = %format!("max_tokens+tool_use({})", name),
+                                    "state transition"
+                                );
                                 LoopAction::WaitForPermission {
                                     tool_name: name.clone(),
                                     tool_use_id: id.clone(),
                                 }
                             } else {
                                 self.state = super::AgentState::Thinking;
+                                tracing::debug!(
+                                    target: "ccore::loop",
+                                    from = %old_state,
+                                    to = "Thinking",
+                                    trigger = "max_tokens",
+                                    "state transition"
+                                );
                                 LoopAction::CallLLM
                             }
                         } else {
                             self.state = super::AgentState::Thinking;
+                            tracing::debug!(
+                                target: "ccore::loop",
+                                from = %old_state,
+                                to = "Thinking",
+                                trigger = "max_tokens",
+                                "state transition"
+                            );
                             LoopAction::CallLLM
                         }
                     }
                     _ => {
                         // 未知 stop_reason，继续调用 LLM
                         self.state = super::AgentState::Thinking;
+                        tracing::debug!(
+                            target: "ccore::loop",
+                            from = %old_state,
+                            to = "Thinking",
+                            trigger = %format!("unknown_stop_reason({})", stop_reason),
+                            "state transition"
+                        );
                         LoopAction::CallLLM
                     }
                 }
@@ -282,10 +333,22 @@ impl LoopStateMachine {
                     }
                     ToolExecutionOutcome::Failure(_) => {
                         self.consecutive_failures += 1;
+                        tracing::debug!(
+                            target: "ccore::loop",
+                            consecutive_failures = self.consecutive_failures,
+                            "tool execution failure recorded"
+                        );
                     }
                 }
                 // 工具执行完成后，回到 Thinking 让模型决定下一步
                 self.state = super::AgentState::Thinking;
+                tracing::debug!(
+                    target: "ccore::loop",
+                    from = %old_state,
+                    to = "Thinking",
+                    trigger = "tool_completed",
+                    "state transition"
+                );
                 LoopAction::CallLLM
             }
 
@@ -296,6 +359,13 @@ impl LoopStateMachine {
             } => {
                 if allowed {
                     self.state = super::AgentState::ToolCalling;
+                    tracing::debug!(
+                        target: "ccore::loop",
+                        from = %old_state,
+                        to = "ToolCalling",
+                        trigger = %format!("permission_allowed({})", tool_name),
+                        "state transition"
+                    );
                     LoopAction::ExecuteTool {
                         tool_name,
                         tool_use_id,
@@ -305,6 +375,13 @@ impl LoopStateMachine {
                     self.done_reason = Some(DoneReason::PermissionDenied {
                         tool_name: tool_name.clone(),
                     });
+                    tracing::debug!(
+                        target: "ccore::loop",
+                        from = %old_state,
+                        to = "Done",
+                        trigger = %format!("permission_denied({})", tool_name),
+                        "state transition"
+                    );
                     LoopAction::EndTurn {
                         reason: DoneReason::PermissionDenied { tool_name },
                     }
@@ -314,6 +391,13 @@ impl LoopStateMachine {
             LoopEvent::UserCancelled => {
                 self.state = super::AgentState::Done;
                 self.done_reason = Some(DoneReason::UserCancelled);
+                tracing::debug!(
+                    target: "ccore::loop",
+                    from = %old_state,
+                    to = "Done",
+                    trigger = "user_cancelled",
+                    "state transition"
+                );
                 LoopAction::EndTurn {
                     reason: DoneReason::UserCancelled,
                 }
@@ -326,6 +410,13 @@ impl LoopStateMachine {
                 };
                 self.state = super::AgentState::Done;
                 self.done_reason = Some(reason.clone());
+                tracing::debug!(
+                    target: "ccore::loop",
+                    from = %old_state,
+                    to = "Done",
+                    trigger = %format!("budget_exhausted({:?})", kind),
+                    "state transition"
+                );
                 LoopAction::EndTurn { reason }
             }
 
@@ -333,25 +424,57 @@ impl LoopStateMachine {
                 tool_name,
                 repeat_count,
             } => {
+                tracing::error!(
+                    target: "ccore::loop",
+                    consecutive_failures = repeat_count,
+                    tool_name = %tool_name,
+                    "doom loop detected!"
+                );
                 let reason = DoneReason::LoopDetected {
                     tool_name: tool_name.clone(),
                     repeat_count,
                 };
                 self.state = super::AgentState::Done;
                 self.done_reason = Some(reason.clone());
+                tracing::debug!(
+                    target: "ccore::loop",
+                    from = %old_state,
+                    to = "Done",
+                    trigger = %format!("loop_detected({})", tool_name),
+                    "state transition"
+                );
                 LoopAction::EndTurn { reason }
             }
 
             LoopEvent::ConsecutiveFailures { count } => {
+                tracing::error!(
+                    target: "ccore::loop",
+                    consecutive_failures = count,
+                    "doom loop detected!"
+                );
                 let reason = DoneReason::ConsecutiveFailures { count };
                 self.state = super::AgentState::Error;
                 self.done_reason = Some(reason.clone());
+                tracing::debug!(
+                    target: "ccore::loop",
+                    from = %old_state,
+                    to = "Error",
+                    trigger = %format!("consecutive_failures({})", count),
+                    "state transition"
+                );
                 LoopAction::EndTurn { reason }
             }
 
             LoopEvent::MaxTurnsReached => {
                 self.state = super::AgentState::Done;
                 self.done_reason = Some(DoneReason::MaxTurnsReached);
+                tracing::debug!(
+                    target: "ccore::loop",
+                    from = %old_state,
+                    to = "Done",
+                    trigger = "max_turns_reached",
+                    "state transition"
+                );
                 LoopAction::EndTurn {
                     reason: DoneReason::MaxTurnsReached,
                 }

@@ -52,22 +52,94 @@ pub fn classify_sampler_error(
     // Check auth errors first
     if let Some(code) = status_code {
         match code {
-            401 | 403 => return RetryDecision::Fatal(format!("认证失败（HTTP {}）", code)),
-            400 | 404 | 422 => return RetryDecision::Fatal(format!("客户端错误（HTTP {}）", code)),
+            401 | 403 => {
+                let class = "AuthError";
+                tracing::debug!(
+                    target: "ccore::retry",
+                    error_class = class,
+                    retryable = false,
+                    status_code = code,
+                    "error classified"
+                );
+                return RetryDecision::Fatal(format!("认证失败（HTTP {}）", code));
+            }
+            400 | 404 | 422 => {
+                let class = "ClientError";
+                tracing::debug!(
+                    target: "ccore::retry",
+                    error_class = class,
+                    retryable = false,
+                    status_code = code,
+                    "error classified"
+                );
+                return RetryDecision::Fatal(format!("客户端错误（HTTP {}）", code));
+            }
             429 => {
+                tracing::warn!(
+                    target: "ccore::sampler",
+                    provider = "unknown",
+                    "rate limit hit"
+                );
                 let next = retry_count + 1;
                 if next >= RATE_LIMIT_RETRY_THRESHOLD {
+                    tracing::debug!(
+                        target: "ccore::retry",
+                        error_class = "RateLimited",
+                        retryable = false,
+                        status_code = code,
+                        "error classified"
+                    );
                     return RetryDecision::Fatal("速率限制重试次数耗尽".into());
                 }
                 let backoff = retry_backoff_with_jitter(next);
+                tracing::debug!(
+                    target: "ccore::retry",
+                    error_class = "RateLimited",
+                    retryable = true,
+                    status_code = code,
+                    "error classified"
+                );
+                tracing::info!(
+                    target: "ccore::retry",
+                    attempt = next,
+                    max = RATE_LIMIT_RETRY_THRESHOLD,
+                    decision = "retry_with_backoff",
+                    "retry decision"
+                );
                 return RetryDecision::RetryWithBackoff { backoff, is_rate_limited: true };
             }
             500 | 502 | 503 | 504 => {
                 let next = retry_count + 1;
                 if next >= max_retries {
+                    tracing::error!(
+                        target: "ccore::retry",
+                        attempts = next,
+                        "retry exhausted"
+                    );
+                    tracing::debug!(
+                        target: "ccore::retry",
+                        error_class = "ServerError",
+                        retryable = false,
+                        status_code = code,
+                        "error classified"
+                    );
                     return RetryDecision::Fatal(format!("服务端错误重试耗尽（HTTP {}）", code));
                 }
                 let backoff = retry_backoff_with_jitter(next);
+                tracing::debug!(
+                    target: "ccore::retry",
+                    error_class = "ServerError",
+                    retryable = true,
+                    status_code = code,
+                    "error classified"
+                );
+                tracing::info!(
+                    target: "ccore::retry",
+                    attempt = next,
+                    max = max_retries,
+                    decision = "retry",
+                    "retry decision"
+                );
                 return RetryDecision::Retry { backoff };
             }
             _ => {}
@@ -77,27 +149,88 @@ pub fn classify_sampler_error(
     // Check error message patterns
     let msg_lower = error_message.to_lowercase();
     if msg_lower.contains("context") && (msg_lower.contains("too long") || msg_lower.contains("overflow")) {
+        tracing::debug!(
+            target: "ccore::retry",
+            error_class = "ContextOverflow",
+            retryable = false,
+            "error classified"
+        );
         return RetryDecision::Fatal("上下文窗口溢出".into());
     }
     if msg_lower.contains("timeout") || msg_lower.contains("connection") {
         let next = retry_count + 1;
         if next >= max_retries {
+            tracing::error!(
+                target: "ccore::retry",
+                attempts = next,
+                "retry exhausted"
+            );
             return RetryDecision::Fatal("连接错误重试耗尽".into());
         }
+        tracing::debug!(
+            target: "ccore::retry",
+            error_class = "ConnectionError",
+            retryable = true,
+            "error classified"
+        );
+        tracing::info!(
+            target: "ccore::retry",
+            attempt = next,
+            max = max_retries,
+            decision = "retry",
+            "retry decision"
+        );
         return RetryDecision::Retry { backoff: retry_backoff_with_jitter(next) };
     }
     if msg_lower.contains("empty response") || msg_lower.contains("no content") {
         let next = retry_count + 1;
         if next >= max_retries {
+            tracing::error!(
+                target: "ccore::retry",
+                attempts = next,
+                "retry exhausted"
+            );
             return RetryDecision::Fatal("空响应重试耗尽".into());
         }
+        tracing::debug!(
+            target: "ccore::retry",
+            error_class = "EmptyResponse",
+            retryable = true,
+            "error classified"
+        );
+        tracing::info!(
+            target: "ccore::retry",
+            attempt = next,
+            max = max_retries,
+            decision = "retry",
+            "retry decision"
+        );
         return RetryDecision::Retry { backoff: retry_backoff_with_jitter(next) };
     }
     if msg_lower.contains("doom loop") || msg_lower.contains("loop detected") {
+        tracing::debug!(
+            target: "ccore::retry",
+            error_class = "DoomLoop",
+            retryable = true,
+            "error classified"
+        );
+        tracing::info!(
+            target: "ccore::retry",
+            attempt = retry_count,
+            max = max_retries,
+            decision = "retry_immediate",
+            "retry decision"
+        );
         return RetryDecision::RetryImmediate { backoff: doom_loop_backoff(retry_count) };
     }
 
     // Default: fatal
+    tracing::debug!(
+        target: "ccore::retry",
+        error_class = "Unknown",
+        retryable = false,
+        "error classified"
+    );
     RetryDecision::Fatal(format!("不可重试的错误：{}", error_message))
 }
 
