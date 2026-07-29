@@ -94,6 +94,8 @@ pub trait PostExecuteHook: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>;
 }
 
+use super::sandbox::{ToolSandbox, SandboxProfile, SandboxCheckResult, FileAccessOperation};
+
 /// 工具桥接器 - 管理工具注册、权限检查和分发
 pub struct ToolBridge {
     /// 已注册的工具条目
@@ -106,6 +108,8 @@ pub struct ToolBridge {
     execution_timeout_secs: u64,
     /// 工具执行重试配置（借鉴 Claude Code）
     retry_config: ToolRetryConfig,
+    /// 工具级沙箱（借鉴 Claude Code，在执行前检查路径/命令/网络权限）
+    sandbox: ToolSandbox,
 }
 
 impl Default for ToolBridge {
@@ -122,6 +126,7 @@ impl ToolBridge {
             post_hooks: Vec::new(),
             execution_timeout_secs: 120,
             retry_config: ToolRetryConfig::default(),
+            sandbox: ToolSandbox::new(SandboxProfile::default()),
         };
         bridge.register_defaults();
         // 注册内置工具执行器（bash/read/write/edit/grep/glob/list_dir）
@@ -556,12 +561,23 @@ impl ToolBridge {
         }
     }
 
-    /// 执行工具调用（带指数退避重试）
+    /// 执行工具调用（带沙箱检查 + 指数退避重试）
     pub async fn execute(
         &self,
         request: &ToolCallRequest,
     ) -> ToolCallResult {
         let start = Instant::now();
+
+        // ── 沙箱前置检查（借鉴 Claude Code，在执行前拦截危险操作）──
+        if let Err(sandbox_denied) = self.check_sandbox(&request.tool_name, &request.arguments) {
+            return ToolCallResult {
+                tool_call_id: request.tool_call_id.clone(),
+                output: sandbox_denied,
+                success: false,
+                duration_ms: start.elapsed().as_millis() as u64,
+                is_partial: false,
+            };
+        }
 
         // 查找工具执行器
         let executor = match self.executors.get(&request.tool_name) {
@@ -687,6 +703,87 @@ impl ToolBridge {
     /// 获取所有工具定义（用于 LLM tools 参数）
     pub fn tool_definitions(&self) -> Vec<&ToolDefinition> {
         self.entries.values().map(|e| &e.definition).collect()
+    }
+
+    /// 沙箱前置检查（借鉴 Claude Code，在工具执行前拦截）
+    ///
+    /// 根据 tool_name 和 arguments 中的路径/命令进行安全检查：
+    /// - bash: 检查命令是否在黑名单中
+    /// - read/cat/head: 检查读取路径是否被拒绝
+    /// - write/edit/search_replace: 检查写入路径是否在工作区内
+    /// - web_fetch/curl: 检查网络权限
+    fn check_sandbox(&self, tool_name: &str, arguments: &serde_json::Value) -> Result<(), String> {
+        match tool_name {
+            "bash" => {
+                if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
+                    match self.sandbox.check_shell_command(cmd) {
+                        SandboxCheckResult::Allowed => Ok(()),
+                        SandboxCheckResult::Denied(reason) => {
+                            tracing::warn!("沙箱拦截 bash 命令：{}", reason);
+                            Err(format!("沙箱拒绝执行：{}", reason))
+                        }
+                        SandboxCheckResult::RequiresConfirmation(reason) => {
+                            tracing::warn!("沙箱提示：{}", reason);
+                            Ok(()) // 需确认但不拒绝，由上层权限系统处理
+                        }
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            "read_file" | "cat" | "head" | "tail" => {
+                if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
+                    match self.sandbox.check_file_access(path, FileAccessOperation::Read) {
+                        SandboxCheckResult::Allowed => Ok(()),
+                        SandboxCheckResult::Denied(reason) => {
+                            tracing::warn!("沙箱拦截读取路径：{}", reason);
+                            Err(format!("沙箱拒绝访问：{}", reason))
+                        }
+                        SandboxCheckResult::RequiresConfirmation(_) => Ok(()),
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            "write_file" | "edit_file" | "search_replace" => {
+                if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
+                    match self.sandbox.check_file_access(path, FileAccessOperation::Write) {
+                        SandboxCheckResult::Allowed => Ok(()),
+                        SandboxCheckResult::Denied(reason) => {
+                            tracing::warn!("沙箱拦截写入路径：{}", reason);
+                            Err(format!("沙箱拒绝写入：{}", reason))
+                        }
+                        SandboxCheckResult::RequiresConfirmation(reason) => {
+                            tracing::warn!("沙箱写入提示：{}", reason);
+                            Ok(())
+                        }
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            "web_fetch" | "curl" => {
+                match self.sandbox.check_network_access() {
+                    SandboxCheckResult::Allowed => Ok(()),
+                    SandboxCheckResult::Denied(reason) => {
+                        tracing::warn!("沙箱拦截网络访问：{}", reason);
+                        Err(format!("沙箱拒绝网络访问：{}", reason))
+                    }
+                    SandboxCheckResult::RequiresConfirmation(_) => Ok(()),
+                }
+            }
+            _ => Ok(()), // 其他工具默认放行
+        }
+    }
+
+    /// 获取沙箱实例引用
+    pub fn sandbox(&self) -> &ToolSandbox {
+        &self.sandbox
+    }
+
+    /// 获取沙箱实例可变引用（用于设置工作区路径或切换档案）
+    pub fn sandbox_mut(&mut self) -> &mut ToolSandbox {
+        &mut self.sandbox
     }
 
     /// 获取工具定义的 JSON 列表（直接可传给 LLM API）
