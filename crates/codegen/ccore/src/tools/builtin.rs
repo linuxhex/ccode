@@ -1,19 +1,49 @@
 //! 内置工具执行器 - 核心工具的实际执行逻辑
 //!
 //! 实现了 ccode 运行所需的最小工具集：
-//! - bash: 执行 shell 命令（含安全预检查）
-//! - read: 读取文件（含分页、过滤、安全校验）
-//! - write: 写入文件（含原子写入、验证）
-//! - edit: 编辑文件（支持 replace/insert/write 模式，原子写入）
+//! - bash: 执行 shell 命令（含安全预检查、命令缓存）
+//! - read: 读取文件（含分页、过滤、安全校验、读取追踪）
+//! - write: 写入文件（含原子写入、验证、先读后写约束）
+//! - edit: 编辑文件（支持 replace/insert/write 模式，原子写入、diff 展示）
 //! - grep: 搜索文件内容（含类型过滤、上下文、回退）
 //! - glob: 搜索文件名（含排除、排序）
 //! - list_dir: 列出目录内容（含递归、隐藏文件、类型标记）
+//! - web_search: 网页搜索（DuckDuckGo API）
+//! - web_fetch: 网页抓取（HTML→文本转换）
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use super::bridge::ToolExecutor;
 use super::output_formatter;
 use super::path_validator;
+use super::read_tracker;
+
+// ─── Bash 命令缓存（借鉴 Claude Code 命令缓存）──────────────────────────────
+
+/// Bash 命令缓存
+static BASH_CACHE: std::sync::OnceLock<Mutex<HashMap<String, CachedBashResult>>> = std::sync::OnceLock::new();
+
+/// 缓存的命令结果
+#[derive(Clone)]
+struct CachedBashResult {
+    stdout: String,
+    exit_code: i32,
+    timestamp: std::time::Instant,
+}
+
+/// 判断命令是否为只读命令（可缓存）
+fn is_readonly_command(command: &str) -> bool {
+    let readonly_prefixes = [
+        "ls", "cat", "head", "tail", "grep", "find", "wc",
+        "echo", "pwd", "which", "type", "git status", "git diff", "git log",
+        "git branch", "cargo check", "cargo test", "cargo build", "npm list",
+        "pip list", "python --version", "node --version", "rustc --version",
+    ];
+    let cmd_with_args = command.trim();
+    readonly_prefixes.iter().any(|prefix| cmd_with_args.starts_with(prefix))
+}
 
 // ─── BashExecutor ────────────────────────────────────────────────────────────
 
@@ -37,6 +67,45 @@ const DANGEROUS_COMMANDS: &[&str] = &[
     "mv / ",
 ];
 
+impl BashExecutor {
+    fn get_cache() -> &'static Mutex<HashMap<String, CachedBashResult>> {
+        BASH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// 检查缓存
+    fn check_cache(command: &str, working_dir: Option<&str>) -> Option<String> {
+        let cache = Self::get_cache();
+        if let Ok(cache) = cache.lock() {
+            let key = format!("{}:{}", working_dir.unwrap_or(""), command);
+            if let Some(cached) = cache.get(&key) {
+                // 缓存 5 分钟有效
+                if cached.timestamp.elapsed().as_secs() < 300 {
+                    let mut result = cached.stdout.clone();
+                    if cached.exit_code != 0 {
+                        result.push_str(&format!("\n[exit code: {}] (cached)", cached.exit_code));
+                    }
+                    result.push_str("\n(cached result)");
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+
+    /// 存入缓存
+    fn store_cache(command: &str, working_dir: Option<&str>, stdout: &str, exit_code: i32) {
+        let cache = Self::get_cache();
+        if let Ok(mut cache) = cache.lock() {
+            let key = format!("{}:{}", working_dir.unwrap_or(""), command);
+            cache.insert(key, CachedBashResult {
+                stdout: stdout.to_string(),
+                exit_code,
+                timestamp: std::time::Instant::now(),
+            });
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolExecutor for BashExecutor {
     async fn execute(&self, args: &serde_json::Value) -> anyhow::Result<String> {
@@ -57,6 +126,13 @@ impl ToolExecutor for BashExecutor {
 
         let timeout_secs = args["timeout"].as_u64().unwrap_or(120);
         let working_dir = args["working_dir"].as_str();
+
+        // 检查缓存（只读命令才缓存）
+        if is_readonly_command(command) {
+            if let Some(cached) = Self::check_cache(command, working_dir) {
+                return Ok(cached);
+            }
+        }
 
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(command);
@@ -92,6 +168,12 @@ impl ToolExecutor for BashExecutor {
                 if !output.status.success() {
                     result.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
                 }
+
+                // 缓存只读命令结果
+                if is_readonly_command(command) && output.status.success() {
+                    Self::store_cache(command, working_dir, &stdout, output.status.code().unwrap_or(-1));
+                }
+
                 // 输出截断
                 Ok(output_formatter::truncate_output(&result, 50_000))
             }
@@ -153,6 +235,9 @@ impl ToolExecutor for ReadExecutor {
                 std::io::ErrorKind::IsADirectory => anyhow::anyhow!("read: {} 是目录，请使用 list_dir", path),
                 _ => anyhow::anyhow!("read: 读取 {} 失败：{}", path, e),
             })?;
+
+        // 记录文件已被读取（先读后写约束）
+        read_tracker::mark_file_read(path);
 
         // 文件大小检查
         let total_lines = content.lines().count();
@@ -216,7 +301,8 @@ impl ToolExecutor for WriteExecutor {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("write: 缺少 content 参数"))?;
 
-        // 路径安全校验
+        // 先读后写约束：检查文件是否已被读取
+        // 如果文件已存在，必须先读取
         let workspace = std::env::current_dir().unwrap_or_default();
         let validation = path_validator::validate_path(path, &workspace);
 
@@ -224,6 +310,11 @@ impl ToolExecutor for WriteExecutor {
             return Err(anyhow::anyhow!(
                 "write: 路径 {} 在工作目录外，操作被拒绝", path
             ));
+        }
+
+        // 如果文件已存在，检查是否已读取
+        if validation.canonical.exists() {
+            read_tracker::require_file_read(path)?;
         }
 
         // 二进制内容检测
@@ -296,6 +387,9 @@ impl ToolExecutor for EditExecutor {
             ));
         }
 
+        // 先读后写约束：编辑前必须先读取文件
+        read_tracker::require_file_read(path)?;
+
         match mode {
             "replace" => self.execute_replace(args, &validation.canonical).await,
             "insert" => self.execute_insert(args, &validation.canonical).await,
@@ -308,7 +402,7 @@ impl ToolExecutor for EditExecutor {
 }
 
 impl EditExecutor {
-    /// 替换模式（原有逻辑升级）
+    /// 替换模式（原有逻辑升级，含 diff 展示）
     async fn execute_replace(&self, args: &serde_json::Value, canonical: &Path) -> anyhow::Result<String> {
         let old_text = args["old_text"]
             .as_str()
@@ -342,6 +436,11 @@ impl EditExecutor {
             (content.replacen(old_text, new_text, 1), 1)
         };
 
+        // 生成 diff（借鉴 Claude Code 编辑后的 diff 展示）
+        let diff = output_formatter::generate_unified_diff(
+            &content, &new_content, &canonical.display().to_string(), 3,
+        );
+
         // 原子写入
         self.atomic_write(canonical, &new_content).await?;
 
@@ -349,13 +448,15 @@ impl EditExecutor {
         let edit_line = self.find_edit_line(&content, old_text);
         let context = self.get_edit_context(&new_content, edit_line, 3);
 
-        Ok(output_formatter::format_edit_result(
+        let edit_result = output_formatter::format_edit_result(
             &canonical.display().to_string(),
             edit_line,
             &context.before.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             &context.edited,
             &context.after.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        ))
+        );
+
+        Ok(format!("{}\n\nDiff:\n{}", edit_result, diff))
     }
 
     /// 插入模式
@@ -385,9 +486,15 @@ impl EditExecutor {
         new_lines.extend_from_slice(&lines[after_line..]);
 
         let new_content = new_lines.join("\n");
+
+        // 生成 diff
+        let diff = output_formatter::generate_unified_diff(
+            &file_content, &new_content, &canonical.display().to_string(), 3,
+        );
+
         self.atomic_write(canonical, &new_content).await?;
 
-        Ok(format!("已插入到 {} 后（{} 行）", after_line, content.lines().count()))
+        Ok(format!("已插入到 {} 后（{} 行）\n\nDiff:\n{}", after_line, content.lines().count(), diff))
     }
 
     /// 完全写入模式
@@ -699,6 +806,157 @@ impl ListDirExecutor {
     }
 }
 
+// ─── WebSearchExecutor ───────────────────────────────────────────────────────
+
+/// WebSearch 工具执行器（借鉴 Claude Code WebSearchTool）
+pub struct WebSearchExecutor;
+
+#[async_trait::async_trait]
+impl ToolExecutor for WebSearchExecutor {
+    async fn execute(&self, args: &serde_json::Value) -> anyhow::Result<String> {
+        let query = args["query"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("web_search: 缺少 query 参数"))?;
+
+        let client = reqwest::Client::new();
+
+        // 使用 DuckDuckGo Instant Answer API
+        let url = format!(
+            "https://api.duckduckgo.com/?q={}&format=json&no_html=1",
+            urlencoding::encode(query)
+        );
+
+        let response = client.get(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .header("User-Agent", "Mozilla/5.0 (compatible; ccore/1.0)")
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("web_search: 请求失败：{}", e))?;
+
+        let body: serde_json::Value = response.json().await
+            .map_err(|e| anyhow::anyhow!("web_search: 解析响应失败：{}", e))?;
+
+        // 提取搜索结果
+        let mut results = String::new();
+
+        if let Some(abstract_text) = body["AbstractText"].as_str() {
+            if !abstract_text.is_empty() {
+                results.push_str(&format!("摘要: {}\n", abstract_text));
+            }
+        }
+        if let Some(abstract_url) = body["AbstractURL"].as_str() {
+            if !abstract_url.is_empty() {
+                results.push_str(&format!("来源: {}\n", abstract_url));
+            }
+        }
+
+        // 相关主题
+        if let Some(topics) = body["RelatedTopics"].as_array() {
+            let valid_topics: Vec<&serde_json::Value> = topics
+                .iter()
+                .filter(|t| t["Text"].as_str().map(|s| !s.is_empty()).unwrap_or(false))
+                .take(5)
+                .collect();
+
+            if !valid_topics.is_empty() {
+                results.push_str("\n相关主题:\n");
+                for (i, topic) in valid_topics.iter().enumerate() {
+                    if let Some(text) = topic["Text"].as_str() {
+                        results.push_str(&format!("{}. {}\n", i + 1, text));
+                    }
+                    if let Some(url) = topic["FirstURL"].as_str() {
+                        results.push_str(&format!("   链接: {}\n", url));
+                    }
+                }
+            }
+        }
+
+        // 结果链接
+        if let Some(results_arr) = body["Results"].as_array() {
+            if !results_arr.is_empty() {
+                results.push_str("\n搜索结果:\n");
+                for (i, r) in results_arr.iter().take(5).enumerate() {
+                    if let Some(text) = r["Text"].as_str() {
+                        results.push_str(&format!("{}. {}\n", i + 1, text));
+                    }
+                    if let Some(url) = r["FirstURL"].as_str() {
+                        results.push_str(&format!("   链接: {}\n", url));
+                    }
+                }
+            }
+        }
+
+        if results.is_empty() {
+            results = format!("未找到 '{}' 的搜索结果", query);
+        }
+
+        Ok(results)
+    }
+
+    fn name(&self) -> &str { "web_search" }
+}
+
+// ─── WebFetchExecutor ────────────────────────────────────────────────────────
+
+/// WebFetch 工具执行器（借鉴 Claude Code WebFetchTool）
+pub struct WebFetchExecutor;
+
+#[async_trait::async_trait]
+impl ToolExecutor for WebFetchExecutor {
+    async fn execute(&self, args: &serde_json::Value) -> anyhow::Result<String> {
+        let url = args["url"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("web_fetch: 缺少 url 参数"))?;
+
+        // URL 基本校验
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(anyhow::anyhow!("web_fetch: URL 必须以 http:// 或 https:// 开头"));
+        }
+
+        let client = reqwest::Client::new();
+        let response = client.get(url)
+            .timeout(std::time::Duration::from_secs(30))
+            .header("User-Agent", "Mozilla/5.0 (compatible; ccore/1.0)")
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("web_fetch: 请求失败：{}", e))?;
+
+        let content_type = response.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let text = response.text().await
+            .map_err(|e| anyhow::anyhow!("web_fetch: 读取响应失败：{}", e))?;
+
+        if content_type.contains("text/html") {
+            let converted = html_to_text(&text);
+            Ok(output_formatter::truncate_output(&converted, 50_000))
+        } else {
+            Ok(output_formatter::truncate_output(&text, 50_000))
+        }
+    }
+
+    fn name(&self) -> &str { "web_fetch" }
+}
+
+/// 简单的 HTML → 文本转换（去除标签）
+fn html_to_text(html: &str) -> String {
+    let re_script = regex::Regex::new(r"(?s)<script[^>]*>.*?</script>").unwrap_or_else(|_| regex::Regex::new("").unwrap());
+    let re_style = regex::Regex::new(r"(?s)<style[^>]*>.*?</style>").unwrap_or_else(|_| regex::Regex::new("").unwrap());
+    let re_tag = regex::Regex::new(r"<[^>]+>").unwrap_or_else(|_| regex::Regex::new("").unwrap());
+    let re_entity = regex::Regex::new(r"&nbsp;|&amp;|&lt;|&gt;|&quot;").unwrap_or_else(|_| regex::Regex::new("").unwrap());
+
+    let text = re_script.replace_all(html, "").to_string();
+    let text = re_style.replace_all(&text, "").to_string();
+    let text = re_tag.replace_all(&text, "").to_string();
+    let text = re_entity.replace_all(&text, " ").to_string();
+
+    // 清理多余空白
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 // ─── 注册所有内置执行器 ──────────────────────────────────────────────────────
 
 /// 注册所有内置工具执行器到 ToolBridge
@@ -710,7 +968,114 @@ pub fn register_builtin_executors(bridge: &mut super::bridge::ToolBridge) {
     bridge.register_executor(Box::new(GrepExecutor));
     bridge.register_executor(Box::new(GlobExecutor));
     bridge.register_executor(Box::new(ListDirExecutor));
+    bridge.register_executor(Box::new(WebSearchExecutor));
+    bridge.register_executor(Box::new(WebFetchExecutor));
 
     // 注册 post_hook：Write/Edit 后对 .rs 文件运行 rustfmt --check 做增量验证
     bridge.register_post_hook(Box::new(super::rustfmt_hook::RustfmtHook));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_readonly_command() {
+        assert!(is_readonly_command("ls -la"));
+        assert!(is_readonly_command("cat file.txt"));
+        assert!(is_readonly_command("git status"));
+        assert!(is_readonly_command("git diff HEAD~1"));
+        assert!(is_readonly_command("cargo check"));
+        assert!(is_readonly_command("pwd"));
+        assert!(is_readonly_command("echo hello"));
+        assert!(is_readonly_command("which python3"));
+        assert!(!is_readonly_command("rm file.txt"));
+        assert!(!is_readonly_command("npm install"));
+        assert!(!is_readonly_command("cargo run"));
+    }
+
+    #[test]
+    fn test_bash_cache_store_and_retrieve() {
+        // 清空缓存
+        let cache = BashExecutor::get_cache();
+        if let Ok(mut c) = cache.lock() {
+            c.clear();
+        }
+
+        BashExecutor::store_cache("ls -la", None, "file1\nfile2\n", 0);
+        let cached = BashExecutor::check_cache("ls -la", None);
+        assert!(cached.is_some());
+        let result = cached.unwrap();
+        assert!(result.contains("file1"));
+        assert!(result.contains("cached result"));
+    }
+
+    #[test]
+    fn test_bash_cache_not_found() {
+        let cache = BashExecutor::get_cache();
+        if let Ok(mut c) = cache.lock() {
+            c.clear();
+        }
+
+        let cached = BashExecutor::check_cache("nonexistent_cmd", None);
+        assert!(cached.is_none());
+    }
+
+    #[test]
+    fn test_bash_cache_with_working_dir() {
+        let cache = BashExecutor::get_cache();
+        if let Ok(mut c) = cache.lock() {
+            c.clear();
+        }
+
+        BashExecutor::store_cache("ls", Some("/home"), "files\n", 0);
+        let cached = BashExecutor::check_cache("ls", Some("/home"));
+        assert!(cached.is_some());
+
+        // 不同工作目录应返回 None
+        let cached = BashExecutor::check_cache("ls", Some("/tmp"));
+        assert!(cached.is_none());
+    }
+
+    #[test]
+    fn test_html_to_text() {
+        let html = r#"<html><head><style>body{}</style></head><body><script>var x=1;</script><h1>Title</h1><p>Hello &amp; World</p></body></html>"#;
+        let text = html_to_text(html);
+        assert!(text.contains("Title"));
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+        assert!(!text.contains("<script>"));
+        assert!(!text.contains("<style>"));
+        assert!(!text.contains("<h1>"));
+        assert!(!text.contains("<p>"));
+    }
+
+    #[test]
+    fn test_html_to_text_entities() {
+        let html = "<p>&nbsp;Hello &amp; &lt;World&gt; &quot;test&quot;</p>";
+        let text = html_to_text(html);
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+        assert!(text.contains("test"));
+        assert!(!text.contains("&amp;"));
+        assert!(!text.contains("&lt;"));
+    }
+
+    #[test]
+    fn test_read_tracker_integration() {
+        // 使用全局追踪器
+        read_tracker::global_read_tracker().clear();
+
+        // 未读取的文件应返回错误
+        let result = read_tracker::require_file_read("/test/unread.rs");
+        assert!(result.is_err());
+
+        // 读取后应成功
+        read_tracker::mark_file_read("/test/read.rs");
+        let result = read_tracker::require_file_read("/test/read.rs");
+        assert!(result.is_ok());
+
+        // 清理
+        read_tracker::global_read_tracker().clear();
+    }
 }

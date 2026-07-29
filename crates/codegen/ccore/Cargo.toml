@@ -67,6 +67,9 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 # 仿生架构依赖
 regex = "1"
 
+# URL 编码（WebSearch 工具）
+urlencoding = { workspace = true }
+
 # Git 支持
 git2 = "0.20"
 
