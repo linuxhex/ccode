@@ -27,3 +27,4 @@ pub mod tracing;
 pub mod retry;
 pub mod degradation;
 pub mod performance;
+pub mod error;

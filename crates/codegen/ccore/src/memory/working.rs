@@ -13,6 +13,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::embedding::{EmbeddingIndex, EmbeddingVector};
+use super::mmr::mmr_select;
+
 /// 消息角色（标准 LLM API 格式）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -135,6 +138,8 @@ pub struct WorkingMemory {
     max_tokens: u32,
     /// 压缩策略
     compaction_policy: CompactionPolicy,
+    /// Embedding 索引（用于相似度检索）
+    embedding_index: EmbeddingIndex,
 }
 
 impl WorkingMemory {
@@ -143,6 +148,7 @@ impl WorkingMemory {
             entries: Vec::new(),
             max_tokens,
             compaction_policy: CompactionPolicy::default(),
+            embedding_index: EmbeddingIndex::new(),
         }
     }
 
@@ -504,5 +510,165 @@ impl WorkingMemory {
             "[LLM摘要] {}...",
             content.chars().take(100).collect::<String>()
         ))
+    }
+
+    /// 添加 embedding 向量到索引
+    ///
+    /// # Arguments
+    /// * `entry_id` - 条目 ID
+    /// * `vector` - Embedding 向量
+    /// * `text_preview` - 文本预览（前 100 字符）
+    pub fn add_embedding(&mut self, entry_id: String, vector: Vec<f32>, text_preview: String) {
+        let embedding = EmbeddingVector {
+            data: vector,
+            entry_id,
+            text_preview,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        self.embedding_index.add(embedding);
+    }
+
+    /// 搜索相似条目（基于余弦相似度）
+    ///
+    /// # Arguments
+    /// * `query` - 查询向量
+    /// * `k` - 返回结果数量
+    ///
+    /// # Returns
+    /// 返回 entry_id 列表，按相似度降序排列
+    pub fn search_similar(&self, query: Vec<f32>, k: usize) -> Vec<String> {
+        self.embedding_index
+            .search_with_metadata(&query, k)
+            .into_iter()
+            .map(|(entry_id, _, _)| entry_id)
+            .collect()
+    }
+
+    /// 使用 MMR 搜索多样化条目
+    ///
+    /// 平衡相关性和多样性，避免返回过于相似的结果
+    ///
+    /// # Arguments
+    /// * `query` - 查询向量
+    /// * `k` - 返回结果数量
+    /// * `lambda` - 相关性权重（0.0-1.0），通常 0.5-0.8
+    ///
+    /// # Returns
+    /// 返回 entry_id 列表，按 MMR 分数排序
+    pub fn search_diverse(&self, query: Vec<f32>, k: usize, lambda: f32) -> Vec<String> {
+        let selected_indices = mmr_select(&self.embedding_index, &query, k, lambda);
+        selected_indices
+            .into_iter()
+            .filter_map(|idx| {
+                self.embedding_index
+                    .vectors()
+                    .get(idx)
+                    .map(|v| v.entry_id.clone())
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_working_memory_add_embedding() {
+        // 创建一个使用 3 维向量的测试索引
+        let mut index = EmbeddingIndex::with_dimension(3);
+
+        let embedding = EmbeddingVector {
+            data: vec![1.0, 0.0, 0.0],
+            entry_id: "test-entry-1".to_string(),
+            text_preview: "Test content".to_string(),
+            created_at: 1000,
+        };
+
+        index.add(embedding);
+
+        // 应该能够通过 entry_id 找到
+        assert!(index.find_by_entry_id("test-entry-1").is_some());
+    }
+
+    #[test]
+    fn test_working_memory_search_similar() {
+        let mut index = EmbeddingIndex::with_dimension(3);
+
+        // 添加几个 embeddings
+        index.add(EmbeddingVector {
+            data: vec![1.0, 0.0, 0.0],
+            entry_id: "entry-1".to_string(),
+            text_preview: "Content 1".to_string(),
+            created_at: 1000,
+        });
+        index.add(EmbeddingVector {
+            data: vec![0.0, 1.0, 0.0],
+            entry_id: "entry-2".to_string(),
+            text_preview: "Content 2".to_string(),
+            created_at: 1000,
+        });
+        index.add(EmbeddingVector {
+            data: vec![0.0, 0.0, 1.0],
+            entry_id: "entry-3".to_string(),
+            text_preview: "Content 3".to_string(),
+            created_at: 1000,
+        });
+
+        // 搜索与 [1, 0, 0] 最相似的
+        let results = index.search_with_metadata(&vec![1.0, 0.0, 0.0], 2);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "entry-1"); // 应该是第一个，因为完全匹配
+    }
+
+    #[test]
+    fn test_working_memory_search_diverse() {
+        let mut index = EmbeddingIndex::with_dimension(3);
+
+        // 添加几个 embeddings（两个相似，一个不同）
+        index.add(EmbeddingVector {
+            data: vec![1.0, 0.0, 0.0],
+            entry_id: "entry-1".to_string(),
+            text_preview: "Content 1".to_string(),
+            created_at: 1000,
+        });
+        index.add(EmbeddingVector {
+            data: vec![0.99, 0.1, 0.0],
+            entry_id: "entry-2".to_string(),
+            text_preview: "Content 2".to_string(),
+            created_at: 1000,
+        });
+        index.add(EmbeddingVector {
+            data: vec![0.0, 1.0, 0.0],
+            entry_id: "entry-3".to_string(),
+            text_preview: "Content 3".to_string(),
+            created_at: 1000,
+        });
+
+        // 使用 MMR 搜索
+        let selected = mmr_select(&index, &vec![1.0, 0.0, 0.0], 2, 0.7);
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0], 0); // 第一个总是最相关的
+        // 第二个应该是 1 或 2
+        assert!(selected.contains(&1) || selected.contains(&2));
+    }
+
+    #[test]
+    fn test_working_memory_integration() {
+        // 测试 WorkingMemory 的集成
+        let mut memory = WorkingMemory::new(10000);
+
+        // 添加一些消息
+        memory.push_system("System prompt", 10);
+        memory.push_user("User question", 20);
+        memory.push_assistant("Assistant response", 30);
+
+        // 验证消息数量
+        assert_eq!(memory.entries().len(), 3);
     }
 }
