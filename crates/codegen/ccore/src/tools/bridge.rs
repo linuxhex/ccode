@@ -149,6 +149,14 @@ pub trait PostExecuteHook: Send + Sync {
 }
 
 use super::sandbox::{ToolSandbox, SandboxProfile, SandboxCheckResult, FileAccessOperation};
+use super::permission::{PermissionChecker, PermissionMode as ToolPermissionMode, PermissionDecision};
+
+/// 全局权限检查器（默认 AskUser 模式）
+static PERMISSION_CHECKER: std::sync::OnceLock<PermissionChecker> = std::sync::OnceLock::new();
+
+fn get_permission_checker() -> &'static PermissionChecker {
+    PERMISSION_CHECKER.get_or_init(|| PermissionChecker::new(ToolPermissionMode::AskUser))
+}
 
 /// 工具桥接器 - 管理工具注册、权限检查和分发
 pub struct ToolBridge {
@@ -838,6 +846,26 @@ path="tests"
                 duration_ms: start.elapsed().as_millis() as u64,
                 is_partial: false,
             };
+        }
+
+        // ── 权限检查（PermissionChecker，在沙箱检查之后执行）──
+        let decision = get_permission_checker().check(&request.tool_name, &request.arguments);
+        match decision {
+            PermissionDecision::Deny => {
+                return ToolCallResult {
+                    tool_call_id: request.tool_call_id.clone(),
+                    output: format!("权限拒绝：工具 {} 被安全策略阻止", request.tool_name),
+                    success: false,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    is_partial: false,
+                };
+            }
+            PermissionDecision::AskUser => {
+                // TODO: 在完整的交互式系统中，这里应该提示用户确认
+                // 当前自动批准但记录警告，避免阻塞非交互式执行
+                tracing::warn!("工具 {} 需要用户确认（当前自动批准）", request.tool_name);
+            }
+            PermissionDecision::Allow => {}
         }
 
         // 查找工具执行器

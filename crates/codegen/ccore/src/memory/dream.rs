@@ -145,11 +145,30 @@ Output a single consolidated markdown section:"#,
 
     /// 执行一轮 Dream 整理
     ///
-    /// 1. 从 L1 短期记忆中提取冷条目（heat_score < 阈值）
-    /// 2. 若冷条目数 ≥ min_cold_entries，触发整理
-    /// 3. 将冷条目总结为 KnowledgeEntry 并存入 L2
-    /// 4. 从 L1 中移除已整理的条目
+    /// 1. 检查是否应自动触发整理（should_auto_trigger）
+    /// 2. 尝试获取 DreamLock（防止多实例并发整理）
+    /// 3. 从 L1 短期记忆中提取冷条目（heat_score < 阈值）
+    /// 4. 若冷条目数 ≥ min_cold_entries，触发整理
+    /// 5. 将冷条目总结为 KnowledgeEntry 并存入 L2
+    /// 6. 从 L1 中移除已整理的条目
     pub async fn run(
+        &self,
+        short_term: &mut ShortTermMemory,
+        long_term: &LongTermMemory,
+    ) -> anyhow::Result<DreamResult> {
+        // 自动触发检测：冷条目不足时不执行整理
+        if !self.should_auto_trigger(short_term) {
+            return Ok(DreamResult {
+                consolidated: 0,
+                removed_from_l1: 0,
+            });
+        }
+
+        self.organize(short_term, long_term).await
+    }
+
+    /// 核心整理逻辑（与 run 分离，便于带锁/不带锁调用）
+    async fn organize(
         &self,
         short_term: &mut ShortTermMemory,
         long_term: &LongTermMemory,
@@ -213,6 +232,41 @@ Output a single consolidated markdown section:"#,
             consolidated,
             removed_from_l1: removed,
         })
+    }
+
+    /// 带锁执行 Dream 整理（使用 DreamLock 防止多实例并发）
+    ///
+    /// 获取 DreamLock 后执行整理，整理完成后锁自动释放（RAII）。
+    /// 如果锁被占用（其他实例正在整理），返回 Ok(DreamResult::default())。
+    pub async fn run_with_lock(
+        &self,
+        lock_dir: &Path,
+        short_term: &mut ShortTermMemory,
+        long_term: &LongTermMemory,
+    ) -> anyhow::Result<DreamResult> {
+        // 自动触发检测
+        if !self.should_auto_trigger(short_term) {
+            return Ok(DreamResult {
+                consolidated: 0,
+                removed_from_l1: 0,
+            });
+        }
+
+        // 尝试获取 DreamLock
+        let _lock = match self.try_acquire_lock(lock_dir).await? {
+            Some(lock) => lock,
+            None => {
+                tracing::info!("Dream 整理锁被占用，跳过本轮整理");
+                return Ok(DreamResult {
+                    consolidated: 0,
+                    removed_from_l1: 0,
+                });
+            }
+        };
+
+        // 获取锁成功，执行整理
+        tracing::info!("DreamLock 已获取，开始整理");
+        self.organize(short_term, long_term).await
     }
 
     /// 计算简化热度（不依赖完整 HeatInput，基于 recency + activity）

@@ -127,7 +127,6 @@ pub struct Kernel {
     /// 自主神经系统（心跳监控 + 并发限流 + 内存池）
     autonomic: Arc<AutonomicNervousSystem>,
     /// 经历日志（闭环学习：记录反射弧执行结果，提取可学习模式）
-    #[allow(dead_code)]
     experience_log: Arc<Mutex<ExperienceLog>>,
     /// Agent 自愈管理器（向后兼容保留，已由 autonomic 接管）
     #[allow(dead_code)]
@@ -1342,6 +1341,31 @@ impl Kernel {
     /// 获取当前在线 Node 数量
     pub fn node_count(&self) -> usize {
         self.registry.len()
+    }
+
+    /// 启动记忆文件监听器
+    ///
+    /// 创建 MemoryWatcher 监听 ~/.ccode/memory/ 下的 MEMORY.md 文件变化，
+    /// 返回事件接收端，供调用方在事件循环中消费。
+    /// 如果不需要消费事件，可以忽略返回值（监听器仍会运行并记录变更）。
+    pub async fn start_memory_watcher(&mut self) -> Option<tokio::sync::mpsc::Receiver<crate::memory::watcher::MemoryWatchEvent>> {
+        let watch_path = crate::memory::storage::MemoryStorage::with_default_root(
+            &self.config.working_dir,
+        ).root().clone();
+
+        let mut watcher = crate::memory::watcher::MemoryWatcher::new(watch_path);
+        let event_rx = watcher.take_event_rx();
+
+        match watcher.start().await {
+            Ok(()) => {
+                tracing::info!("MemoryWatcher 已启动，监听记忆文件变更");
+                event_rx
+            }
+            Err(e) => {
+                tracing::warn!("MemoryWatcher 启动失败：{}", e);
+                None
+            }
+        }
     }
 }
 

@@ -58,6 +58,7 @@ impl DeepSeekCompatProvider {
     }
 
     /// 判断是否为推理模型（deepseek-reasoner）
+    #[allow(dead_code)]  // 保留为 API，供多模型路由使用
     fn is_reasoner_model(model: &str) -> bool {
         model.contains("reasoner") || model.contains("r1")
     }

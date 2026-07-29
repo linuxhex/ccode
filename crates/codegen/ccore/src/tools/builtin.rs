@@ -19,6 +19,17 @@ use super::bridge::ToolExecutor;
 use super::output_formatter;
 use super::path_validator;
 use super::read_tracker;
+use super::gitignore_filter::GitignoreFilter;
+
+/// 全局 Gitignore 过滤器
+static GITIGNORE: std::sync::OnceLock<GitignoreFilter> = std::sync::OnceLock::new();
+
+fn get_gitignore() -> &'static GitignoreFilter {
+    GITIGNORE.get_or_init(|| {
+        let workspace = std::env::current_dir().unwrap_or_default();
+        GitignoreFilter::new(workspace)
+    })
+}
 
 // ─── Bash 命令缓存（借鉴 Claude Code 命令缓存）──────────────────────────────
 
@@ -225,6 +236,11 @@ impl ToolExecutor for ReadExecutor {
                 "read: {} 可能包含敏感信息，读取被拒绝\n  如确需读取，请使用 bash: cat {}",
                 path, path
             ));
+        }
+
+        // gitignore 过滤
+        if get_gitignore().should_skip(&validation.canonical) {
+            return Err(anyhow::anyhow!("read: 文件 {} 被 .gitignore 忽略", path));
         }
 
         // 读取文件
@@ -567,7 +583,8 @@ impl ToolExecutor for GrepExecutor {
 
         let mut cmd = tokio::process::Command::new("rg");
         cmd.arg("--line-number")
-            .arg("--max-count").arg("200");
+            .arg("--max-count").arg("200")
+            .arg("--glob").arg("!.git");  // 排除 .git 目录（显式 gitignore 兼容）
 
         if case_insensitive {
             cmd.arg("-i");
@@ -704,7 +721,15 @@ impl ToolExecutor for GlobExecutor {
         if stdout.is_empty() {
             Ok("未找到匹配文件".into())
         } else {
-            let mut lines: Vec<&str> = stdout.lines().take(200).collect();
+            // 使用 gitignore 过滤结果
+            let gitignore = get_gitignore();
+            let mut lines: Vec<&str> = stdout.lines()
+                .filter(|line| {
+                    let path = std::path::Path::new(line);
+                    !gitignore.should_skip(path)
+                })
+                .take(200)
+                .collect();
             lines.sort();
             let count = lines.len();
             let mut result = format!("找到 {} 个文件\n\n", count);

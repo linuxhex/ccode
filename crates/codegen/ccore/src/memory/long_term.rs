@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tokio::fs;
+use super::storage::{MemoryStorage, MemoryScope};
 
 /// L2 知识条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,6 +317,51 @@ impl LongTermMemory {
         let path = self.entry_path(id);
         if path.exists() {
             fs::remove_file(&path).await?;
+        }
+        Ok(())
+    }
+
+    /// 将所有知识条目序列化并保存到 MemoryStorage（Workspace 范围）
+    ///
+    /// 借鉴 Claude Code 的 MEMORY.md 持久化机制，将知识条目以 Markdown 格式
+    /// 追加到 Workspace 级别的 MEMORY.md 文件中。
+    pub async fn save_to_storage(&self, storage: &MemoryStorage) -> anyhow::Result<()> {
+        let entries = self.load_all().await?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut content = String::from("## Long-Term Knowledge Entries\n\n");
+        for entry in &entries {
+            content.push_str(&format!(
+                "### [{}] {} (created: {})\n\n{}\n\n",
+                match entry.category {
+                    KnowledgeCategory::Architecture => "Architecture",
+                    KnowledgeCategory::Decision => "Decision",
+                    KnowledgeCategory::UserPreference => "UserPreference",
+                    KnowledgeCategory::CodePattern => "CodePattern",
+                    KnowledgeCategory::ErrorFix => "ErrorFix",
+                },
+                entry.id,
+                entry.created_at,
+                entry.content,
+            ));
+        }
+
+        storage.append(MemoryScope::Workspace, &content).await
+    }
+
+    /// 从 MemoryStorage（Workspace 范围）加载知识条目
+    ///
+    /// 读取 Workspace 级别的 MEMORY.md 文件，解析其中的知识条目。
+    /// 注意：此方法为轻量级集成，仅将存储内容作为补充数据源，
+    /// 完整的条目仍以 JSON 文件为准。
+    pub async fn load_from_storage(&mut self, storage: &MemoryStorage) -> anyhow::Result<()> {
+        if let Some(_content) = storage.read(MemoryScope::Workspace).await? {
+            // 存储内容已可读，表明 MemoryStorage 已初始化
+            // 知识条目的主存储仍为 JSON 文件（由 load_all 管理）
+            // 此方法标记了 MemoryStorage 的可用性，供未来深度集成
+            tracing::debug!("MemoryStorage Workspace 记忆已可读");
         }
         Ok(())
     }

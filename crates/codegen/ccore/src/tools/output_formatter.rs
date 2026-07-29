@@ -87,7 +87,7 @@ pub fn format_file_header(path: &str, size_bytes: u64) -> String {
 
 /// 搜索结果格式
 pub fn format_search_result(
-    path: &str,
+    _path: &str,
     line_num: usize,
     content: &str,
     context_before: &[&str],

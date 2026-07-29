@@ -490,6 +490,7 @@ impl WorkingMemory {
     ///
     /// # Returns
     /// 摘要后的内容字符串，或截断后备方案
+    #[allow(dead_code)]  // 保留为 API，待集成 SamplerNode 后启用
     async fn summarize_with_llm(&self, content: &str) -> Result<String, anyhow::Error> {
         // Build a summarization prompt
         let _prompt = format!(

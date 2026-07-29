@@ -153,7 +153,9 @@ impl Default for TelemetryCollector {
 /// - GET /metrics: Prometheus 格式指标
 /// - GET /dashboard: JSON 格式仪表盘数据
 pub struct DashboardServer {
+    #[allow(dead_code)]  // 保留字段，供 HTTP 服务端启动时使用
     collector: Arc<TelemetryCollector>,
+    #[allow(dead_code)]  // 保留字段，记录服务监听地址
     addr: SocketAddr,
 }
 

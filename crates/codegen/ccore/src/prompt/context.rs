@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use crate::memory::working::{WorkingMemory, MessageRole};
+use crate::memory::working::WorkingMemory;
 use crate::prompt::agents_md::AgentConfigFile;
 use crate::prompt::skills::SkillInfo;
 use crate::prompt::personas::PersonaInfo;
+use crate::tools::prompts;
 
 /// 模板渲染器（借鉴 Claude Code TemplateRenderer）
 ///
@@ -111,6 +112,7 @@ pub enum TemplateMode {
 /// - 无需加密（ccore 是开源项目）
 pub struct TemplateWatcher {
     /// 文件系统监听器
+    #[allow(dead_code)]  // 保留 watcher 以维持文件监听生命周期
     watcher: notify::RecommendedWatcher,
     /// 当前模板内容缓存
     templates: Arc<RwLock<HashMap<String, String>>>,
@@ -468,10 +470,20 @@ impl PromptContext {
             prompt.push_str(&personas_section);
         }
 
-        // 5. Tools section
+        // 5. Tools section（如果未手动设置 tools_section，则从 prompts::get_tool_definitions() 自动生成）
         if let Some(ref tools) = self.tools_section {
             prompt.push_str("\n\n## Available Tools\n\n");
             prompt.push_str(tools);
+        } else {
+            let tool_defs = prompts::get_tool_definitions();
+            if !tool_defs.is_empty() {
+                prompt.push_str("\n\n## Available Tools\n\n");
+                for def in &tool_defs {
+                    let name = def["name"].as_str().unwrap_or("");
+                    let description = def["description"].as_str().unwrap_or("");
+                    prompt.push_str(&format!("- **{}**: {}\n", name, description));
+                }
+            }
         }
 
         // 6. Custom instructions
