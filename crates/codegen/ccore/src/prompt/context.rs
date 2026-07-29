@@ -5,6 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 use crate::memory::working::WorkingMemory;
+use crate::prompt::agents_md::AgentConfigFile;
+use crate::prompt::skills::SkillInfo;
+use crate::prompt::personas::PersonaInfo;
 
 /// Controls which base template to use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -38,6 +41,12 @@ pub struct PromptContext {
     pub tools_section: Option<String>,
     /// Memory system enabled flag
     pub memory_enabled: bool,
+    /// Discovered AGENTS.md files
+    pub agents_md_files: Vec<AgentConfigFile>,
+    /// Discovered skills from .skill/ directory
+    pub skills: Vec<SkillInfo>,
+    /// Active personas for system prompt injection
+    pub active_personas: Vec<PersonaInfo>,
 }
 
 impl Default for PromptContext {
@@ -53,6 +62,9 @@ impl Default for PromptContext {
             custom_instructions: None,
             tools_section: None,
             memory_enabled: false,
+            agents_md_files: Vec::new(),
+            skills: Vec::new(),
+            active_personas: Vec::new(),
         }
     }
 }
@@ -66,32 +78,50 @@ impl PromptContext {
     /// Render the full system prompt
     pub fn render(&self, working_memory: &WorkingMemory) -> String {
         let mut prompt = String::new();
-        
+
         // 1. Base template header
         prompt.push_str(&self.render_template_header());
-        
+
         // 2. User info section
         prompt.push_str(&self.render_user_info());
-        
-        // 3. Tools section
+
+        // 3. AGENTS.md section (after user_info)
+        if let Some(agents_md) = crate::prompt::agents_md::format_agents_md_section(&self.agents_md_files) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&agents_md);
+        }
+
+        // 4. Skills section (after agents_md)
+        if let Some(skills_section) = crate::prompt::skills::format_skills_section(&self.skills) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&skills_section);
+        }
+
+        // 5. Active personas section (after skills)
+        if let Some(personas_section) = crate::prompt::personas::format_personas_section(&self.active_personas) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&personas_section);
+        }
+
+        // 5. Tools section
         if let Some(ref tools) = self.tools_section {
             prompt.push_str("\n\n## Available Tools\n\n");
             prompt.push_str(tools);
         }
-        
-        // 4. Custom instructions
+
+        // 6. Custom instructions
         if let Some(ref instructions) = self.custom_instructions {
             prompt.push_str("\n\n## Custom Instructions\n\n");
             prompt.push_str(instructions);
         }
-        
-        // 5. Working memory context (if any hot entries)
+
+        // 7. Working memory context (if any hot entries)
         let hot_entries = working_memory.hot_entries_summary();
         if !hot_entries.is_empty() {
             prompt.push_str("\n\n## Recent Context\n\n");
             prompt.push_str(&hot_entries);
         }
-        
+
         prompt
     }
 
@@ -105,7 +135,7 @@ impl PromptContext {
 
     fn render_user_info(&self) -> String {
         let mut section = String::from("\n\n<user_info>\n");
-        
+
         if let Some(ref wd) = self.working_directory {
             section.push_str(&format!("Working directory: {}\n", wd));
         }
@@ -118,7 +148,7 @@ impl PromptContext {
         if let Some(ref shell) = self.shell_path {
             section.push_str(&format!("Shell: {}\n", shell));
         }
-        
+
         section.push_str("</user_info>");
         section
     }
@@ -132,6 +162,12 @@ impl PromptContext {
     /// Set tools section
     pub fn with_tools(mut self, tools: impl Into<String>) -> Self {
         self.tools_section = Some(tools.into());
+        self
+    }
+
+    /// Add a persona to active personas
+    pub fn with_persona(mut self, persona: PersonaInfo) -> Self {
+        self.active_personas.push(persona);
         self
     }
 }

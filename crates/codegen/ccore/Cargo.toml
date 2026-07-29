@@ -32,6 +32,7 @@ reqwest = { workspace = true }
 rmp-serde = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 
 # 错误处理
 anyhow = { workspace = true }
@@ -52,5 +53,19 @@ toml = { workspace = true }
 # FFI
 libc = "0.2"
 
+# A+ 增强依赖
+metrics = "0.22"
+metrics-exporter-prometheus = "0.13"
+crossbeam-queue = "0.3"
+notify = "6"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+
+# 仿生架构依赖
+regex = "1"
+
+# Git 支持
+git2 = "0.20"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"
