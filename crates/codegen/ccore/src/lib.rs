@@ -18,3 +18,12 @@ pub mod agent;
 pub mod tools;
 pub mod config;
 pub mod ffi;
+pub mod prompt;
+
+// A+ 增强模块
+pub mod persistence;
+pub mod metrics;
+pub mod tracing;
+pub mod retry;
+pub mod degradation;
+pub mod performance;

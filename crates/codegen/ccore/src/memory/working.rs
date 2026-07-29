@@ -1,8 +1,55 @@
 //! L0 工作记忆 - 当前 LLM context window 内的内容
 //!
 //! 管理当前上下文窗口中的消息，按冷热评分动态更新
+//!
+//! ## 消息角色（借鉴 Claude Code message 类型）
+//!
+//! - `system`: 系统提示词、工具定义、上下文注入
+//! - `user`: 用户输入、感官信号、工具返回结果
+//! - `assistant`: LLM 响应、工具调用请求
+//!
+//! 角色必须按 system → user → assistant → user → ... 交替，
+//! 不能连续相同角色（LLM API 限制）。
 
 use serde::{Deserialize, Serialize};
+
+/// 消息角色（标准 LLM API 格式）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageRole {
+    System,
+    User,
+    Assistant,
+}
+
+impl std::fmt::Display for MessageRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::System => write!(f, "system"),
+            Self::User => write!(f, "user"),
+            Self::Assistant => write!(f, "assistant"),
+        }
+    }
+}
+
+impl From<MessageRole> for String {
+    fn from(role: MessageRole) -> String {
+        role.to_string()
+    }
+}
+
+impl std::convert::TryFrom<&str> for MessageRole {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s.to_lowercase().as_str() {
+            "system" => Ok(Self::System),
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            _ => Err(format!("Invalid message role: {}", s)),
+        }
+    }
+}
 
 /// 上下文压缩策略（借鉴 Claude Code CompactionPolicy）
 #[derive(Debug, Clone)]
@@ -46,7 +93,7 @@ pub struct CompactionResult {
 pub enum WorkingEntry {
     /// 热消息：完整原文
     Hot {
-        role: String,
+        role: MessageRole,
         content: String,
         token_count: u32,
     },
@@ -114,8 +161,8 @@ impl WorkingMemory {
         self.max_tokens
     }
 
-    /// 添加热消息
-    pub fn push_hot(&mut self, role: String, content: String, token_count: u32) {
+    /// 添加热消息（显式角色）
+    pub fn push_hot(&mut self, role: MessageRole, content: String, token_count: u32) {
         self.entries.push(WorkingEntry::Hot {
             role,
             content,
@@ -123,18 +170,42 @@ impl WorkingMemory {
         });
     }
 
+    /// 添加系统消息（便捷方法）
+    pub fn push_system(&mut self, content: impl Into<String>, token_count: u32) {
+        self.push_hot(MessageRole::System, content.into(), token_count);
+    }
+
+    /// 添加用户消息（便捷方法）
+    pub fn push_user(&mut self, content: impl Into<String>, token_count: u32) {
+        self.push_hot(MessageRole::User, content.into(), token_count);
+    }
+
+    /// 添加助手消息（便捷方法）
+    pub fn push_assistant(&mut self, content: impl Into<String>, token_count: u32) {
+        self.push_hot(MessageRole::Assistant, content.into(), token_count);
+    }
+
     /// 获取所有条目
     pub fn entries(&self) -> &[WorkingEntry] {
         &self.entries
     }
 
-    /// 获取可发送给 LLM 的消息列表（过滤冷占位符，或按需替换为召回内容）
+    /// 获取可发送给 LLM 的消息列表（OpenAI 格式）
+    ///
+    /// 输出格式：`Vec<(String, String)>` where `(role, content)`
+    /// - role: "system" | "user" | "assistant"
+    /// - content: 消息内容
+    ///
+    /// 借鉴 Claude Code 的消息格式转换逻辑：
+    /// - Hot: 直接输出原角色和内容
+    /// - Warm: 作为 system 消息，内容为 `[上下文摘要] {summary}`
+    /// - Cold: 作为 system 消息，内容为占位符
     pub fn to_chat_messages(&self) -> Vec<(String, String)> {
         self.entries
             .iter()
             .map(|entry| match entry {
                 WorkingEntry::Hot { role, content, .. } => {
-                    (role.clone(), content.clone())
+                    (role.to_string(), content.clone())
                 }
                 WorkingEntry::Warm { summary, .. } => {
                     ("system".into(), format!("[上下文摘要] {}", summary))
@@ -251,5 +322,24 @@ impl WorkingMemory {
             entries_compacted,
             compacted_range: (compacted_start, compacted_end),
         }
+    }
+
+    /// 获取热条目摘要（用于系统提示上下文）
+    ///
+    /// 返回所有 Hot 条目的简要内容摘要，用于构建系统提示
+    pub fn hot_entries_summary(&self) -> String {
+        let mut summary = String::new();
+        for entry in &self.entries {
+            if let WorkingEntry::Hot { role, content, .. } = entry {
+                // 每个条目最多取前 100 字符
+                let preview = if content.len() > 100 {
+                    format!("{}...", &content[..100])
+                } else {
+                    content.clone()
+                };
+                summary.push_str(&format!("[{}] {}\n", role, preview));
+            }
+        }
+        summary.trim_end().to_string()
     }
 }

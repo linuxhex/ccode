@@ -3,7 +3,7 @@
 //! 每 agent turn 结束时，重算冷热评分，从热到冷填充 L0
 
 use crate::memory::heat::{self, HeatInput, HeatWeights, HeatThresholds, Temperature};
-use crate::memory::working::WorkingEntry;
+use crate::memory::working::{WorkingEntry, MessageRole};
 
 /// 滑动窗口更新器
 pub struct SlidingWindow {
@@ -64,7 +64,7 @@ impl SlidingWindow {
         for (_heat_score, temp, msg) in &scored {
             let entry = match temp {
                 Temperature::Hot => WorkingEntry::Hot {
-                    role: msg.role.clone(),
+                    role: MessageRole::try_from(msg.role.as_str()).unwrap_or(MessageRole::User),
                     content: msg.content.clone(),
                     token_count: msg.token_count,
                 },

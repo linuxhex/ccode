@@ -141,7 +141,39 @@ impl ToolBridge {
         self.register(ToolEntry {
             definition: ToolDefinition {
                 name: "bash".into(),
-                description: "执行 shell 命令。支持交互式命令、管道、重定向。工作目录为项目根目录。".into(),
+                description: r###"执行 shell 命令,用于运行构建/测试命令、git 操作、文件系统操作等。
+
+**何时使用**:
+- 运行构建和测试命令 (如 `cargo build`, `npm test`)
+- 执行 git 操作 (如 `git status`, `git diff`)
+- 文件系统操作 (如 `mkdir`, `cp`, `mv`)
+- 运行项目脚本和工具
+
+**何时不使用**:
+- 读取文件内容 → 使用 `read_file`
+- 搜索代码 → 使用 `grep`
+- 查找文件 → 使用 `glob`
+- 编辑文件 → 使用 `search_replace` 或 `write_file`
+
+**使用示例**:
+构建项目:
+command="cargo build --release"
+
+运行测试:
+command="cargo test"
+
+Git 操作:
+command="git status"
+command="git diff HEAD~1"
+
+安装依赖:
+command="npm install"
+
+**注意事项**:
+- 默认超时为 120 秒,长时间运行的任务应设置 timeout 参数
+- 避免在没有用户确认的情况下执行 `rm -rf` 等危险命令
+- 工作目录默认为项目根目录
+- 支持交互式命令、管道和重定向"###.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -159,7 +191,38 @@ impl ToolBridge {
         self.register(ToolEntry {
             definition: ToolDefinition {
                 name: "read_file".into(),
-                description: "读取文件内容。支持指定行范围。".into(),
+                description: r###"读取文件内容,用于查看源代码、配置文件、文档等。
+
+**何时使用**:
+- 查看源代码文件内容
+- 读取配置文件 (如 `Cargo.toml`, `package.json`)
+- 查看文档和说明文件
+- 检查文件结构
+
+**参数说明**:
+- `path`: 文件的绝对路径或相对路径(相对于项目根目录)
+- `offset`: 起始行号(从 1 开始),用于分页读取大文件
+- `limit`: 最大读取行数,避免一次性读取过多内容
+
+**使用示例**:
+读取完整文件:
+path="src/main.rs"
+
+读取前 50 行:
+path="Cargo.toml"
+offset=1
+limit=50
+
+读取特定行范围:
+path="src/lib.rs"
+offset=100
+limit=30
+
+**注意事项**:
+- 对于大文件,使用 `offset` 和 `limit` 分批读取,避免内存溢出
+- 不要读取二进制文件(如图片、可执行文件),可能导致乱码
+- 路径区分大小写(在区分大小写的文件系统上)
+- 如果文件不存在,会返回错误信息"###.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -178,7 +241,40 @@ impl ToolBridge {
         self.register(ToolEntry {
             definition: ToolDefinition {
                 name: "write_file".into(),
-                description: "写入文件。如果文件不存在则创建，存在则覆盖。".into(),
+                description: r###"写入文件内容,用于创建新文件或完全替换现有文件。
+
+**何时使用**:
+- 创建新的源代码文件
+- 生成配置文件
+- 创建文档文件
+- 完全重写现有文件内容
+
+**何时不使用**:
+- 小范围编辑现有文件 → 使用 `search_replace`
+- 追加内容到文件末尾 → 使用 `bash` 命令 `echo >> file`
+- 只修改几行代码 → 使用 `search_replace` 更安全
+
+**使用示例**:
+```bash
+创建新的 Rust 文件:
+path="src/lib.rs"
+content="//! 新库文件..."
+
+生成配置文件:
+path="config.json"
+content='{"name": "my-project", "version": "1.0.0"}'
+
+创建 README:
+path="README.md"
+content="项目说明文档"
+```
+
+**注意事项**:
+- 会完全覆盖现有文件内容,没有警告或确认
+- 如果文件不存在,会自动创建(包括必要的目录)
+- 适合创建新文件或完全重写文件
+- 对于现有文件的小修改,优先使用 `search_replace`
+- 写入前确保内容正确,避免数据丢失"###.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -196,7 +292,41 @@ impl ToolBridge {
         self.register(ToolEntry {
             definition: ToolDefinition {
                 name: "search_replace".into(),
-                description: "搜索文件中的文本并替换。支持多行搜索。".into(),
+                description: r###"在文件中搜索文本并替换,用于精确修改现有文件。
+
+**何时使用**:
+- 修改现有文件中的特定代码片段
+- 更新函数实现
+- 重命名变量或函数
+- 修复代码中的错误
+
+**何时不使用**:
+- 创建新文件 → 使用 `write_file`
+- 完全重写文件内容 → 使用 `write_file`
+- 批量替换多个文件 → 使用 `bash` 配合 `sed`
+
+**使用示例**:
+替换函数实现:
+path="src/lib.rs"
+search="pub fn old_name() {"
+replace="pub fn new_name() {"
+
+更新配置值:
+path="config.toml"
+search="version = \"1.0.0\""
+replace="version = \"2.0.0\""
+
+修复代码错误:
+path="src/main.rs"
+search="println!(\"Hello\");"
+replace="println!(\"Hello, World!\");"
+
+**注意事项**:
+- 必须精确匹配要替换的内容,包括空格和缩进
+- 如果搜索文本在文件中出现多次,会替换所有匹配项
+- 搜索文本不匹配时会返回错误,不会修改文件
+- 支持多行搜索,但需要包含完整的文本块
+- 建议先用 `read_file` 查看文件内容,确保搜索文本准确"###.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -216,7 +346,49 @@ impl ToolBridge {
         self.register(ToolEntry {
             definition: ToolDefinition {
                 name: "grep".into(),
-                description: "搜索文件内容（基于 ripgrep）。支持正则表达式。".into(),
+                description: r###"搜索文件内容(基于 ripgrep),用于查找代码、文本模式等。
+
+**何时使用**:
+- 在代码库中查找函数定义或使用
+- 搜索特定的文本模式
+- 查找错误消息或日志
+- 定位代码片段
+
+**参数说明**:
+- `pattern`: 搜索模式,支持正则表达式(如 `fn \w+\(`, `TODO|FIXME`)
+- `path`: 搜索目录,默认为当前工作目录
+- `glob`: 文件名过滤,支持通配符(如 `*.rs`, `**/*.js`)
+
+**使用示例**:
+搜索函数定义:
+pattern="fn main"
+glob="*.rs"
+
+查找所有 TODO 注释:
+pattern="TODO|FIXME"
+
+在特定目录中搜索:
+pattern="import"
+path="src/components"
+glob="*.tsx"
+
+使用正则表达式:
+pattern="function\s+\w+\s*\("
+glob="*.js"
+
+**搜索模式示例**:
+- 精确匹配: `"exact_text"`
+- 正则匹配: `"fn \w+\("` (函数定义)
+- 或匹配: `"TODO|FIXME"` (多个关键词)
+- 行首匹配: `"^import"` (以 import 开头)
+- 大小写不敏感: 使用 `-i` 标志(通过 bash 命令)
+
+**注意事项**:
+- 默认区分大小写
+- 正则表达式需要转义特殊字符
+- 支持大多数 ripgrep 的正则语法
+- 对于大型代码库,建议使用 glob 过滤以提高性能
+- 返回匹配的文件路径和行号"###.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -235,7 +407,42 @@ impl ToolBridge {
         self.register(ToolEntry {
             definition: ToolDefinition {
                 name: "list_dir".into(),
-                description: "列出目录内容。".into(),
+                description: r###"列出目录内容,用于浏览项目结构。
+
+**何时使用**:
+- 查看项目目录结构
+- 确认文件是否存在
+- 浏览文件夹内容
+- 查找特定类型的文件
+
+**参数说明**:
+- `path`: 目录的绝对路径或相对路径
+
+**使用示例**:
+列出项目根目录:
+path="."
+
+查看源代码目录:
+path="src"
+
+浏览配置目录:
+path="config"
+
+检查测试目录:
+path="tests"
+
+**输出格式**:
+- 显示目录下的所有文件和子目录
+- 区分文件和目录(目录会有 `/` 后缀)
+- 按字母顺序排序
+- 包含隐藏文件(以 `.` 开头)
+
+**注意事项**:
+- 路径不存在时会返回错误
+- 只显示直接内容,不会递归显示子目录
+- 对于大型目录,输出可能较长
+- 如果需要递归查找文件,建议使用 `glob` 工具
+- 适合快速浏览目录结构,不适合查找特定文件"###.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {

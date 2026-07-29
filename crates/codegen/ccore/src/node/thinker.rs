@@ -42,7 +42,7 @@ use crate::agent::doom_loop::{DoomLoopDetector, DoomLoopResult, EscapeAction};
 use crate::agent::loop_state::{LoopStateMachine, LoopEvent, LoopAction, ToolExecutionOutcome};
 use crate::agent::orchestrator::Orchestrator;
 use crate::agent::subagent::SubAgentCrashed;
-use crate::memory::working::WorkingMemory;
+use crate::memory::working::{WorkingMemory, MessageRole};
 use crate::memory::short_term::ShortTermMemory;
 use crate::memory::window::SlidingWindow;
 use crate::sampler::provider::{
@@ -146,7 +146,7 @@ impl ThinkerNode {
         );
 
         self.working_memory.push_hot(
-            role.to_string(),
+            MessageRole::try_from(role).unwrap_or(MessageRole::User),
             content.to_string(),
             Self::estimate_tokens(content),
         );
@@ -220,9 +220,9 @@ impl ThinkerNode {
             severity: "error".into(),
         });
 
-        // 注入工作记忆供 LLM 处理
+        // 注入工作记忆供 LLM 处理（感官信号作为 system 消息）
         let token_count = Self::estimate_tokens(&summary);
-        self.working_memory.push_hot("sensory".to_string(), summary.clone(), token_count);
+        self.working_memory.push_system(summary.clone(), token_count);
 
         // 向 Kernel 发送感官信号（让反射弧和经验学习有输入）
         if let Err(e) = self.publish_sensory_to_kernel(
@@ -412,7 +412,9 @@ impl ThinkerNode {
             token_count,
             true,
         );
-        self.working_memory.push_hot("tool".to_string(), output.to_string(), token_count);
+        // 将工具返回注入工作记忆（作为 user 消息，LLM 需要看到执行结果）
+        let token_count = Self::estimate_tokens(&output);
+        self.working_memory.push_user(output.to_string(), token_count);
 
         if self.pending_tool_results.is_empty() {
             // 通过状态机记录工具执行完成（借鉴 Claude Code）
@@ -661,11 +663,7 @@ impl Node for ThinkerNode {
                     let output = payload["output"].as_str().unwrap_or("");
                     tracing::info!("子 Agent 完成：{}, 输出长度={}", subagent_id, output.len());
                     let token_count = Self::estimate_tokens(output);
-                    self.working_memory.push_hot(
-                        format!("subagent_{}", subagent_id),
-                        output.to_string(),
-                        token_count,
-                    );
+                    self.working_memory.push_user(output.to_string(), token_count);
                     let node_id: NodeId = subagent_id.to_string().into();
                     self.orchestrator.remove_subagent(&node_id);
                 }
@@ -716,11 +714,7 @@ impl Node for ThinkerNode {
             for action in &doom_result.escape_actions {
                 match action {
                     EscapeAction::InjectHint(hint) => {
-                        self.working_memory.push_hot(
-                            "system".to_string(),
-                            hint.clone(),
-                            Self::estimate_tokens(hint),
-                        );
+                        self.working_memory.push_system(hint.clone(), Self::estimate_tokens(hint));
                         tracing::warn!("Doom Loop 逃脱：已注入换策略提示到工作记忆");
                     }
                     EscapeAction::DisableTool(tool) => {
