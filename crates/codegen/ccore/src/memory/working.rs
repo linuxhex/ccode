@@ -512,6 +512,81 @@ impl WorkingMemory {
         ))
     }
 
+    /// 压缩对话历史（保留工具调用配对）
+    ///
+    /// 借鉴 Claude Code compaction.rs 的逻辑：
+    /// 1. 保留最近 N 轮完整对话（用户+助手+工具调用+结果）
+    /// 2. 较早的对话用摘要替换
+    /// 3. 工具调用和结果必须配对保留，不可拆开
+    pub fn compact_conversation(&mut self, keep_recent_turns: usize) -> Vec<WorkingEntry> {
+        let turns = self.group_by_turns();
+        let total = turns.len();
+
+        if total <= keep_recent_turns {
+            return Vec::new(); // 不需要压缩
+        }
+
+        let mut removed = Vec::new();
+        let keep_from = total - keep_recent_turns;
+
+        // 收集需要压缩的轮次索引
+        let compact_indices: Vec<usize> = (0..keep_from).collect();
+
+        // 从后往前替换，避免索引偏移
+        for &turn_start in compact_indices.iter().rev() {
+            let turn_end = turns.get(turn_start + 1).copied().unwrap_or(self.entries.len());
+            // 将该轮次的条目替换为摘要
+            let turn_entries: Vec<&WorkingEntry> = self.entries[turn_start..turn_end].iter().collect();
+            let summary = self.summarize_turn(&turn_entries);
+
+            // 移除原条目
+            let drained: Vec<WorkingEntry> = self.entries.drain(turn_start..turn_end).collect();
+            removed.extend(drained);
+
+            // 插入摘要条目
+            let summary_tokens = (summary.len() as u32 / 4).max(1);
+            self.entries.insert(turn_start, WorkingEntry::Warm {
+                summary,
+                token_count: summary_tokens,
+                source_range: (turn_start, turn_start),
+            });
+        }
+
+        removed
+    }
+
+    /// 按轮次分组消息
+    ///
+    /// 每个用户消息开始一个新轮次，后续的助手+工具结果属于同一轮次
+    /// 返回每个轮次的起始索引
+    fn group_by_turns(&self) -> Vec<usize> {
+        let mut turns = Vec::new();
+
+        for (i, entry) in self.entries.iter().enumerate() {
+            if let WorkingEntry::Hot { role, .. } = entry {
+                if *role == MessageRole::User {
+                    turns.push(i);
+                }
+            }
+        }
+
+        turns
+    }
+
+    /// 生成轮次摘要
+    fn summarize_turn(&self, turn: &[&WorkingEntry]) -> String {
+        let contents: Vec<&str> = turn.iter().map(|e| {
+            match e {
+                WorkingEntry::Hot { content, .. } => content.as_str(),
+                WorkingEntry::Warm { summary, .. } => summary.as_str(),
+                WorkingEntry::Cold { placeholder, .. } => placeholder.as_str(),
+            }
+        }).collect();
+        let joined = contents.join(" → ");
+        let truncated: String = joined.chars().take(200).collect();
+        format!("[对话摘要] {}", truncated)
+    }
+
     /// 添加 embedding 向量到索引
     ///
     /// # Arguments

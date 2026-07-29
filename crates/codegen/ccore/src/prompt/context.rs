@@ -13,6 +13,83 @@ use crate::prompt::agents_md::AgentConfigFile;
 use crate::prompt::skills::SkillInfo;
 use crate::prompt::personas::PersonaInfo;
 
+/// 模板渲染器（借鉴 Claude Code TemplateRenderer）
+///
+/// 支持动态变量注入：
+/// - ${{ tools.by_kind.read }} → 实际工具名
+/// - ${{ tools.by_kind.edit }} → 实际工具名
+/// - ${{ os_name }} → 操作系统名
+/// - ${{ memory_enabled }} → 是否启用记忆
+pub struct TemplateRenderer {
+    /// 工具名映射 (kind → name)
+    tool_names: HashMap<String, String>,
+    /// 上下文变量
+    variables: HashMap<String, String>,
+}
+
+impl TemplateRenderer {
+    pub fn new() -> Self {
+        let mut tool_names = HashMap::new();
+        tool_names.insert("read".into(), "read".into());
+        tool_names.insert("write".into(), "write".into());
+        tool_names.insert("edit".into(), "edit".into());
+        tool_names.insert("bash".into(), "bash".into());
+        tool_names.insert("grep".into(), "grep".into());
+        tool_names.insert("glob".into(), "glob".into());
+        tool_names.insert("list_dir".into(), "list_dir".into());
+
+        let mut variables = HashMap::new();
+        variables.insert("os_name".into(), std::env::consts::OS.into());
+        variables.insert("memory_enabled".into(), "true".into());
+
+        Self { tool_names, variables }
+    }
+
+    /// 注册工具名
+    pub fn register_tool_name(&mut self, kind: &str, name: &str) {
+        self.tool_names.insert(kind.into(), name.into());
+    }
+
+    /// 设置变量
+    pub fn set_variable(&mut self, key: &str, value: &str) {
+        self.variables.insert(key.into(), value.into());
+    }
+
+    /// 渲染模板
+    pub fn render(&self, template: &str) -> String {
+        let mut result = template.to_string();
+
+        // 替换 ${{ tools.by_kind.X }}
+        for (kind, name) in &self.tool_names {
+            let pattern = format!("${{{{ tools.by_kind.{} }}}}", kind);
+            result = result.replace(&pattern, name);
+        }
+
+        // 替换 ${{ variable }}
+        for (key, value) in &self.variables {
+            let pattern = format!("${{{{ {} }}}}", key);
+            result = result.replace(&pattern, value);
+        }
+
+        result
+    }
+}
+
+impl Default for TemplateRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for TemplateRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TemplateRenderer")
+            .field("tool_names_count", &self.tool_names.len())
+            .field("variables_count", &self.variables.len())
+            .finish()
+    }
+}
+
 /// Controls which base template to use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -292,6 +369,9 @@ pub struct PromptContext {
     /// Dynamic template renderer (optional, for hot reload)
     #[serde(skip)]
     pub renderer: Option<DynamicTemplateRenderer>,
+    /// 模板渲染器（动态工具名注入）
+    #[serde(skip)]
+    pub template_renderer: TemplateRenderer,
 }
 
 impl Clone for PromptContext {
@@ -309,6 +389,7 @@ impl Clone for PromptContext {
             skills: self.skills.clone(),
             active_personas: self.active_personas.clone(),
             renderer: None, // Renderer 不参与 Clone，设为 None
+            template_renderer: TemplateRenderer::new(), // 重新创建默认渲染器
         }
     }
 }
@@ -330,6 +411,7 @@ impl Default for PromptContext {
             skills: Vec::new(),
             active_personas: Vec::new(),
             renderer: None,
+            template_renderer: TemplateRenderer::new(),
         }
     }
 }
@@ -458,6 +540,15 @@ impl PromptContext {
     pub fn with_persona(mut self, persona: PersonaInfo) -> Self {
         self.active_personas.push(persona);
         self
+    }
+
+    /// 使用 TemplateRenderer 渲染系统提示
+    ///
+    /// 借鉴 Claude Code 的 TemplateRenderer，支持动态工具名注入。
+    /// 先用 TemplateRenderer 渲染占位符，再走正常的 render 流程。
+    pub fn render_system_prompt(&self, working_memory: &WorkingMemory) -> String {
+        let raw_prompt = self.render(working_memory);
+        self.template_renderer.render(&raw_prompt)
     }
 }
 

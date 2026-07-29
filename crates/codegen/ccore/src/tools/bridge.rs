@@ -17,6 +17,60 @@ use crate::tools::{
 };
 use crate::node::PermissionMode;
 
+/// 工具执行结果（借鉴 Claude Code ToolRunResult）
+///
+/// 包含两个视图：
+/// - output: 干净的工具输出（用于日志、通知）
+/// - prompt_text: 格式化为下轮 LLM 输入的文本（包含系统提醒）
+#[derive(Debug, Clone)]
+pub struct ToolRunResult {
+    /// 干净输出
+    pub output: String,
+    /// LLM 下轮输入格式
+    pub prompt_text: String,
+}
+
+impl ToolRunResult {
+    /// 从简单输出创建（自动生成 prompt_text）
+    pub fn from_output(output: impl Into<String>) -> Self {
+        let output = output.into();
+        let prompt_text = format!("<tool_result>\n{}\n</tool_result>", output);
+        Self { output, prompt_text }
+    }
+
+    /// 创建带错误的结果
+    pub fn from_error(error: impl Into<String>) -> Self {
+        let error = error.into();
+        let prompt_text = format!("<tool_error>\n{}\n</tool_error>", error);
+        Self { output: error, prompt_text }
+    }
+
+    /// 追加系统提醒
+    pub fn with_reminder(mut self, reminder: &str) -> Self {
+        self.prompt_text = format!(
+            "{}\n\n<system-reminder>\n{}\n</system-reminder>",
+            self.prompt_text, reminder
+        );
+        self
+    }
+}
+
+/// 将工具调用结果格式化为 LLM 消息
+///
+/// 借鉴 Claude Code 的 tool_calls.rs 格式
+pub fn format_tool_results_for_prompt(results: &[(&str, ToolRunResult)]) -> Vec<serde_json::Value> {
+    results
+        .iter()
+        .map(|(tool_call_id, result)| {
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": result.prompt_text
+            })
+        })
+        .collect()
+}
+
 /// 工具执行重试配置（借鉴 Claude Code BackoffConfig）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolRetryConfig {

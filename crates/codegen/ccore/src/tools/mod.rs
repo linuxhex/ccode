@@ -18,6 +18,7 @@ pub mod file_transaction;
 pub mod gitignore_filter;
 pub mod output_formatter;
 pub mod path_validator;
+pub mod permission;
 pub mod rustfmt_hook;
 pub mod sandbox;
 pub mod verify;
