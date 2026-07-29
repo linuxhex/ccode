@@ -10,12 +10,64 @@
 //! 工具桥接层：定义 22 个工具元数据 + 执行器接口 + 动态注册 + 超时控制
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::tools::{
     ToolCallRequest, ToolCallResult, ToolDefinition, ToolEntry, ToolCategory,
 };
 use crate::node::PermissionMode;
+
+/// 工具执行重试配置（借鉴 Claude Code BackoffConfig）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolRetryConfig {
+    /// 最大重试次数
+    pub max_retries: u32,
+    /// 基础退避延迟（毫秒）
+    pub base_delay_ms: u64,
+    /// 最大退避延迟（毫秒）
+    pub max_delay_ms: u64,
+    /// 可重试的工具错误模式（正则表达式，匹配输出文本）
+    pub retryable_error_patterns: Vec<String>,
+}
+
+impl Default for ToolRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_delay_ms: 1000,
+            max_delay_ms: 30_000,
+            retryable_error_patterns: vec![
+                "timeout".into(),
+                "connection reset".into(),
+                "ECONNREFUSED".into(),
+                "429".into(),
+                "502".into(),
+                "503".into(),
+                "504".into(),
+            ],
+        }
+    }
+}
+
+impl ToolRetryConfig {
+    /// 计算指数退避延迟（借鉴 Claude Code BackoffConfig::calculate_delay）
+    pub fn calculate_delay(&self, attempt: u32) -> Duration {
+        let delay_ms = std::cmp::min(
+            self.base_delay_ms * 2u64.pow(attempt.saturating_sub(1)),
+            self.max_delay_ms,
+        );
+        Duration::from_millis(delay_ms)
+    }
+
+    /// 检查错误输出是否匹配可重试模式
+    fn is_retryable_error(&self, error_output: &str) -> bool {
+        self.retryable_error_patterns.iter().any(|pattern| {
+            regex::Regex::new(pattern)
+                .map(|re| re.is_match(error_output))
+                .unwrap_or(false)
+        })
+    }
+}
 
 /// 工具执行器 trait - 每个工具需要实现此 trait
 #[async_trait::async_trait]
@@ -27,14 +79,33 @@ pub trait ToolExecutor: Send + Sync {
     fn name(&self) -> &str;
 }
 
+/// 工具执行后钩子
+/// 在工具执行成功后触发，用于增量验证等场景
+pub trait PostExecuteHook: Send + Sync {
+    /// 是否对该工具触发
+    fn should_run(&self, tool_name: &str) -> bool;
+
+    /// 执行钩子，返回追加到工具结果的信息（空字符串表示无追加）
+    fn run<'a>(
+        &'a self,
+        tool_name: &str,
+        args: &'a serde_json::Value,
+        result: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>;
+}
+
 /// 工具桥接器 - 管理工具注册、权限检查和分发
 pub struct ToolBridge {
     /// 已注册的工具条目
     entries: HashMap<String, ToolEntry>,
     /// 工具执行器（实际执行逻辑，后续集成 ccode 工具时填充）
     executors: HashMap<String, Box<dyn ToolExecutor>>,
+    /// 工具执行后钩子（用于增量验证，如 Write/Edit 后的 rustfmt 检查）
+    post_hooks: Vec<Box<dyn PostExecuteHook>>,
     /// 工具执行超时（秒）
     execution_timeout_secs: u64,
+    /// 工具执行重试配置（借鉴 Claude Code）
+    retry_config: ToolRetryConfig,
 }
 
 impl Default for ToolBridge {
@@ -48,10 +119,13 @@ impl ToolBridge {
         let mut bridge = Self {
             entries: HashMap::new(),
             executors: HashMap::new(),
+            post_hooks: Vec::new(),
             execution_timeout_secs: 120,
+            retry_config: ToolRetryConfig::default(),
         };
         bridge.register_defaults();
         // 注册内置工具执行器（bash/read/write/edit/grep/glob/list_dir）
+        // 以及 post_hook（Write/Edit 后的 rustfmt 检查）
         super::builtin::register_builtin_executors(&mut bridge);
         bridge
     }
@@ -458,6 +532,11 @@ impl ToolBridge {
         self.executors.insert(executor.name().to_string(), executor);
     }
 
+    /// 注册工具执行后钩子（用于增量验证，如 Write/Edit 后的 rustfmt 检查）
+    pub fn register_post_hook(&mut self, hook: Box<dyn PostExecuteHook>) {
+        self.post_hooks.push(hook);
+    }
+
     /// 检查工具是否需要用户确认
     pub fn needs_confirmation(
         &self,
@@ -477,7 +556,7 @@ impl ToolBridge {
         }
     }
 
-    /// 执行工具调用
+    /// 执行工具调用（带指数退避重试）
     pub async fn execute(
         &self,
         request: &ToolCallRequest,
@@ -485,46 +564,123 @@ impl ToolBridge {
         let start = Instant::now();
 
         // 查找工具执行器
-        match self.executors.get(&request.tool_name) {
-            Some(executor) => {
-                // 设置超时
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(self.execution_timeout_secs),
-                    executor.execute(&request.arguments),
-                )
-                .await;
+        let executor = match self.executors.get(&request.tool_name) {
+            Some(e) => e,
+            None => {
+                return ToolCallResult {
+                    tool_call_id: request.tool_call_id.clone(),
+                    output: format!("未知工具：{}", request.tool_name),
+                    success: false,
+                    duration_ms: 0,
+                    is_partial: false,
+                };
+            }
+        };
 
-                match result {
-                    Ok(Ok(output)) => ToolCallResult {
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+
+            // 设置超时执行
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(self.execution_timeout_secs),
+                executor.execute(&request.arguments),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(output)) => {
+                    let mut final_output = output;
+                    // 工具执行成功后，遍历 post_hooks 做增量验证
+                    // 钩子自身的失败不阻塞工具执行，仅把警告信息追加到结果
+                    for hook in &self.post_hooks {
+                        if !hook.should_run(&request.tool_name) {
+                            continue;
+                        }
+                        let extra = hook
+                            .run(&request.tool_name, &request.arguments, &final_output)
+                            .await;
+                        if !extra.is_empty() {
+                            final_output.push_str(&extra);
+                        }
+                    }
+                    // 如果经过重试后成功，附加重试信息
+                    if attempt > 1 {
+                        final_output.push_str(&format!(
+                            "\n[重试成功：第 {} 次尝试成功]",
+                            attempt
+                        ));
+                    }
+                    return ToolCallResult {
                         tool_call_id: request.tool_call_id.clone(),
-                        output,
+                        output: final_output,
                         success: true,
                         duration_ms: start.elapsed().as_millis() as u64,
                         is_partial: false,
-                    },
-                    Ok(Err(e)) => ToolCallResult {
+                    };
+                }
+                Ok(Err(e)) => {
+                    let error_output = format!("工具执行错误：{}", e);
+                    // 检查是否为可重试错误，以及是否还有重试次数
+                    if attempt <= self.retry_config.max_retries
+                        && self.retry_config.is_retryable_error(&error_output)
+                    {
+                        let delay = self.retry_config.calculate_delay(attempt);
+                        tracing::warn!(
+                            "工具 {} 第 {} 次执行失败（{}），将在 {}ms 后重试",
+                            request.tool_name,
+                            attempt,
+                            e,
+                            delay.as_millis()
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    // 不可重试或重试耗尽
+                    let retry_info = if attempt > 1 {
+                        format!("（已重试 {} 次）", attempt - 1)
+                    } else {
+                        String::new()
+                    };
+                    return ToolCallResult {
                         tool_call_id: request.tool_call_id.clone(),
-                        output: format!("工具执行错误：{}", e),
+                        output: format!("{}{}", error_output, retry_info),
                         success: false,
                         duration_ms: start.elapsed().as_millis() as u64,
                         is_partial: false,
-                    },
-                    Err(_) => ToolCallResult {
+                    };
+                }
+                Err(_) => {
+                    let error_output = format!("工具执行超时（{}秒）", self.execution_timeout_secs);
+                    // 超时也检查是否可重试
+                    if attempt <= self.retry_config.max_retries
+                        && self.retry_config.is_retryable_error(&error_output)
+                    {
+                        let delay = self.retry_config.calculate_delay(attempt);
+                        tracing::warn!(
+                            "工具 {} 第 {} 次执行超时，将在 {}ms 后重试",
+                            request.tool_name,
+                            attempt,
+                            delay.as_millis()
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    let retry_info = if attempt > 1 {
+                        format!("（已重试 {} 次）", attempt - 1)
+                    } else {
+                        String::new()
+                    };
+                    return ToolCallResult {
                         tool_call_id: request.tool_call_id.clone(),
-                        output: format!("工具执行超时（{}秒）", self.execution_timeout_secs),
+                        output: format!("{}{}", error_output, retry_info),
                         success: false,
                         duration_ms: start.elapsed().as_millis() as u64,
                         is_partial: false,
-                    },
+                    };
                 }
             }
-            None => ToolCallResult {
-                tool_call_id: request.tool_call_id.clone(),
-                output: format!("未知工具：{}", request.tool_name),
-                success: false,
-                duration_ms: 0,
-                is_partial: false,
-            },
         }
     }
 
@@ -563,6 +719,16 @@ impl ToolBridge {
     /// 已注册执行器数量
     pub fn executor_count(&self) -> usize {
         self.executors.len()
+    }
+
+    /// 获取重试配置
+    pub fn retry_config(&self) -> &ToolRetryConfig {
+        &self.retry_config
+    }
+
+    /// 设置重试配置
+    pub fn set_retry_config(&mut self, config: ToolRetryConfig) {
+        self.retry_config = config;
     }
 }
 

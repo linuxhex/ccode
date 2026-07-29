@@ -13,7 +13,17 @@
 pub mod bridge;
 pub mod builtin;
 pub mod checkpoint;
+pub mod compile_feedback;
+pub mod file_transaction;
+pub mod rustfmt_hook;
+pub mod sandbox;
 pub mod verify;
+
+pub use compile_feedback::{
+    format_for_injection, run_cargo_check, run_rustfmt_check, CompileError, CompileReport,
+};
+pub use file_transaction::FileTransaction;
+pub use sandbox::{ToolSandbox, SandboxProfile, SandboxProfileName, SandboxCheckResult, FileAccessOperation};
 
 use serde::{Deserialize, Serialize};
 

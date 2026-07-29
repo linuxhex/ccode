@@ -4,6 +4,7 @@ pub mod prompt;
 pub mod subagent;
 pub mod orchestrator;
 pub mod doom_loop;
+pub mod loop_state;
 pub mod plan_execute;
 pub mod skills;
 
