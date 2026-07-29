@@ -697,8 +697,8 @@ pub(crate) async fn run_shell_child(
         hunk_tracking: ctx.hunk_tracking_enabled && cwd_outside_parent,
         ..FsWatchCapabilities::none()
     };
-    let child_cwd_abs = ccode_pathss::AbsPathBuf::new(child_cwd).unwrap_or_else(|_| {
-        ccode_pathss::AbsPathBuf::new(std::env::current_dir().unwrap_or_default())
+    let child_cwd_abs = ccode_paths::AbsPathBuf::new(child_cwd).unwrap_or_else(|_| {
+        ccode_paths::AbsPathBuf::new(std::env::current_dir().unwrap_or_default())
             .expect("current_dir should be absolute")
     });
     let mut tool_ctx = ToolContext::with_preloaded_env(

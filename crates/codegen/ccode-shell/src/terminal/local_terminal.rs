@@ -131,7 +131,7 @@ mod tests {
     use crate::terminal::DEFAULT_OUTPUT_BYTE_LIMIT;
     use crate::terminal::runner::TerminalRunRequest;
     use std::collections::HashMap;
-    use ccode_pathss::AbsPathBuf;
+    use ccode_paths::AbsPathBuf;
 
     fn make_request(command: &str) -> TerminalRunRequest {
         TerminalRunRequest {

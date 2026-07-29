@@ -3,7 +3,7 @@ use super::*;
 use crate::session::storage::StorageAdapter;
 use crate::terminal::AsyncTerminalRunner;
 use crate::terminal::runner::{TerminalError, TerminalRunRequest, TerminalRunResult};
-use ccode_pathss::AbsPathBuf;
+use ccode_paths::AbsPathBuf;
 #[derive(Debug)]
 struct DummyTerminal;
 #[async_trait::async_trait]
@@ -197,6 +197,8 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
+                pending_compile_feedback: Mutex::new(None),
+                current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
                 last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -288,6 +290,8 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
                 turn_stream_drained: parking_lot::Mutex::new(None),
                 sampler_handle: ccode_sampler::SamplerHandle::noop(),
+                use_message_bus: false,
+                message_bus_bridge: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
@@ -665,6 +669,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
+                pending_compile_feedback: Mutex::new(None),
+                current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
                 last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -756,6 +762,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
                 turn_stream_drained: parking_lot::Mutex::new(None),
                 sampler_handle: ccode_sampler::SamplerHandle::noop(),
+                use_message_bus: false,
+                message_bus_bridge: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
@@ -948,6 +956,8 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
+                pending_compile_feedback: Mutex::new(None),
+                current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
                 last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -1056,6 +1066,8 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 ),
                 turn_stream_drained: parking_lot::Mutex::new(None),
                 sampler_handle: ccode_sampler::SamplerHandle::noop(),
+                use_message_bus: false,
+                message_bus_bridge: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
@@ -2203,6 +2215,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
+                pending_compile_feedback: Mutex::new(None),
+                current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
                 last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -2311,6 +2325,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 ),
                 turn_stream_drained: parking_lot::Mutex::new(None),
                 sampler_handle: sampler_handle.clone(),
+                use_message_bus: false,
+                message_bus_bridge: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(

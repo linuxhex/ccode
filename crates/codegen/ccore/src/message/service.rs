@@ -95,7 +95,9 @@ impl ServiceClient {
 
         let mut pending = self.pending_requests.lock().await;
         if let Some(tx) = pending.remove(&request_id) {
-            let _ = tx.send(msg.clone());
+            if let Err(_) = tx.send(msg.clone()) {
+                tracing::warn!("Service 响应发送失败：接收端已关闭");
+            }
         } else {
             tracing::warn!("收到未知 request_id 的 Service 响应：{}", request_id);
         }

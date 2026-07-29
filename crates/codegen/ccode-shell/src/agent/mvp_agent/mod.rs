@@ -96,7 +96,7 @@ use crate::upload::turn::{
     parse_agent_profile_from_meta,
 };
 use tokio_util::sync::CancellationToken;
-use ccode_pathss::AbsPathBuf;
+use ccode_paths::AbsPathBuf;
 use ccode_workspace::session::git::GitDiscoveryResult;
 use ccode_hunk::HunkTrackerActor;
 /// Hard-error message for legacy Direct hub-bind sessions (`ccode.dev/cloud_server_id`).

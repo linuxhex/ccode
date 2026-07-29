@@ -26,8 +26,35 @@ pub(super) fn is_auth_tool_error(err: &ccode_tool_runtime::ToolError) -> bool {
         || lower.contains("invalid api key")
         || lower.contains("invalid_token")
 }
-/// Gate inputs bundled with the composed decision so the 401-recovery log can
-/// report the components.
+/// 判定 LLM 采样错误是否应被 `retry_with_backoff` 重试，返回供 `RetryPolicy`
+/// 比对的状态码（`None` ⇒ 默认可重试）。
+///
+/// 仅对**流式开始前**的可恢复错误重试，以避免消息重复（幂等性）：
+/// - `Http`（连接/超时）发生在流式之前 ⇒ `None`（可重试）。
+/// - `Api`：服务端 `should_retry=true` ⇒ `None`（可重试）；`should_retry=false`
+///   ⇒ `Some(400)`（内容错误，不重试）；否则按 HTTP 状态码与
+///   `RetryPolicy.retryable_codes` 比对（408/429/5xx 重试）。
+/// - `Auth` / `Serialization` / `InvalidConfiguration` / 流式中断 ⇒ `Some(400)`
+///   （不重试）：401 交由既有 `handle_sampling_failure` 的 auth 恢复链处理，
+///   流式中断不重试以避免重复输出。
+fn retryable_sampling_error_code(err: &ccode_sampling_types::SamplingError) -> Option<u16> {
+    use ccode_sampling_types::SamplingError;
+    match err {
+        SamplingError::Http(_) => None,
+        SamplingError::Api {
+            status,
+            should_retry,
+            ..
+        } => match *should_retry {
+            Some(true) => None,
+            Some(false) => Some(400),
+            None => Some(status.as_u16()),
+        },
+        _ => Some(400),
+    }
+}
+/// Gate inputs bundled with the composed decision so the 401-recovery log can report
+/// the components.
 #[derive(Clone, Copy)]
 struct SessionTokenAuthGate {
     is_session_based: bool,
@@ -1096,6 +1123,44 @@ impl SessionActor {
             )),
         )
     }
+    /// 持久化当前会话快照（best-effort，不阻塞主流程）。
+    ///
+    /// 在关键状态变更点调用：`turn_start`（用户消息加入）、`turn_end`（Agent
+    /// 响应完成）。快照经 `SessionPersistBridge` → `SessionPersister` →
+    /// `FileStorage`（原子写入）落盘；序列化或写入失败仅 `tracing::warn`，
+    /// 绝不影响主循环。
+    fn persist_turn_snapshot(
+        &self,
+        request: &ConversationRequest,
+        response: Option<&ConversationResponse>,
+        tag: &'static str,
+    ) {
+        let payload = serde_json::json!({
+            "session_id": self.session_info.id.0.to_string(),
+            "tag": tag,
+            "model": request.model.clone(),
+            "items": response.map(|r| &r.items),
+            "stop_reason": response.and_then(|r| r.stop_reason),
+            "usage": response.and_then(|r| r.usage.as_ref()),
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        let data = match serde_json::to_vec(&payload) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(tag = tag, error = %e, "会话快照序列化失败，跳过持久化");
+                return;
+            }
+        };
+        let session_id = self.session_info.id.0.to_string();
+        let base_dir = self
+            .tool_context
+            .cwd
+            .as_path()
+            .join(".ccode")
+            .join("sessions");
+        let agent_id = ccode_telemetry::id::agent_id();
+        crate::session::persist::save_session_snapshot(session_id, base_dir, agent_id, data);
+    }
     /// Drive a single turn through the sampler-based path.
     ///
     /// Calls `prepare_sampler_for_turn` first (auth refresh + config
@@ -1112,20 +1177,44 @@ impl SessionActor {
         self: &Arc<Self>,
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
+        // 用户消息加入时持久化会话快照（best-effort，不阻塞主流程）
+        self.persist_turn_snapshot(&request, None, "turn_start");
+        // 消息总线路径：当 use_message_bus=true 时，LLM 请求通过 MessageBusBridge 路由
+        // 到消息总线上的 SamplerNode，而非直接调用本地 ccode-sampler。
+        if self.use_message_bus {
+            return self.run_turn_via_message_bus(request).await;
+        }
         self.prepare_sampler_for_turn().await;
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             *self.turn_stream_drained.lock() = Some(tx);
             rx
         };
-        let request_id = ccode_sampler::RequestId::random();
-        let request_id_str = request_id.as_str().to_string();
-        match self
-            .sampler_handle
-            .submit_and_collect(request_id, request)
-            .await
-        {
-            Ok((response, metrics)) => {
+        // 用 retry_with_backoff 包装 LLM 采样调用：仅对网络超时/5xx/限流等可恢复
+        // 错误重试（max_retries=3, initial=1s, max=30s）；401/参数错误/流式中断不
+        // 重试，分别交由 handle_sampling_failure 与既有恢复链处理。每次重试使用
+        // 新的 request_id，且仅在流式开始前重试，保证幂等（不产生重复输出）。
+        let retry_policy = ccore::retry::RetryPolicy {
+            max_retries: 3,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 30000,
+            retryable_codes: vec![408, 429, 500, 502, 503, 504],
+        };
+        let sampled = ccore::retry::backoff::retry_with_error_check(
+            &retry_policy,
+            || async {
+                let attempt_id = ccode_sampler::RequestId::random();
+                let attempt_id_str = attempt_id.as_str().to_string();
+                self.sampler_handle
+                    .submit_and_collect(attempt_id, request.clone())
+                    .await
+                    .map(|(response, metrics)| (attempt_id_str, response, metrics))
+            },
+            retryable_sampling_error_code,
+        )
+        .await;
+        match sampled {
+            Ok((request_id_str, response, metrics)) => {
                 let span = tracing::Span::current();
                 span.record("request_id", request_id_str.as_str());
                 if let Some(ttft) = metrics.time_to_first_token_ms {
@@ -1144,6 +1233,289 @@ impl SessionActor {
                          calls (eventId ordering may be imperfect this turn)"
                     );
                 }
+                // Agent 响应完成时持久化会话快照
+                self.persist_turn_snapshot(&request, Some(&response), "turn_end");
+                Ok(SamplerTurnOutcome::Response(
+                    Box::new(response),
+                    Box::new(metrics),
+                ))
+            }
+            Err(rich_err) => {
+                self.turn_stream_drained.lock().take();
+                let info = ccode_sampler::SamplingErrorInfo::from(&rich_err);
+                match self.handle_sampling_failure(info).await? {
+                    SamplerFailureRecovery::CompactAndResubmit => {
+                        Ok(SamplerTurnOutcome::CompactAndResubmit)
+                    }
+                    SamplerFailureRecovery::RefreshAuthAndResubmit => {
+                        Ok(SamplerTurnOutcome::RefreshAuthAndResubmit)
+                    }
+                }
+            }
+        }
+    }
+    /// 消息总线路径：通过 MessageBusBridge 将 LLM 请求路由到消息总线上的 SamplerNode。
+    ///
+    /// 当 `use_message_bus=true` 时，`run_turn_via_sampler` 委托到此方法。
+    /// 流程：
+    /// 1. 将 `ConversationRequest` 转换为 ccore 的 `SampleRequest`
+    /// 2. 通过 `MessageBusBridge::send_llm_request` 发送到消息总线
+    /// 3. 消费流式 chunk，累积为 `ConversationResponse`
+    /// 4. 返回 `SamplerTurnOutcome::Response`
+    ///
+    /// 如果桥接器不可用或发送失败，回退到直接调用路径并记录警告。
+    async fn run_turn_via_message_bus(
+        self: &Arc<Self>,
+        request: ConversationRequest,
+    ) -> Result<SamplerTurnOutcome, acp::Error> {
+        let bridge = match &self.message_bus_bridge {
+            Some(b) => b.clone(),
+            None => {
+                tracing::warn!(
+                    "use_message_bus=true 但 message_bus_bridge 未初始化，回退到直接调用路径"
+                );
+                return self.run_turn_via_sampler_direct(request).await;
+            }
+        };
+
+        // 1. 转换 ConversationRequest → SampleRequest
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = self.session_info.id.0.to_string();
+
+        let messages: Vec<ccore::sampler::provider::ChatMessage> = request
+            .items
+            .iter()
+            .filter_map(|item| {
+                use ccode_sampling_types::ConversationItem;
+                match item {
+                    ConversationItem::System(s) => Some(ccore::sampler::provider::ChatMessage {
+                        role: "system".into(),
+                        content: s.content.to_string(),
+                    }),
+                    ConversationItem::User(u) => {
+                        // UserItem.content 是 Vec<ContentPart>，提取文本部分
+                        let text: String = u
+                            .content
+                            .iter()
+                            .filter_map(|p| match p {
+                                ccode_sampling_types::ContentPart::Text { text } => {
+                                    Some(text.as_ref())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        Some(ccore::sampler::provider::ChatMessage {
+                            role: "user".into(),
+                            content: text,
+                        })
+                    }
+                    ConversationItem::Assistant(a) => {
+                        Some(ccore::sampler::provider::ChatMessage {
+                            role: "assistant".into(),
+                            content: a.content.to_string(),
+                        })
+                    }
+                    ConversationItem::ToolResult(t) => Some(ccore::sampler::provider::ChatMessage {
+                        role: "tool".into(),
+                        content: t.content.to_string(),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let tools: Vec<ccore::sampler::provider::ToolDefinition> = request
+            .tools
+            .iter()
+            .map(|t| ccore::sampler::provider::ToolDefinition {
+                name: t.name.clone(),
+                description: t.description.clone().unwrap_or_default(),
+                parameters: t.parameters.clone(),
+            })
+            .collect();
+
+        let model = request.model.clone().unwrap_or_else(|| {
+            // 同步获取不可用，使用空字符串让 SamplerNode 用默认模型
+            // TODO: 后续可通过 chat_state_handle.get_sampling_config().await 获取
+            String::new()
+        });
+
+        let sample_request = ccore::sampler::provider::SampleRequest {
+            request_id: request_id.clone(),
+            agent_id,
+            model,
+            messages,
+            tools,
+            stream: true,
+            reasoning_effort: request.reasoning_effort.as_ref().map(|e| match e {
+                ccode_sampling_types::ReasoningEffort::None => 0.0,
+                ccode_sampling_types::ReasoningEffort::Minimal => 0.1,
+                ccode_sampling_types::ReasoningEffort::Low => 0.2,
+                ccode_sampling_types::ReasoningEffort::Medium => 0.5,
+                ccode_sampling_types::ReasoningEffort::High => 0.8,
+                ccode_sampling_types::ReasoningEffort::Xhigh => 0.9,
+                ccode_sampling_types::ReasoningEffort::Max => 1.0,
+            }),
+            max_tokens: request.max_output_tokens,
+            temperature: request.temperature.map(|t| t as f64),
+        };
+
+        // 2. 发送到消息总线
+        let (mut chunk_rx, done_rx) = match bridge.send_llm_request(sample_request).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!("消息总线 LLM 请求发送失败：{}，回退到直接调用路径", e);
+                return self.run_turn_via_sampler_direct(request).await;
+            }
+        };
+
+        // 3. 消费流式 chunk，累积为 ConversationResponse
+        let mut accumulated_text = String::new();
+        let mut tool_calls: Vec<ccode_sampling_types::ToolCall> = Vec::new();
+
+        while let Some(chunk) = chunk_rx.recv().await {
+            use ccore::sampler::provider::StreamChannel;
+            match chunk.channel {
+                StreamChannel::Text => {
+                    accumulated_text.push_str(&chunk.content);
+                    // 流式转发到 TUI
+                    self.send_update(
+                        acp::SessionUpdate::AgentMessageChunk(
+                            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
+                                chunk.content,
+                            ))),
+                        ),
+                        None,
+                    )
+                    .await;
+                }
+                StreamChannel::Reasoning => {
+                    tracing::trace!("收到推理 chunk：{} 字符", chunk.content.len());
+                }
+                StreamChannel::ToolCall => {
+                    if let Some(tc) = &chunk.tool_call {
+                        tool_calls.push(ccode_sampling_types::ToolCall {
+                            id: tc.tool_call_id.clone().into(),
+                            name: tc.tool_name.clone(),
+                            arguments: tc.arguments.clone().into(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 4. 等待完成信号
+        let outcome = done_rx.await.unwrap_or(
+            crate::session::message_bus_bridge::LlmOutcome::Error("完成信号丢失".into()),
+        );
+
+        match outcome {
+            crate::session::message_bus_bridge::LlmOutcome::Done => {
+                tracing::info!("消息总线 LLM 采样完成：request_id={}", request_id);
+            }
+            crate::session::message_bus_bridge::LlmOutcome::Error(e) => {
+                tracing::warn!("消息总线 LLM 采样错误：{}，回退到直接调用路径", e);
+                return self.run_turn_via_sampler_direct(request).await;
+            }
+        }
+
+        // 5. 构建 ConversationResponse
+        let has_tool_calls = !tool_calls.is_empty();
+        let mut response_items: Vec<ccode_sampling_types::ConversationItem> = Vec::new();
+        if has_tool_calls || !accumulated_text.is_empty() {
+            response_items.push(ccode_sampling_types::ConversationItem::Assistant(
+                ccode_sampling_types::AssistantItem {
+                    content: accumulated_text.into(),
+                    tool_calls,
+                    model_id: None,
+                    model_fingerprint: None,
+                    reasoning_effort: None,
+                },
+            ));
+        }
+
+        let response = ConversationResponse {
+            items: response_items,
+            stop_reason: Some(if has_tool_calls {
+                ccode_sampling_types::StopReason::ToolCalls
+            } else {
+                ccode_sampling_types::StopReason::Stop
+            }),
+            usage: None,
+            cost_usd_ticks: None,
+            message_chunks_emitted: 0,
+            doom_loop_signals: Vec::new(),
+            stop_message: None,
+        };
+
+        let metrics = ccode_sampler::InferenceLatencyStats::default();
+
+        // Agent 响应完成时持久化会话快照（消息总线路径）
+        self.persist_turn_snapshot(&request, Some(&response), "turn_end");
+
+        Ok(SamplerTurnOutcome::Response(
+            Box::new(response),
+            Box::new(metrics),
+        ))
+    }
+
+    /// 直接调用路径（绕过消息总线检查）。
+    ///
+    /// 当消息总线路径失败需要回退时使用。此方法不检查 `use_message_bus` 标志，
+    /// 直接调用 ccode-sampler。同样用 `retry_with_backoff` 包装采样调用，
+    /// 仅对网络超时/5xx/限流重试。
+    async fn run_turn_via_sampler_direct(
+        self: &Arc<Self>,
+        request: ConversationRequest,
+    ) -> Result<SamplerTurnOutcome, acp::Error> {
+        self.prepare_sampler_for_turn().await;
+        let stream_drained_rx = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            *self.turn_stream_drained.lock() = Some(tx);
+            rx
+        };
+        let retry_policy = ccore::retry::RetryPolicy {
+            max_retries: 3,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 30000,
+            retryable_codes: vec![408, 429, 500, 502, 503, 504],
+        };
+        let sampled = ccore::retry::backoff::retry_with_error_check(
+            &retry_policy,
+            || async {
+                let attempt_id = ccode_sampler::RequestId::random();
+                let attempt_id_str = attempt_id.as_str().to_string();
+                self.sampler_handle
+                    .submit_and_collect(attempt_id, request.clone())
+                    .await
+                    .map(|(response, metrics)| (attempt_id_str, response, metrics))
+            },
+            retryable_sampling_error_code,
+        )
+        .await;
+        match sampled {
+            Ok((request_id_str, response, metrics)) => {
+                let span = tracing::Span::current();
+                span.record("request_id", request_id_str.as_str());
+                if let Some(ttft) = metrics.time_to_first_token_ms {
+                    span.record("ttft_ms", ttft as i64);
+                }
+                if metrics.attempts > 0 {
+                    span.record("attempt", i64::from(metrics.attempts));
+                }
+                if tokio::time::timeout(std::time::Duration::from_secs(5), stream_drained_rx)
+                    .await
+                    .is_err()
+                {
+                    self.turn_stream_drained.lock().take();
+                    tracing::warn!(
+                        "stream-drain barrier timed out; proceeding to emit tool \
+                         calls (eventId ordering may be imperfect this turn)"
+                    );
+                }
+                // Agent 响应完成时持久化会话快照（回退路径）
+                self.persist_turn_snapshot(&request, Some(&response), "turn_end");
                 Ok(SamplerTurnOutcome::Response(
                     Box::new(response),
                     Box::new(metrics),

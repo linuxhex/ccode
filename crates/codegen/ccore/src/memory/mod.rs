@@ -7,3 +7,5 @@ pub mod heat;
 pub mod window;
 pub mod dream;
 pub mod recall;
+pub mod embedding;
+pub mod mmr;

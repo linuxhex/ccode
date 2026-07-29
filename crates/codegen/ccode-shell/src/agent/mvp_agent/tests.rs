@@ -1160,7 +1160,7 @@ fn make_test_handle(
         upload_queue: Arc::new(OnceLock::new()),
         upload_failures_since_success: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tool_context: crate::tools::ToolContext::new_local_context(
-            ccode_pathss::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap(),
+            ccode_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap(),
             std::sync::Arc::new(ccode_workspace::file_system::LocalFs::new(
                 std::path::PathBuf::from("/tmp"),
             )),
@@ -3001,7 +3001,7 @@ where
 #[test]
 fn chat_session_spawn_options_matches_thin_profile() {
     let sid = acp::SessionId::new(std::sync::Arc::from("00000000-0000-0000-0000-000000000099"));
-    let cwd = ccode_pathss::AbsPathBuf::new(std::env::temp_dir()).expect("temp cwd");
+    let cwd = ccode_paths::AbsPathBuf::new(std::env::temp_dir()).expect("temp cwd");
     let opts = chat_session_spawn_options(
         SessionInfo {
             id: sid,

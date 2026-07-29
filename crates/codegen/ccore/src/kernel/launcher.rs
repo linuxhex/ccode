@@ -8,6 +8,13 @@
 //!
 //! 启动流程：
 //! Kernel 启动 → NodeLauncher spawn 各 Node → 各 Node 连接 ZMQ → 发送 sys/register → 开始工作
+//!
+//! 仿生架构（路线 A）：感官内置，5 个 Node
+//! - Sampler：LLM 采样
+//! - State：对话持久化
+//! - Tool：工具执行（= Hand + Limb 运动层）
+//! - Thinker：大脑皮层（内置 Eye/Ear/Nose/Skin 感官层）
+//! - TUI：用户交互（= Ear + Mouth 交互层）
 
 use crate::config::CcodeConfig;
 use crate::kernel::KernelConfig;
@@ -19,6 +26,7 @@ use crate::node::sampler::SamplerNode;
 use crate::node::tui::TUINode;
 use crate::node::tool::ToolNode;
 use crate::node::state::StateNode;
+use crate::node::thinker::ThinkerNode;
 use crate::node::transport::run_node;
 use crate::agent::AgentConfig;
 use crate::agent::AgentType;
@@ -61,17 +69,17 @@ impl NodeLauncher {
         }
     }
 
-    /// spawn 初始 Node 集合（MVP 阶段需要的 5 个 Node）
+    /// spawn 初始 Node 集合（仿生架构路线 A：感官内置，5 Node）
     ///
     /// 每个 Node 在独立的 tokio task 中通过 run_node() 启动，
     /// run_node() 会自动连接消息总线、注册、进入消息循环。
     ///
-    /// 启动顺序：
-    /// 1. Sampler（LLM 采样）- Agent 依赖它
-    /// 2. State（对话持久化）- Agent 依赖它
-    /// 3. Tool（工具执行）- Agent 依赖它
-    /// 4. Agent（主 Agent）- 核心循环
-    /// 5. TUI（终端渲染）- 用户交互
+    /// 架构（仿生隐喻保留在概念层面，不拆独立进程）：
+    /// 1. Sampler（LLM 采样）— Thinker 依赖
+    /// 2. State（对话持久化）— Thinker 依赖
+    /// 3. Tool（工具执行 = Hand + Limb 运动层）— Thinker 依赖
+    /// 4. Thinker（大脑皮层 + 内置 Eye/Ear/Nose/Skin 感官层）— 核心
+    /// 5. TUI（用户交互 = Ear + Mouth 交互层）— 用户界面
     pub async fn spawn_initial_set(&mut self) -> anyhow::Result<Vec<NodeDescriptor>> {
         // 1. Sampler Node（使用 ccode_config 中的 Provider 配置）
         let sampler_ctx = self.node_context();
@@ -105,7 +113,7 @@ impl NodeLauncher {
         });
         tracing::info!("State Node 已 spawn");
 
-        // 3. Tool Node
+        // 3. Tool Node（运动层：Hand + Limb 的能力由 ToolNode 统一执行）
         let tool_ctx = self.node_context();
         let tool_id = NodeId::new();
         let tool = ToolNode::new(tool_id.clone());
@@ -121,10 +129,12 @@ impl NodeLauncher {
         });
         tracing::info!("Tool Node 已 spawn");
 
-        // 4. Primary Agent
-        let agent_ctx = self.node_context();
-        let agent_id = NodeId::new();
-        let agent_config = AgentConfig {
+        // 4. Thinker Node（大脑皮层 + 内置感官层）
+        //    感官层（Eye/Ear/Nose/Skin）作为 ThinkerNode 内部方法，
+        //    不拆独立进程，通过 agent/{id}/tool_call → ToolNode 执行
+        let thinker_ctx = self.node_context();
+        let thinker_id = NodeId::new();
+        let thinker_config = AgentConfig {
             agent_type: AgentType::Primary,
             model: self.ccode_config.default_model.clone(),
             permission_mode: self.ccode_config.permission_mode,
@@ -133,20 +143,20 @@ impl NodeLauncher {
             non_interactive: false,
             tools: Vec::new(), // 将通过 tool/register 消息动态填充
         };
-        let agent = AgentNode::new(agent_id.clone(), agent_config);
+        let thinker = ThinkerNode::new(thinker_id.clone(), thinker_config);
         tokio::spawn(async move {
-            if let Err(e) = run_node(agent, agent_ctx).await {
-                tracing::error!("Agent Node 异常退出：{}", e);
+            if let Err(e) = run_node(thinker, thinker_ctx).await {
+                tracing::error!("Thinker Node 异常退出：{}", e);
             }
         });
         self.launched_nodes.push(NodeDescriptor {
-            id: agent_id,
-            node_type: NodeType::Agent,
-            name: "agent-primary".into(),
+            id: thinker_id,
+            node_type: NodeType::Thinker,
+            name: "thinker-primary".into(),
         });
-        tracing::info!("Primary Agent 已 spawn");
+        tracing::info!("Thinker Node（大脑皮层 + 内置感官层）已 spawn");
 
-        // 5. TUI Node（使用专用交互循环）
+        // 5. TUI Node（交互层：Ear + Mouth 的能力由 TUINode 统一处理）
         let tui_ctx = self.node_context();
         let tui_id = NodeId::new();
         let tui = TUINode::new(tui_id.clone());
@@ -162,7 +172,7 @@ impl NodeLauncher {
         });
         tracing::info!("TUI Node 已 spawn");
 
-        tracing::info!("初始 Node 集合启动完成（共 {} 个）", self.launched_nodes.len());
+        tracing::info!("仿生架构（路线 A）初始 Node 集合启动完成（共 {} 个）", self.launched_nodes.len());
         Ok(self.launched_nodes.clone())
     }
 

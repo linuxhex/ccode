@@ -280,6 +280,7 @@ wiremock = "0.6"
 wl-clipboard-rs = "0.9"
 ccode-acp = { path = "crates/codegen/ccode-acp" }
 ccode-lifecycle = { path = "crates/codegen/ccode-lifecycle" }
+ccore = { path = "crates/codegen/ccore" }
 ccode-circuit-breaker = { path = "crates/common/ccode-circuit-breaker" }
 ccode-hub-core = { path = "crates/common/ccode-hub-core" }
 ccode-hub-sdk = { path = "crates/common/ccode-hub-sdk" }

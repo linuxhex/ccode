@@ -145,7 +145,9 @@ impl KernelTransport {
 
         // 等待后台任务完成
         for handle in self.tasks {
-            let _ = handle.await;
+            if let Err(e) = handle.await {
+                tracing::debug!("Kernel 后台任务退出异常：{}", e);
+            }
         }
         tracing::info!("Kernel 传输层已关闭");
     }
@@ -266,7 +268,10 @@ impl KernelTransport {
             }
         }
         // 关闭 publisher
-        let _ = publisher.close().await;
+        let errors = publisher.close().await;
+        if !errors.is_empty() {
+            tracing::debug!("PUB socket 关闭失败：{:?}", errors);
+        }
         tracing::debug!("PUB 广播循环退出");
     }
 }

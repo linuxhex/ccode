@@ -111,7 +111,8 @@ pub async fn run_tui_node(
                             if node.primary_agent_id.is_none() {
                                 if let Ok(payload) = FrameCodec::decode_payload::<serde_json::Value>(&msg) {
                                     if let Some(node_type) = payload["node_type"].as_str() {
-                                        if node_type == "agent" {
+                                        // 兼容 AgentNode 和 ThinkerNode
+                                        if node_type == "agent" || node_type == "thinker" {
                                             if let Some(agent_id) = payload["node_id"].as_str() {
                                                 node.set_primary_agent(agent_id.to_string());
                                                 tracing::info!("TUI 设置 primary agent：{}", agent_id);
@@ -341,7 +342,9 @@ impl Node for TUINode {
                     if self.terminal.is_none() {
                         print!("{}", content);
                         use std::io::Write;
-                        let _ = std::io::stdout().flush();
+                        if let Err(e) = std::io::stdout().flush() {
+                            tracing::debug!("stdout flush 失败：{}", e);
+                        }
                     } else {
                         self.render()?;
                     }

@@ -315,4 +315,7 @@ pub fn register_builtin_executors(bridge: &mut super::bridge::ToolBridge) {
     bridge.register_executor(Box::new(GrepExecutor));
     bridge.register_executor(Box::new(GlobExecutor));
     bridge.register_executor(Box::new(ListDirExecutor));
+
+    // 注册 post_hook：Write/Edit 后对 .rs 文件运行 rustfmt --check 做增量验证
+    bridge.register_post_hook(Box::new(super::rustfmt_hook::RustfmtHook));
 }

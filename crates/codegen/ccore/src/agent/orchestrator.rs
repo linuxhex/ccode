@@ -56,6 +56,17 @@ impl Orchestrator {
         self.subagents.remove(node_id);
     }
 
+    /// 移除子 Agent（无论完成或崩溃）
+    ///
+    /// 统一的清理入口：子 Agent 正常完成、崩溃、超时均通过此方法移除，
+    /// 避免调用方需要区分状态。语义与 `remove_completed` 一致，
+    /// 但命名更直白，便于在事件处理代码中识别清理动作。
+    pub fn remove_subagent(&mut self, node_id: &NodeId) {
+        if self.subagents.remove(node_id).is_some() {
+            tracing::debug!("子 Agent 已从编排器移除：{}", node_id);
+        }
+    }
+
     /// 获取所有活跃子 Agent
     pub fn active_subagents(&self) -> Vec<&SubAgentState> {
         self.subagents.values().collect()

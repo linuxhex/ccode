@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use agent_client_protocol as acp;
 use ccode_acp::AcpAgentGatewaySender;
-use ccode_pathss::AbsPathBuf;
+use ccode_paths::AbsPathBuf;
 use ccode_workspace::permission::{AccessKind, ClientType, spawn_permission_manager};
 
 use super::support::create_test_actor;

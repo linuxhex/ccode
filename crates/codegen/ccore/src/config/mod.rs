@@ -2,11 +2,41 @@
 
 pub mod provider;
 pub mod memory;
+pub mod hot_reload;
+pub mod watcher;
+pub mod reloader;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::node::PermissionMode;
+
+/// A+ 能力配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct APlusConfig {
+    /// turn 结束后自动运行 cargo check（默认 true）
+    pub cargo_check_on_turn_end: bool,
+    /// Write/Edit 后自动运行 rustfmt --check（默认 true）
+    pub rustfmt_on_write: bool,
+    /// 自动代码审查（默认 false，需用户显式开启）
+    pub auto_review: bool,
+    /// Doom Loop 检测窗口大小（默认 10）
+    pub doom_loop_window_size: usize,
+    /// Doom Loop 重复阈值（默认 3）
+    pub doom_loop_repeat_threshold: usize,
+}
+
+impl Default for APlusConfig {
+    fn default() -> Self {
+        Self {
+            cargo_check_on_turn_end: true,
+            rustfmt_on_write: true,
+            auto_review: false,
+            doom_loop_window_size: 10,
+            doom_loop_repeat_threshold: 3,
+        }
+    }
+}
 
 /// ccode 全局配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +53,9 @@ pub struct CcodeConfig {
     pub permission_mode: PermissionMode,
     /// 最大子 Agent 数量
     pub max_subagents: usize,
+    /// A+ 能力配置
+    #[serde(default)]
+    pub aplus: APlusConfig,
 }
 
 impl Default for CcodeConfig {
@@ -34,6 +67,7 @@ impl Default for CcodeConfig {
             memory: memory::MemoryConfig::default(),
             permission_mode: PermissionMode::Trust,
             max_subagents: 10,
+            aplus: APlusConfig::default(),
         }
     }
 }

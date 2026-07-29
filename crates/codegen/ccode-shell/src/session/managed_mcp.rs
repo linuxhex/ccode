@@ -12,10 +12,10 @@
 //!   - Managed        — header injection + auto-create missing connectors
 //!
 //! The transport/cache/injection core lives in
-//! `ccode_session::managed_mcp` and is re-exported here so
+//! `ccode_shell_session_support::managed_mcp` and is re-exported here so
 //! `crate::session::managed_mcp::…` paths keep resolving unchanged.
 
-pub use ccode_session::managed_mcp::*;
+pub use ccode_shell_session_support::managed_mcp::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;

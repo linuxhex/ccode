@@ -77,6 +77,7 @@ tokio-util = { workspace = true, features = ["compat"] }
 tokio-retry = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v5", "v7"] }
 ccode-acp = { workspace = true }
+ccore = { workspace = true }
 axum = { workspace = true, features = ["ws", "multipart"] }
 backon = { workspace = true }
 webbrowser = { workspace = true }

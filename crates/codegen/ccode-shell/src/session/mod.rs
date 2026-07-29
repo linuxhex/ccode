@@ -4,6 +4,7 @@ pub mod commands;
 pub mod compaction_config;
 pub mod handle;
 pub mod memory_state;
+pub mod message_bus_bridge;
 pub mod merge;
 pub mod notifications;
 pub mod pending_interaction;
@@ -340,6 +341,9 @@ pub mod mcp_servers;
 pub mod memory;
 pub(crate) mod normalize_cache;
 pub mod persistence;
+/// SessionActor 持久化桥接：封装 `ccore::persistence` 的 SessionPersister /
+/// StatePersister，提供会话级懒初始化与 best-effort 异步保存。
+pub(crate) mod persist;
 pub use ccode_shared::placeholder_images;
 pub mod plan_mode;
 pub mod prompt_history;

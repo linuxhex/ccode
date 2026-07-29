@@ -1514,6 +1514,8 @@ pub(crate) async fn spawn_session_actor(
         max_retries: ccode_sampler::resolve_max_retries(max_retries),
         pending_interjections: InterjectionBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
+        pending_compile_feedback: Mutex::new(None),
+        current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
         idle_flush_timeout: memory_config
             .as_ref()
             .and_then(|mc| mc.flush.idle_timeout_secs)
@@ -1638,6 +1640,8 @@ pub(crate) async fn spawn_session_actor(
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle,
+        use_message_bus: false,
+        message_bus_bridge: None,
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),

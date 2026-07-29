@@ -180,7 +180,7 @@ pub(crate) async fn create_test_actor_ex(
     SessionActor,
     tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
 ) {
-    let cwd = ccode_pathss::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
+    let cwd = ccode_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
     let fs = Arc::new(ccode_workspace::file_system::MockFs::new(
         cwd.to_path_buf(),
     ));
@@ -311,6 +311,8 @@ pub(crate) async fn create_test_actor_ex(
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
+        pending_compile_feedback: Mutex::new(None),
+        current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
         idle_flush_timeout: None,
         dream_check_timeout: None,
         last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -399,6 +401,8 @@ pub(crate) async fn create_test_actor_ex(
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle: ccode_sampler::SamplerHandle::noop(),
+        use_message_bus: false,
+        message_bus_bridge: None,
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),

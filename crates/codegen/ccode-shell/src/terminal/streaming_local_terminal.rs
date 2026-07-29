@@ -1189,7 +1189,7 @@ async fn run_output_collector(
 mod tests {
     use super::*;
     use crate::terminal::DEFAULT_OUTPUT_BYTE_LIMIT;
-    use ccode_pathss::AbsPathBuf;
+    use ccode_paths::AbsPathBuf;
 
     struct TestNotifier {
         notifications: Mutex<Vec<acp::SessionNotification>>,

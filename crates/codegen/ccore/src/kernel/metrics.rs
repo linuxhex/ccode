@@ -164,7 +164,7 @@ impl MetricsCollector {
         let p99_latency = if !latencies.is_empty() {
             let sorted = {
                 let mut v = latencies.clone();
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v.sort_by(|a, b| a.partial_cmp(b).expect("f64 排序不应出现 NaN"));
                 v
             };
             let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
@@ -260,7 +260,7 @@ impl HealthChecker {
     pub fn record_heartbeat(&self, node_id: &str) {
         self.node_heartbeats
             .lock()
-            .unwrap()
+            .expect("node_heartbeats Mutex 不应中毒")
             .insert(node_id.to_string(), Instant::now());
     }
 
@@ -323,7 +323,7 @@ impl HealthChecker {
         
         self.node_heartbeats
             .lock()
-            .unwrap()
+            .expect("node_heartbeats Mutex 不应中毒")
             .iter()
             .filter(|(_, last)| now.duration_since(**last) > timeout)
             .map(|(id, _)| id.clone())

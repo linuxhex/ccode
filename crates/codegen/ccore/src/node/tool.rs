@@ -2,18 +2,26 @@
 //!
 //! Tool Node 的完整工作流：
 //! 1. 订阅 agent/*/tool_call topic
-//! 2. 收到 ToolCallRequest → 权限检查 → 执行工具 → 返回 ToolCallResult
+//! 2. 收到 ToolCallRequest → 权限检查 → 并发限流 → 执行工具 → 返回 ToolCallResult
 //! 3. 结果通过消息总线发送到 agent/{src}/tool_result
+//!
+//! 并发控制：内置 Semaphore（默认 20 并发），防止工具执行过载。
+//! 对应 ANS 的 tool_semaphore，但运行在 ToolNode 本地（独立进程无法共享 ANS）。
 
 use async_trait::async_trait;
+use tokio::sync::Semaphore;
 
 use crate::message::frame::FrameCodec;
 use crate::message::Message;
 use crate::message::Topic;
+use crate::metrics::AgentMetrics;
 use crate::node::{Node, NodeId, NodeType, NodeContext, PermissionMode};
 use crate::node::transport::NodeTransportHandle;
 use crate::tools::bridge::ToolBridge;
 use crate::tools::ToolCallRequest;
+
+/// 默认最大并发工具执行数
+const DEFAULT_MAX_CONCURRENT_TOOLS: usize = 20;
 
 /// Tool Node 实现
 pub struct ToolNode {
@@ -22,6 +30,8 @@ pub struct ToolNode {
     bridge: ToolBridge,
     /// 全局权限模式
     permission_mode: PermissionMode,
+    /// 并发限流信号量（对应 ANS 的 tool_semaphore）
+    concurrency_semaphore: Semaphore,
 }
 
 impl ToolNode {
@@ -30,6 +40,7 @@ impl ToolNode {
             id,
             bridge: ToolBridge::new(),
             permission_mode: PermissionMode::Trust,
+            concurrency_semaphore: Semaphore::new(DEFAULT_MAX_CONCURRENT_TOOLS),
         }
     }
 
@@ -44,11 +55,26 @@ impl ToolNode {
         request: ToolCallRequest,
         transport: &NodeTransportHandle,
     ) -> anyhow::Result<()> {
+        // 并发限流：获取信号量许可
+        let _permit = match self.concurrency_semaphore.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    available = self.concurrency_semaphore.available_permits(),
+                    "工具并发已满，等待可用许可"
+                );
+                // 等待可用许可
+                self.concurrency_semaphore.acquire().await
+                    .map_err(|_| anyhow::anyhow!("信号量已关闭"))?
+            }
+        };
+
         // 权限检查
         if self.bridge.needs_confirmation(&request.tool_name, self.permission_mode) {
             match self.permission_mode {
                 PermissionMode::Ask => {
                     // Ask 模式下拒绝未确认的工具调用
+                    AgentMetrics::global().record_error("tool_permission_denied");
                     let result_msg = FrameCodec::new_message(
                         Topic::agent_tool_result(&request.agent_id),
                         self.id.as_str(),
@@ -77,13 +103,22 @@ impl ToolNode {
         // 执行工具
         let result = self.bridge.execute(&request).await;
 
-        // 将结果封装为消息，发送到 agent/{agent_id}/tool_result
+        // 记录工具执行耗时（工具名 + 耗时），metrics 埋点失败不影响主流程
+        AgentMetrics::global()
+            .record_tool_execution_time(&request.tool_name, result.duration_ms as f64);
+        if !result.success {
+            AgentMetrics::global().record_error("tool_execution_failed");
+        }
+
+        // 将结果封装为消息，优先通过数据面 PUB 发送
         let tool_result_msg = FrameCodec::new_message(
             Topic::agent_tool_result(&request.agent_id),
             self.id.as_str(),
             &result,
         )?;
-        transport.send_message(&tool_result_msg).await?;
+        if let Err(_) = transport.publish_data(&tool_result_msg).await {
+            transport.send_message(&tool_result_msg).await?;
+        }
 
         tracing::debug!(
             "工具执行完成：tool_call_id={}, success={}, duration={}ms",
@@ -156,6 +191,11 @@ impl Node for ToolNode {
             "sys/spawn".into(),
             "sys/shutdown".into(),
         ]
+    }
+
+    /// Tool 发布的 topic（数据面 PUB）
+    fn published_topics(&self) -> Vec<String> {
+        vec!["agent/*/tool_result".into(), "tool/register".into()]
     }
 
     async fn stop(&mut self) -> anyhow::Result<()> {

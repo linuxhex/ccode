@@ -19,11 +19,12 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
+use zeromq::{DealerSocket, PubSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
 use crate::message::frame::FrameCodec;
 use crate::message::{Message, SequenceManager};
 use crate::node::NodeId;
+use crate::performance::memory_pool::{BufferGuard, MessagePool};
 
 /// 发现的 Publisher 信息（Kernel 通过 publisher_discovery 响应下发）
 #[derive(Debug, Clone)]
@@ -36,27 +37,36 @@ pub struct PublisherInfo {
     pub topics: Vec<String>,
 }
 
-/// 数据面状态 — 缓存已发现的 Publisher 信息
+/// 数据面状态 — 管理 Node 间 PUB/SUB 直连
 ///
-/// 当前阶段仅缓存，为后续 Node 间 PUB/SUB 直连做准备。
-/// 未来实现直连时，此处将维护 SUB socket 连接池。
-#[derive(Debug, Default)]
+/// ROS 1 风格：收到 publisher_discovery 后，自动创建 SUB socket 连接到发现的 Publisher，
+/// 实现数据面直连（业务数据不经 Kernel）。
+///
+/// 每个 SUB socket 在独立 tokio task 中接收消息，转发到统一的 incoming 通道。
 pub struct DataPlaneState {
     /// 已发现的 publisher：pub_addr → PublisherInfo
     publishers: HashMap<String, PublisherInfo>,
+    /// 已建立的 SUB 连接：pub_addr → JoinHandle
+    sub_handles: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// 本 Node 订阅的 topic 模式列表（用于匹配 Publisher 的 topic）
+    local_subscriptions: Vec<String>,
 }
 
 impl DataPlaneState {
-    /// 创建空的数据面状态
-    pub fn new() -> Self {
-        Self::default()
+    /// 创建数据面状态
+    pub fn new(local_subscriptions: Vec<String>) -> Self {
+        Self {
+            publishers: HashMap::new(),
+            sub_handles: HashMap::new(),
+            local_subscriptions,
+        }
     }
 
     /// 处理 Kernel 返回的 publisher_discovery 响应
     ///
     /// 解析响应中的 publisher 列表，缓存到本地状态。
-    /// 当前的 PUB/SUB 直连尚未实现，此处仅记录日志和缓存信息。
-    pub fn handle_discovery(&mut self, payload: &serde_json::Value) {
+    /// 对新发现的 Publisher，自动创建 SUB socket 并订阅匹配的 topic。
+    pub fn handle_discovery(&mut self, payload: &serde_json::Value, incoming_tx: mpsc::Sender<Message>) {
         let publishers = match payload.get("publishers").and_then(|v| v.as_array()) {
             Some(arr) => arr,
             None => return,
@@ -67,7 +77,7 @@ impl DataPlaneState {
                 for p in pub_list {
                     let node_id = p["node_id"].as_str().unwrap_or("").to_string();
                     let pub_addr = p["pub_addr"].as_str().unwrap_or("").to_string();
-                    let topics = p["topics"]
+                    let topics: Vec<String> = p["topics"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
@@ -80,17 +90,155 @@ impl DataPlaneState {
                         continue;
                     }
 
+                    // 如果已有连接，跳过
+                    if self.sub_handles.contains_key(&pub_addr) {
+                        continue;
+                    }
+
                     tracing::info!(
-                        "发现 Publisher：node={}, addr={}, topics={:?}",
+                        "发现新 Publisher：node={}, addr={}, topics={:?}",
                         node_id, pub_addr, topics
                     );
+
+                    // 计算本 Node 需要订阅此 Publisher 的哪些 topic
+                    // 策略：通配符模式（含 *）不走数据面直连（ZMQ SUB 不支持通配符），
+                    // 由 Kernel 控制面路由负责转发。仅精确 topic 走数据面直连。
+                    let exact_topics: Vec<String> = topics
+                        .iter()
+                        .filter(|t| !t.contains('*'))
+                        .filter(|t| Self::topic_matches(&self.local_subscriptions, t))
+                        .cloned()
+                        .collect();
+
+                    if exact_topics.is_empty() {
+                        tracing::debug!(
+                            "Publisher {} 无精确匹配 topic（通配符模式由控制面路由），跳过数据面 SUB 连接",
+                            pub_addr
+                        );
+                        self.publishers.insert(
+                            pub_addr.clone(),
+                            PublisherInfo { node_id, pub_addr, topics },
+                        );
+                        continue;
+                    }
+
+                    // 缓存 Publisher 信息
                     self.publishers.insert(
                         pub_addr.clone(),
-                        PublisherInfo { node_id, pub_addr, topics },
+                        PublisherInfo { node_id: node_id.clone(), pub_addr: pub_addr.clone(), topics },
                     );
+
+                    // 启动 SUB 连接任务（仅精确 topic，ZMQ SUB 前缀匹配即可正确过滤）
+                    let handle = tokio::spawn(Self::sub_connect_loop(
+                        pub_addr.clone(),
+                        exact_topics,
+                        incoming_tx.clone(),
+                    ));
+                    self.sub_handles.insert(pub_addr, handle);
                 }
             }
         }
+    }
+
+    /// 处理 publisher_change 通知（新 Publisher 上线时 Kernel 推送）
+    ///
+    /// 与 handle_discovery 逻辑相同，解析并连接新 Publisher。
+    pub fn handle_publisher_change(&mut self, payload: &serde_json::Value, incoming_tx: mpsc::Sender<Message>) {
+        // publisher_change 格式与 publisher_discovery 相同，复用解析逻辑
+        self.handle_discovery(payload, incoming_tx);
+    }
+
+    /// 判断 topic 是否匹配本 Node 的订阅模式
+    fn topic_matches(subscriptions: &[String], topic: &str) -> bool {
+        // 精确匹配或前缀匹配
+        subscriptions.iter().any(|sub| {
+            topic == sub || topic.starts_with(sub)
+        })
+    }
+
+    /// 将通配符订阅模式转换为 ZMQ SUB 前缀
+    ///
+    /// ZMQ SUB 的 subscribe() 只支持字符串前缀匹配，不支持通配符。
+    /// 因此 "sampler/*/stream" 不能直接用于 ZMQ 订阅。
+    /// 转换策略：取通配符出现前的最长前缀作为 ZMQ 订阅前缀。
+    ///   "sampler/*/stream" → "sampler/"
+    ///   "agent/*/tool_call" → "agent/"
+    ///   "sys/shutdown" → "sys/shutdown"（无通配符，原样返回）
+    fn zmq_subscribe_prefix(pattern: &str) -> &str {
+        // 找到第一个通配符（* 或 **）的位置
+        if let Some(pos) = pattern.find('*') {
+            // 取通配符前最后一段的前缀（截断到最后一个 /）
+            let prefix = &pattern[..pos];
+            if let Some(slash_pos) = prefix.rfind('/') {
+                &pattern[..=slash_pos]  // "sampler/*" → "sampler/"
+            } else {
+                prefix  // 无 / 的情况，如 "*/xxx" → ""
+            }
+        } else {
+            pattern  // 无通配符，原样返回
+        }
+    }
+
+    /// 启动 SUB 连接循环
+    ///
+    /// 创建 SUB socket 连接到指定 Publisher，订阅匹配的 topic，
+    /// 接收消息后转发到 incoming 通道。
+    async fn sub_connect_loop(
+        pub_addr: String,
+        topics: Vec<String>,
+        tx: mpsc::Sender<Message>,
+    ) {
+        tracing::info!("正在连接 Publisher SUB：{}", pub_addr);
+
+        let mut subscriber = SubSocket::new();
+        match subscriber.connect(&pub_addr).await {
+            Ok(()) => {
+                tracing::info!("SUB socket 已连接到 Publisher：{}", pub_addr);
+            }
+            Err(e) => {
+                tracing::error!("SUB socket 连接失败 {}：{}", pub_addr, e);
+                return;
+            }
+        }
+
+        // 订阅匹配的 topic（使用 ZMQ 前缀订阅，因 ZMQ 不支持通配符）
+        for topic in &topics {
+            let zmq_prefix = Self::zmq_subscribe_prefix(topic);
+            if let Err(e) = subscriber.subscribe(zmq_prefix).await {
+                tracing::warn!("SUB 订阅 topic {} (prefix={}) 失败：{}", topic, zmq_prefix, e);
+            } else {
+                tracing::debug!("SUB 订阅 ZMQ 前缀：{} (原始模式：{})", zmq_prefix, topic);
+            }
+        }
+
+        // 接收循环
+        loop {
+            match subscriber.recv().await {
+                Ok(zmq_msg) => {
+                    if zmq_msg.len() < 3 {
+                        tracing::warn!("数据面 SUB 收到帧数不足的消息：{} 帧", zmq_msg.len());
+                        continue;
+                    }
+                    let frames: Vec<Vec<u8>> = zmq_msg.iter().map(|b| b.to_vec()).collect();
+
+                    match FrameCodec::decode(&frames) {
+                        Ok(message) => {
+                            if tx.send(message).await.is_err() {
+                                break; // 通道已关闭
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("数据面 SUB 消息解码失败：{}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("数据面 SUB 接收错误 {}：{}", pub_addr, e);
+                    break;
+                }
+            }
+        }
+        tracing::debug!("数据面 SUB 连接循环退出：{}", pub_addr);
     }
 
     /// 获取所有已发现的 publisher 信息
@@ -102,13 +250,19 @@ impl DataPlaneState {
 /// Node 端传输层句柄
 ///
 /// Node 通过此句柄发送消息到消息总线。
-/// 内部通过 mpsc 通道与后台 DEALER 任务通信。
+/// 支持控制面（DEALER→ROUTER）和数据面（PUB→SUB）两种发送路径。
 #[derive(Clone)]
 pub struct NodeTransportHandle {
-    /// 发送消息的通道
+    /// 控制面发送通道（DEALER → Kernel ROUTER）
     outgoing_tx: mpsc::Sender<Vec<Bytes>>,
+    /// 数据面发布通道（PUB → 其他 Node SUB）
+    data_pub_tx: mpsc::Sender<Vec<Bytes>>,
+    /// 消息接收通道（用于 DataPlaneState 的 SUB 连接转发消息）
+    incoming_tx: mpsc::Sender<Message>,
     /// 序列号管理器
     sequence_manager: Arc<SequenceManager>,
+    /// 消息内存池 — 池化序列化缓冲区，减少消息发送时的内存分配
+    message_pool: Arc<MessagePool>,
 }
 
 impl NodeTransportHandle {
@@ -120,7 +274,7 @@ impl NodeTransportHandle {
         // 获取下一个序列号
         let sequence = self.sequence_manager.next_sequence();
 
-        // 创建带序列号的消息
+        // 创建带序列号的消息（保留原 requires_ack 标志，确保关键控制面消息的可靠性传递）
         let msg_with_seq = Message {
             topic: msg.topic.clone(),
             header: crate::message::MessageHeader {
@@ -129,6 +283,7 @@ impl NodeTransportHandle {
                 src_node: msg.header.src_node.clone(),
                 reply_to: msg.header.reply_to.clone(),
                 sequence,
+                requires_ack: msg.header.requires_ack,
             },
             payload: msg.payload.clone(),
         };
@@ -152,6 +307,50 @@ impl NodeTransportHandle {
     /// 获取当前序列号
     pub fn current_sequence(&self) -> u64 {
         self.sequence_manager.current_sequence()
+    }
+
+    /// 通过数据面 PUB socket 发布消息（Node 间直连，不经 Kernel）
+    ///
+    /// 将 ccode Message 编码后通过 PUB socket 广播，
+    /// 订阅了对应 topic 的 Node 会直接收到。
+    ///
+    /// 使用消息内存池获取池化缓冲区进行序列化，避免每次发送都重新分配工作缓冲区。
+    /// BufferGuard drop 时自动归还缓冲区到池中复用；Bytes 拷贝自缓冲区独立持有数据，
+    /// 不共享池化缓冲区的底层分配，避免异步发送场景下的数据竞争。
+    pub async fn publish_data(&self, msg: &Message) -> anyhow::Result<()> {
+        let frames = FrameCodec::encode(msg)?;
+
+        // 从内存池获取缓冲区（优先复用池中已有缓冲区，减少工作缓冲区分配）
+        let mut guard = BufferGuard::new(&*self.message_pool);
+        let buf = guard.as_mut();
+
+        // 将所有帧连续写入池化缓冲区，记录每帧偏移量
+        let mut offsets: Vec<usize> = Vec::with_capacity(frames.len() + 1);
+        offsets.push(0);
+        for frame in &frames {
+            buf.extend_from_slice(frame);
+            offsets.push(buf.len());
+        }
+
+        // 从池化缓冲区切片拷贝创建 Bytes（独立所有权，缓冲区可安全归还复用）
+        let mut bytes_frames: Vec<Bytes> = Vec::with_capacity(frames.len());
+        for w in offsets.windows(2) {
+            bytes_frames.push(Bytes::copy_from_slice(&buf[w[0]..w[1]]));
+        }
+        // guard drop 时自动归还缓冲区到池中复用
+
+        self.data_pub_tx
+            .send(bytes_frames)
+            .await
+            .map_err(|_| anyhow::anyhow!("数据面发布通道已关闭"))
+    }
+
+    /// 通过数据面 PUB socket 发布原始帧
+    pub async fn publish_frames(&self, frames: Vec<Bytes>) -> anyhow::Result<()> {
+        self.data_pub_tx
+            .send(frames)
+            .await
+            .map_err(|_| anyhow::anyhow!("数据面发布通道已关闭"))
     }
 }
 
@@ -203,7 +402,7 @@ impl NodeTransport {
         dealer.connect(&info.router_addr).await?;
         tracing::info!("DEALER socket 已连接：{}", info.router_addr);
 
-        // 2. 创建 SUB socket 并连接到 Kernel PUB
+        // 2. 创建 SUB socket 并连接到 Kernel PUB（控制面广播）
         let mut subscriber = SubSocket::new();
         subscriber.connect(&info.pub_addr).await?;
         // 订阅空字符串前缀（接收所有广播消息）
@@ -214,19 +413,32 @@ impl NodeTransport {
         }
         tracing::info!("SUB socket 已连接：{} (订阅 {} 个 topic)", info.pub_addr, info.subscriptions.len());
 
-        // 3. 创建通道和序列号管理器
+        // 3. 创建数据面 PUB socket（如果配置了 data_pub_addr）
+        let has_pub_socket = !info.data_pub_addr.is_empty();
+        if has_pub_socket {
+            tracing::info!("数据面 PUB socket 将绑定到：{}", info.data_pub_addr);
+        }
+
+        // 4. 创建通道和序列号管理器
         let (incoming_tx, incoming_rx) = mpsc::channel::<Message>(256);
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Vec<Bytes>>(256);
+        let (data_pub_tx, data_pub_rx) = mpsc::channel::<Vec<Bytes>>(64);
 
         // 创建序列号管理器
         let sequence_manager = Arc::new(SequenceManager::new(info.node_id.clone()));
 
+        // 创建消息内存池（64 个 64KB 缓冲区，供数据面序列化复用）
+        let message_pool = Arc::new(MessagePool::new(64, 64 * 1024));
+
         let handle = NodeTransportHandle {
             outgoing_tx,
+            data_pub_tx,
+            incoming_tx: incoming_tx.clone(),
             sequence_manager: sequence_manager.clone(),
+            message_pool,
         };
 
-        // 4. 发送 sys/register 消息（ROS 1 风格：包含数据面地址和正确的 node_type）
+        // 5. 发送 sys/register 消息（ROS 1 风格：包含数据面地址和正确的 node_type）
         let mut register_payload = serde_json::json!({
             "node_id": info.node_id.to_string(),
             "node_type": info.node_type,
@@ -261,16 +473,27 @@ impl NodeTransport {
             }
         });
 
-        // 5. 启动 DEALER 收发任务（zeromq 0.4 不支持 split，用 select! 交替收发）
+        // 6. 启动 DEALER 收发任务（zeromq 0.4 不支持 split，用 select! 交替收发）
         let dealer_handle = tokio::spawn(Self::dealer_loop(dealer, incoming_tx.clone(), outgoing_rx));
 
-        // 6. 启动 SUB 接收任务
+        // 7. 启动 SUB 接收任务（控制面广播）
         let sub_recv_handle = tokio::spawn(Self::sub_recv_loop(subscriber, incoming_tx));
+
+        // 8. 启动数据面 PUB 发布任务（如果配置了 PUB 地址）
+        let mut tasks = vec![dealer_handle, sub_recv_handle];
+        if has_pub_socket {
+            let pub_addr = info.data_pub_addr.clone();
+            let pub_handle = tokio::spawn(Self::data_pub_loop(pub_addr, data_pub_rx));
+            tasks.push(pub_handle);
+        } else {
+            // 没有 PUB socket 时，丢弃发布请求
+            drop(data_pub_rx);
+        }
 
         Ok(Self {
             incoming_rx,
             handle,
-            tasks: vec![dealer_handle, sub_recv_handle],
+            tasks,
         })
     }
 
@@ -289,7 +512,9 @@ impl NodeTransport {
         drop(self.handle);
         drop(self.incoming_rx);
         for handle in self.tasks {
-            let _ = handle.await;
+            if let Err(e) = handle.await {
+                tracing::debug!("Node 后台任务退出异常：{}", e);
+            }
         }
         tracing::debug!("Node 传输层已关闭");
     }
@@ -394,12 +619,50 @@ impl NodeTransport {
         }
         tracing::debug!("SUB 接收循环退出");
     }
+
+    /// 数据面 PUB 发布循环
+    ///
+    /// 绑定 PUB socket，从通道读取消息帧并广播。
+    /// 订阅了对应 topic 的 Node 会通过数据面 SUB 直连收到。
+    async fn data_pub_loop(pub_addr: String, mut rx: mpsc::Receiver<Vec<Bytes>>) {
+        let mut publisher = PubSocket::new();
+        match publisher.bind(&pub_addr).await {
+            Ok(_endpoint) => {
+                tracing::info!("数据面 PUB socket 已绑定：{}", pub_addr);
+            }
+            Err(e) => {
+                tracing::error!("数据面 PUB socket 绑定失败 {}：{}", pub_addr, e);
+                return;
+            }
+        }
+
+        while let Some(frames) = rx.recv().await {
+            match ZmqMessage::try_from(frames) {
+                Ok(msg) => {
+                    if let Err(e) = publisher.send(msg).await {
+                        tracing::warn!("数据面 PUB 发布失败：{}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("数据面 PUB 消息构造失败：{}", e);
+                }
+            }
+        }
+        let errors = publisher.close().await;
+        if !errors.is_empty() {
+            tracing::debug!("数据面 PUB socket 关闭失败：{:?}", errors);
+        }
+        tracing::debug!("数据面 PUB 发布循环退出");
+    }
 }
 
 /// Node 消息循环入口
 ///
 /// 连接消息总线，启动 Node，进入消息收发循环（含心跳）。
 /// 这是每个 Node 运行的标准主循环。
+///
+/// ACK 机制：心跳等关键控制面消息发送后等待 Kernel 的 ACK 确认，
+/// 超时未确认则自动重传（最多 3 次，指数退避）。
 pub async fn run_node<N: crate::node::Node + Send + 'static>(
     mut node: N,
     ctx: crate::node::NodeContext,
@@ -413,9 +676,9 @@ pub async fn run_node<N: crate::node::Node + Send + 'static>(
         pub_addr: ctx.pub_addr.clone(),
         node_id: node_id.clone(),
         node_type: node.node_type().as_str().to_string(),
-        subscriptions,
+        subscriptions: subscriptions.clone(),
         data_pub_addr: ctx.data_pub_addr.clone(),
-        published_topics: Vec::new(), // 由具体 Node 实现
+        published_topics: node.published_topics(),
         data_rep_addr: ctx.data_rep_addr.clone(),
         service_name: None, // 由具体 Node 实现
     };
@@ -434,10 +697,20 @@ pub async fn run_node<N: crate::node::Node + Send + 'static>(
     let heartbeat_interval = std::time::Duration::from_secs(10);
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
 
-    // 6. 数据面状态 — 缓存 publisher_discovery 发现的 Publisher 信息
-    let mut data_plane = DataPlaneState::new();
+    // 6. 数据面状态 — 管理 Node 间 PUB/SUB 直连
+    let mut data_plane = DataPlaneState::new(subscriptions);
 
-    // 7. 消息循环（含心跳）
+    // 7. ACK 确认管理器 — 关键控制面消息的可靠性保障
+    let ack_manager = std::sync::Arc::new(
+        crate::message::ack::AckManager::new(crate::message::ack::AckConfig::default())
+    );
+    let (retry_tx, mut retry_rx) = mpsc::channel::<crate::message::Message>(64);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+    // 启动重试后台任务：超时未确认的消息通过 retry_tx 回传，由主循环重发
+    let ack_for_retry = ack_manager.clone();
+    tokio::spawn(crate::message::ack::retry_loop(ack_for_retry, retry_tx, shutdown_rx));
+
+    // 8. 消息循环（含心跳 + 数据面发现 + ACK 处理）
     loop {
         tokio::select! {
             // 接收消息
@@ -449,6 +722,16 @@ pub async fn run_node<N: crate::node::Node + Send + 'static>(
                             tracing::info!("Node {} 收到关闭信号", node_id);
                             break;
                         }
+                        // ACK 确认消息 — 关联已发送消息，标记为已确认
+                        if msg.topic.as_str() == "sys/ack" {
+                            if let Some(reply_to) = &msg.header.reply_to {
+                                let acked = ack_manager.handle_ack(reply_to).await;
+                                if acked {
+                                    tracing::debug!("Node {} 收到 ACK：{}", node_id, reply_to);
+                                }
+                            }
+                            continue;
+                        }
                         // 心跳响应（忽略）
                         if msg.topic.as_str() == "sys/heartbeat" {
                             continue;
@@ -458,11 +741,25 @@ pub async fn run_node<N: crate::node::Node + Send + 'static>(
                             match FrameCodec::decode_payload::<serde_json::Value>(&msg) {
                                 Ok(payload) => {
                                     if payload.get("type").and_then(|v| v.as_str()) == Some("publisher_discovery") {
-                                        data_plane.handle_discovery(&payload);
+                                        tracing::info!("Node {} 收到 publisher_discovery", node_id);
+                                        data_plane.handle_discovery(&payload, handle.incoming_tx.clone());
                                     }
                                 }
                                 Err(e) => {
                                     tracing::warn!("Node {} 解析 publisher_discovery 响应失败：{}", node_id, e);
+                                }
+                            }
+                            continue;
+                        }
+                        // publisher_change 通知 — 新 Publisher 上线
+                        if msg.topic.as_str() == "sys/publisher_change" {
+                            match FrameCodec::decode_payload::<serde_json::Value>(&msg) {
+                                Ok(payload) => {
+                                    tracing::info!("Node {} 收到 publisher_change 通知", node_id);
+                                    data_plane.handle_publisher_change(&payload, handle.incoming_tx.clone());
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Node {} 解析 publisher_change 失败：{}", node_id, e);
                                 }
                             }
                             continue;
@@ -480,22 +777,40 @@ pub async fn run_node<N: crate::node::Node + Send + 'static>(
                     }
                 }
             }
-            // 定期发送心跳
+            // 定期发送心跳（requires_ack=true，确保 Kernel 收到）
             _ = heartbeat_timer.tick() => {
-                let heartbeat_msg = FrameCodec::new_message(
+                let mut heartbeat_msg = FrameCodec::new_message(
                     crate::message::Topic::sys_heartbeat(),
                     node_id.as_str(),
                     &serde_json::json!({ "node_id": node_id.to_string() }),
                 )?;
+                // 标记需要 ACK 确认，并记录到 AckManager 等待确认
+                heartbeat_msg.header.requires_ack = true;
+                let msg_id = heartbeat_msg.header.msg_id.clone();
                 if let Err(e) = handle.send_message(&heartbeat_msg).await {
                     tracing::warn!("Node {} 心跳发送失败：{}", node_id, e);
+                } else {
+                    ack_manager.record_sent(heartbeat_msg).await;
+                    tracing::trace!("Node {} 心跳已发送，等待 ACK：{}", node_id, msg_id);
+                }
+            }
+            // 重试消息：AckManager 检测到超时未确认，通过 retry_tx 回传待重发消息
+            retry_msg = retry_rx.recv() => {
+                if let Some(msg) = retry_msg {
+                    tracing::warn!("Node {} 重发超时消息：{}", node_id, msg.header.msg_id);
+                    if let Err(e) = handle.send_message(&msg).await {
+                        tracing::warn!("Node {} 重发失败：{}", node_id, e);
+                    }
                 }
             }
         }
     }
 
-    // 8. 停止 Node
-    node.stop().await?;
+    // 9. 优雅停止 Node 和重试任务
+    if let Err(e) = shutdown_tx.send(()).await {
+        tracing::debug!("关闭信号发送失败：{}", e);
+    }
+    node.graceful_stop(Some(&handle)).await?;
     transport.shutdown().await;
     tracing::info!("Node {} 已停止", node_id);
 

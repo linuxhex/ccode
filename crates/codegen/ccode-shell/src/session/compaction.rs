@@ -2209,7 +2209,7 @@ mod inline_auto_compact_flow_tests {
     use crate::terminal::runner::{TerminalError, TerminalRunRequest, TerminalRunResult};
     use std::sync::OnceLock;
     use tokio::sync::mpsc;
-    use ccode_pathss::AbsPathBuf;
+    use ccode_paths::AbsPathBuf;
     use ccode_workspace::file_system::MockFs;
     use ccode_workspace::permission::PermissionHandle;
     #[derive(Debug)]
@@ -2357,6 +2357,8 @@ mod inline_auto_compact_flow_tests {
             max_turns: None,
             pending_interjections: InterjectionBuffer::new(),
             pending_skill_reminders: Mutex::new(Vec::new()),
+            pending_compile_feedback: Mutex::new(None),
+            current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
             idle_flush_timeout: None,
             dream_check_timeout: None,
             last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -2452,6 +2454,8 @@ mod inline_auto_compact_flow_tests {
             ),
             turn_stream_drained: parking_lot::Mutex::new(None),
             sampler_handle: ccode_sampler::SamplerHandle::noop(),
+            use_message_bus: false,
+            message_bus_bridge: None,
             rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
             image_description_model: crate::test_support::TEST_MODEL.to_owned(),
             image_describe_cache: Arc::new(

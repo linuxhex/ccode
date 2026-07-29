@@ -98,10 +98,13 @@ impl CheckpointManager {
             }
             CheckpointMode::Commit => {
                 // 先保存当前未提交的修改到 stash
-                let _ = Command::new("git")
+                let output = Command::new("git")
                     .args(["stash", "save", "--include-untracked", "ccode:rollback-auto-stash"])
                     .current_dir(&self.working_dir)
                     .output();
+                if let Err(e) = output {
+                    tracing::debug!("git stash save 失败：{}", e);
+                }
 
                 // 恢复到检查点 commit：git checkout <hash>
                 let output = Command::new("git")

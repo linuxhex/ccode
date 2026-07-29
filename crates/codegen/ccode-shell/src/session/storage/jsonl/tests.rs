@@ -338,7 +338,7 @@ async fn merge_rewind_points_from_aborts_on_malformed_without_writing() {
 /// read-modify-write merge (not just index/count).
 #[tokio::test]
 async fn merge_rewind_points_from_round_trips_file_snapshots() {
-    use ccode_pathss::RelPathBuf;
+    use ccode_paths::RelPathBuf;
     use ccode_workspace::session::file_state::{FileSnapshot, RewindPoint};
     let temp_dir = TempDir::new().unwrap();
     let info = create_test_info();

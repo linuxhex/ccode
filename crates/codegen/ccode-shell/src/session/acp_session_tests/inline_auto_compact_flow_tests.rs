@@ -3,7 +3,7 @@ use super::*;
 use crate::terminal::AsyncTerminalRunner;
 use crate::terminal::runner::{TerminalError, TerminalRunRequest, TerminalRunResult};
 use tokio::sync::mpsc;
-use ccode_pathss::AbsPathBuf;
+use ccode_paths::AbsPathBuf;
 use ccode_workspace::file_system::MockFs;
 use ccode_workspace::permission::PermissionHandle;
 #[derive(Debug)]
@@ -149,6 +149,8 @@ async fn create_test_actor(
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
+        pending_compile_feedback: Mutex::new(None),
+        current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
         idle_flush_timeout: None,
         dream_check_timeout: None,
         last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -237,6 +239,8 @@ async fn create_test_actor(
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle: ccode_sampler::SamplerHandle::noop(),
+        use_message_bus: false,
+        message_bus_bridge: None,
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
@@ -591,6 +595,8 @@ async fn create_test_actor_with_memory(
         max_turns: None,
         pending_interjections: InterjectionBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
+        pending_compile_feedback: Mutex::new(None),
+        current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
         idle_flush_timeout: memory_config
             .as_ref()
             .and_then(|mc| mc.flush.idle_timeout_secs)
@@ -690,6 +696,8 @@ async fn create_test_actor_with_memory(
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle: ccode_sampler::SamplerHandle::noop(),
+        use_message_bus: false,
+        message_bus_bridge: None,
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
@@ -1223,7 +1231,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let (gateway_tx, _) = mpsc::unbounded_channel::<ccode_acp::AcpClientMessage>();
             let (persistence_tx, _) = mpsc::unbounded_channel::<PersistenceMsg>();
-            let cwd = ccode_pathss::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
+            let cwd = ccode_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
             let fs = Arc::new(ccode_workspace::file_system::MockFs::new(
                 cwd.to_path_buf(),
             ));
@@ -1371,6 +1379,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
+                pending_compile_feedback: Mutex::new(None),
+                current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
                 last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -1466,6 +1476,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 turn_stream_drained: parking_lot::Mutex::new(None),
                 attribution_callback: None,
                 sampler_handle: ccode_sampler::SamplerHandle::noop(),
+                use_message_bus: false,
+                message_bus_bridge: None,
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),

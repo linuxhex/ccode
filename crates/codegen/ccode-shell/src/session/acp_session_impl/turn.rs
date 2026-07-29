@@ -461,31 +461,6 @@ impl SessionActor {
                 )
                 .await;
 
-                // Apply skill model/effort override via lightweight model switch.
-                if let Some(first_skill) = parsed_skills.first() {
-                    if first_skill.model.is_some() || first_skill.effort.is_some() {
-                        let target_model = first_skill.model.clone().unwrap_or_else(|| {
-                            self.chat_state_handle.get_sampling_config().model.clone()
-                        });
-                        tracing::info!(
-                            skill_name = %first_skill.name,
-                            model = %target_model,
-                            effort = ?first_skill.effort,
-                            "switching model for skill execution"
-                        );
-                        if let Err(e) = self.handle_lightweight_model_switch(
-                            target_model,
-                            first_skill.effort.clone(),
-                        ).await {
-                            tracing::warn!(
-                                skill_name = %first_skill.name,
-                                error = %e,
-                                "failed to switch model for skill, continuing with current model"
-                            );
-                        }
-                    }
-                }
-
                 original_blocks
             }
         };
@@ -941,6 +916,23 @@ impl SessionActor {
                                 loop_action = ?action,
                                 "agent loop: round completed, state machine ready for next round"
                             );
+                        }
+                    }
+                }
+
+                // 状态变迁广播到消息总线：使 TUI/监控可观测循环阶段
+                // 仅在 use_message_bus=true 且桥接器可用时发送，失败不阻塞主循环
+                if self.use_message_bus {
+                    if let Some(bridge) = &self.message_bus_bridge {
+                        let state_name = format!("{:?}", loop_sm.state());
+                        let metadata = serde_json::json!({
+                            "turn_count": loop_sm.turn_count(),
+                            "tokens_used": loop_sm.tokens_used(),
+                            "consecutive_failures": loop_sm.consecutive_failures(),
+                            "elapsed_secs": loop_sm.elapsed().as_secs(),
+                        });
+                        if let Err(e) = bridge.broadcast_state(state_name, metadata).await {
+                            tracing::debug!(error = %e, "状态变迁广播失败，不阻塞主循环");
                         }
                     }
                 }
@@ -1511,6 +1503,54 @@ impl SessionActor {
     /// Active), both branches are skipped: neither streak moves and the
     /// existing pause cause is preserved.
     pub(crate) async fn handle_turn_end(&self, turn_succeeded: bool) {
+        // A+ 编译反馈闭环：本轮若调用过 write/edit，则运行 cargo check，
+        // 将错误摘要存入 pending_compile_feedback 供下一轮注入。
+        // auto_review 开启时追加自审提醒。任何异常仅记录 warn，不阻塞主流程。
+        // 注意：cargo check 在此同步 await——handle_turn_end 位于 actor 串行循环中，
+        // 下一轮 prompt 通常等待用户输入，故 inline 等待不会拖慢交互。
+        let aplus_cfg = ccore::config::APlusConfig::default();
+        let has_write_edit = self
+            .current_turn_has_write_edit
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if has_write_edit {
+            if aplus_cfg.cargo_check_on_turn_end {
+                let workdir = self.tool_context.cwd.as_path();
+                match ccore::tools::run_cargo_check(workdir).await {
+                    Ok(report) => {
+                        if !report.success {
+                            let hint = ccore::tools::format_for_injection(&report);
+                            if !hint.is_empty() {
+                                *self.pending_compile_feedback.lock() = Some(hint);
+                                tracing::warn!(
+                                    "编译发现 {} 个错误，已注入下一轮",
+                                    report.errors.len()
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("cargo check 执行失败：{}", e);
+                    }
+                }
+            }
+            if aplus_cfg.auto_review {
+                // 简化实现：注入一条让 LLM 自审代码修改的 system 提醒，
+                // 与已有的编译反馈（若有）合并，下一轮统一注入。
+                let review_hint = "请审查你刚才的代码修改：检查逻辑正确性、边界条件、\
+                    是否引入回归，并在必要时修正。";
+                let mut guard = self.pending_compile_feedback.lock();
+                match &mut *guard {
+                    Some(existing) => {
+                        existing.push_str("\n\n");
+                        existing.push_str(review_hint);
+                    }
+                    None => {
+                        *guard = Some(review_hint.to_string());
+                    }
+                }
+            }
+        }
+
         let goal_active_now = laziness_injection_active(
             self.goal_harness_enabled(),
             self.goal_tracker.lock().status(),
@@ -2016,6 +2056,15 @@ impl SessionActor {
                  arguments; do not return the answer as text.",
             );
         }
+        // A+ 编译反馈闭环：本轮开始前注入上一轮 handle_turn_end 产出的编译错误摘要，
+        // 并复位 write/edit 标志。注入失败不影响主流程——take() 后即使后续注入抛错，
+        // 反馈也已被消费，下一轮重新走 cargo check 即可。
+        self.current_turn_has_write_edit
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(feedback) = self.pending_compile_feedback.lock().take() {
+            self.push_system_reminder(&feedback);
+            tracing::info!("已注入上一轮编译反馈到本轮 system reminder");
+        }
         loop {
             self.emit_event(crate::session::events::Event::LoopStarted { loop_index });
             loop_index += 1;
@@ -2520,6 +2569,12 @@ impl SessionActor {
                     span.record("mcp_tool.name", tool.as_str());
                 }
                 turn_tools_called.push(tc.name.clone());
+                // A+ 编译反馈闭环：检测 write/edit 工具调用，置位本轮标志。
+                // handle_turn_end 读取该标志决定是否触发 cargo check。
+                if tc.name == "write" || tc.name == "edit" {
+                    self.current_turn_has_write_edit
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             let step_signature = tool_calls
                 .iter()

@@ -12,7 +12,7 @@ use agent_client_protocol as acp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use ccode_acp::AcpAgentGatewaySender as GatewaySender;
-use ccode_pathss::AbsPathBuf;
+use ccode_paths::AbsPathBuf;
 use ccode_workspace::file_system::{AsyncFileSystem, AsyncFsWrapper};
 use ccode_workspace::session::file_state::FileStateHandle;
 use ccode_hunk::HunkTrackerHandle;
@@ -376,7 +376,7 @@ mod tests {
     use crate::{terminal::AsyncTerminalRunner, tools::ToolContext};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use ccode_pathss::AbsPathBuf;
+    use ccode_paths::AbsPathBuf;
     use ccode_workspace::file_system::{AsyncFileSystem, AsyncFsWrapper};
     use ccode_hunk::HunkTrackerHandle;
     impl ToolContext {

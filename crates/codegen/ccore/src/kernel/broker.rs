@@ -208,6 +208,24 @@ impl Broker {
         result
     }
 
+    /// 查找可能对新 Publisher 感兴趣的订阅者
+    ///
+    /// 给定一个新 Publisher 发布的 topic 列表，找出订阅了这些 topic 的 Node。
+    /// 用于新 Publisher 上线时通知已有订阅者建立数据面 SUB 连接。
+    pub fn find_subscribers_for_publisher(&self, publisher_topics: &[String]) -> Vec<NodeId> {
+        let mut result = Vec::new();
+        for topic in publisher_topics {
+            for (pattern, subscribers) in &self.subscriptions {
+                if topic_matches(pattern, topic) {
+                    result.extend(subscribers.iter().cloned());
+                }
+            }
+        }
+        result.sort_by_key(|a| a.to_string());
+        result.dedup();
+        result
+    }
+
     /// 获取 Node 的 ZMQ identity
     pub fn get_identity(&self, node_id: &NodeId) -> Option<&NodeIdentity> {
         self.node_identities.get(node_id)

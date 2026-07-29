@@ -696,6 +696,14 @@ pub(crate) struct SessionActor {
     /// cancel/idle. The flush also delivers the plan tracker's buffered
     /// mid-turn activation reminder (see `activate_plan_mode_mid_turn`).
     pub(crate) pending_skill_reminders: Mutex<Vec<ConversationItem>>,
+    /// A+ 编译反馈闭环：上一轮 handle_turn_end 运行 cargo check 得到的错误摘要，
+    /// 在下一轮 process_conversation_turn 开始时注入 system reminder，然后清空。
+    /// 注入失败不影响主流程（cargo check 异常时仅记录 warn 日志）。
+    pub(crate) pending_compile_feedback: Mutex<Option<String>>,
+    /// A+ 编译反馈闭环：当前 turn 是否调用过 write/edit 类工具。
+    /// 在工具调用处理处置位，handle_turn_end 读取后决定是否触发 cargo check，
+    /// 并在 handle_turn_end 末尾复位，确保每个 turn 的判定相互独立。
+    pub(crate) current_turn_has_write_edit: std::sync::atomic::AtomicBool,
     /// Idle flush timeout: `None` = disabled, `Some(duration)` = flush after inactivity.
     pub(crate) idle_flush_timeout: Option<std::time::Duration>,
     /// Periodic dream check interval: `None` = disabled.
@@ -1014,6 +1022,18 @@ pub(crate) struct SessionActor {
     /// tests and other constructor sites use `SamplerHandle::noop()`.
     /// All inference flows through this handle.
     pub(crate) sampler_handle: ccode_sampler::SamplerHandle,
+    /// 是否使用消息总线路由 LLM 请求和工具调用（默认 false，直接调用 ccode-sampler/ccode-tools）。
+    ///
+    /// 当 `true` 时，`run_turn_via_sampler` 和 `execute_tool_calls` 通过
+    /// `message_bus_bridge` 将请求路由到消息总线上的 SamplerNode 和 ToolNode，
+    /// 而非直接调用本地 ccode-sampler/ccode-tools。
+    /// 保留 `false` 路径以支持并行运行和渐进迁移。
+    pub(crate) use_message_bus: bool,
+    /// 消息总线桥接器（仅当 `use_message_bus=true` 时存在）。
+    ///
+    /// 持有 ccore 的 `NodeTransport` 连接，提供 LLM 请求和工具调用的消息总线路径。
+    /// 通过 `MessageBusBridge::connect()` 创建，生命周期与 SessionActor 一致。
+    pub(crate) message_bus_bridge: Option<Arc<crate::session::message_bus_bridge::MessageBusBridge>>,
     /// Cached recipe for constructing this session's [`ccode_agent::Agent`].
     ///
     /// Populated once at session spawn and then reused by

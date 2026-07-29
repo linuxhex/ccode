@@ -62,6 +62,16 @@ impl Topic {
         Self::new("sys/shutdown")
     }
 
+    /// Kernel 通知订阅者有新 Publisher 上线
+    pub fn sys_publisher_change() -> Self {
+        Self::new("sys/publisher_change")
+    }
+
+    /// 消息确认（ACK）
+    pub fn sys_ack() -> Self {
+        Self::new("sys/ack")
+    }
+
     // ---- Agent Topic ----
 
     /// 向指定 Agent 发送输入
@@ -92,6 +102,38 @@ impl Topic {
     /// Agent 状态事件（崩溃、完成等）
     pub fn agent_event(agent_id: &str) -> Self {
         Self::new(format!("agent/{agent_id}/event"))
+    }
+
+    // ---- SubAgent Topic ----
+
+    /// 向指定子 Agent 派发任务
+    pub fn subagent_task(subagent_id: &str) -> Self {
+        Self::new(format!("subagent/{subagent_id}/task"))
+    }
+
+    /// 子 Agent 的输出流
+    pub fn subagent_output(subagent_id: &str) -> Self {
+        Self::new(format!("subagent/{subagent_id}/output"))
+    }
+
+    /// 子 Agent 请求执行工具
+    pub fn subagent_tool_call(subagent_id: &str) -> Self {
+        Self::new(format!("subagent/{subagent_id}/tool_call"))
+    }
+
+    /// 工具执行结果返回给子 Agent
+    pub fn subagent_tool_result(subagent_id: &str) -> Self {
+        Self::new(format!("subagent/{subagent_id}/tool_result"))
+    }
+
+    /// 子 Agent 完成事件（携带最终输出）
+    pub fn subagent_completed(subagent_id: &str) -> Self {
+        Self::new(format!("subagent/{subagent_id}/completed"))
+    }
+
+    /// 子 Agent 崩溃事件（携带错误信息）
+    pub fn subagent_crashed(subagent_id: &str) -> Self {
+        Self::new(format!("subagent/{subagent_id}/crashed"))
     }
 
     // ---- Sampler Topic ----
@@ -141,6 +183,68 @@ impl Topic {
     pub fn service_response(service_name: &str) -> Self {
         Self::new(format!("service/{service_name}/response"))
     }
+
+    // ---- 仿生器官 Topic ----
+
+    /// EyeNode：观察请求/结果
+    pub fn eye_observe() -> Self { Self::new("eye/observe") }
+    /// EyeNode：文件变化事件
+    pub fn eye_file_changed() -> Self { Self::new("eye/file_changed") }
+    /// EyeNode：终端输出流
+    pub fn eye_terminal_output() -> Self { Self::new("eye/terminal_output") }
+
+    /// EarNode：用户输入
+    pub fn ear_hear() -> Self { Self::new("ear/hear") }
+    /// EarNode：系统通知
+    pub fn ear_notification() -> Self { Self::new("ear/notification") }
+
+    /// NoseNode：嗅探结果
+    pub fn nose_smell() -> Self { Self::new("nose/smell") }
+    /// NoseNode：编译错误
+    pub fn nose_compile_error() -> Self { Self::new("nose/compile_error") }
+    /// NoseNode：测试失败
+    pub fn nose_test_failure() -> Self { Self::new("nose/test_failure") }
+
+    /// SkinNode：触觉反馈（工具结果/进程退出）
+    pub fn skin_touch() -> Self { Self::new("skin/touch") }
+    /// SkinNode：进程退出
+    pub fn skin_process_exit() -> Self { Self::new("skin/process_exit") }
+    /// SkinNode：内存压力
+    pub fn skin_memory_pressure() -> Self { Self::new("skin/memory_pressure") }
+
+    /// MouthNode：文本输出
+    pub fn mouth_speak() -> Self { Self::new("mouth/speak") }
+    /// MouthNode：代码写入
+    pub fn mouth_code_write() -> Self { Self::new("mouth/code_write") }
+    /// MouthNode：状态报告
+    pub fn mouth_status() -> Self { Self::new("mouth/status") }
+
+    /// HandNode：编辑操作
+    pub fn hand_edit() -> Self { Self::new("hand/edit") }
+    /// HandNode：搜索操作
+    pub fn hand_search() -> Self { Self::new("hand/search") }
+    /// HandNode：重构操作
+    pub fn hand_restructure() -> Self { Self::new("hand/restructure") }
+
+    /// LimbNode：命令执行
+    pub fn limb_execute() -> Self { Self::new("limb/execute") }
+    /// LimbNode：构建操作
+    pub fn limb_build() -> Self { Self::new("limb/build") }
+    /// LimbNode：Git 操作
+    pub fn limb_git() -> Self { Self::new("limb/git") }
+
+    /// ThinkerNode：思考指令
+    pub fn cortex_think(agent_id: &str) -> Self { Self::new(format!("cortex/{agent_id}/think")) }
+    /// ThinkerNode：规划指令
+    pub fn cortex_plan(agent_id: &str) -> Self { Self::new(format!("cortex/{agent_id}/plan")) }
+    /// ThinkerNode：决策指令
+    pub fn cortex_decide(agent_id: &str) -> Self { Self::new(format!("cortex/{agent_id}/decide")) }
+    /// ThinkerNode：感官综合信号
+    pub fn cortex_sensory(agent_id: &str) -> Self { Self::new(format!("cortex/{agent_id}/sensory")) }
+    /// ThinkerNode：输入（替代 agent/{id}/input）
+    pub fn cortex_input(agent_id: &str) -> Self { Self::new(format!("cortex/{agent_id}/input")) }
+    /// ThinkerNode：说话指令（输出到 MouthNode）
+    pub fn cortex_speak(agent_id: &str) -> Self { Self::new(format!("cortex/{agent_id}/speak")) }
 
     // ---- Param Topic (ROS 风格参数服务器) ----
 

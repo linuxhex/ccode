@@ -6,6 +6,8 @@
 //! 3. 执行健康检查（心跳超时检测）
 //! 4. 管理 Node 生命周期（spawn/deregister）
 //! 5. 启动初始 Node 集合
+//! 6. 反射弧路由：感官信号 → ReflexRouter → 运动指令（脊髓反射）
+//! 7. 自主神经调节：心跳监控 + 并发限流 + 内存池（无意识自调节）
 //!
 //! 事件循环：
 //! ```
@@ -13,12 +15,14 @@
 //!   ├─ 创建 KernelTransport（绑定 ROUTER + PUB socket）
 //!   ├─ 创建 NodeLauncher
 //!   ├─ spawn 初始 Node 集合（各 Node 连接 DEALER + SUB 到 Kernel）
+//!   ├─ 启动 AutonomicNervousSystem 自主循环（心跳/并发/内存）
 //!   └─ 进入事件循环：
 //!       ├─ recv from ROUTER → 路由消息到订阅者
-//!       ├─ sys/register → 注册 Node（identity + subscriptions）
-//!       ├─ sys/heartbeat → 更新心跳时间戳
+//!       ├─ sys/register → 注册 Node（identity + subscriptions）+ 注册到 ANS
+//!       ├─ sys/heartbeat → 更新心跳时间戳 + 通知 ANS
+//!       ├─ nose/*/skin/*/eye/* → 反射弧：ReflexRouter → motor 指令
 //!       ├─ agent/{id}/spawn → spawn 子 Agent
-//!       └─ 定期健康检查 → 清理超时 Node
+//!       └─ 定期健康检查 → ANS 检测超时 + 清理死亡 Node
 //! ```
 
 pub mod broker;
@@ -29,12 +33,23 @@ pub mod launcher;
 pub mod transaction;
 pub mod backpressure;
 pub mod metrics;
+pub mod self_healing;
+pub mod autonomic;
+pub mod reflex;
+pub mod experience;
 
 use anyhow::Result;
 use bytes::Bytes;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::CcodeConfig;
+use crate::config::reloader::ConfigReloader;
+use crate::config::watcher::ConfigWatcher;
+use crate::kernel::self_healing::SelfHealingManager;
+use crate::kernel::autonomic::AutonomicNervousSystem;
+use crate::kernel::reflex::{ReflexRouter, ReflexAction, ReflexLevel, ReflexRule, builtin_reflex_rules};
+use crate::kernel::experience::{ExperienceLog, ExperienceEntry};
 use crate::kernel::transport::{IncomingMessage, KernelTransport};
 use crate::kernel::backpressure::{BackpressureController, BackpressureConfig};
 use crate::kernel::metrics::{MonitoringService, HealthCheckConfig};
@@ -45,6 +60,7 @@ use crate::message::SequenceChecker;
 use crate::message::param::ParamServer;
 use crate::node::{NodeId, NodeType, NodeContext};
 use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock, Mutex};
 
 /// Kernel 配置
 #[derive(Debug, Clone)]
@@ -90,7 +106,12 @@ impl Default for KernelConfig {
 /// - `backpressure`: 背压控制器
 /// - `monitoring`: 监控服务
 /// - `param_server`: ROS 风格的参数服务器
-/// - `ccode_config`: ccode 全局配置
+/// - `ccode_config`: ccode 全局配置（与 ConfigReloader 共享，支持热更新）
+/// - `reflex_router`: 反射路由器（脊髓反射弧：感官信号 → 运动指令）
+/// - `autonomic`: 自主神经系统（心跳监控 + 并发限流 + 内存池，已接管 self_healing 职责）
+/// - `experience_log`: 经历日志（闭环学习：记录反射弧执行结果，提取可学习模式）
+/// - `self_healing`: （向后兼容保留，已由 autonomic 接管）
+/// - `config_watcher`: 配置文件监听器（热更新）
 pub struct Kernel {
     config: KernelConfig,
     broker: broker::Broker,
@@ -100,7 +121,22 @@ pub struct Kernel {
     monitoring: MonitoringService,
     param_server: ParamServer,
     running: bool,
-    ccode_config: Option<CcodeConfig>,
+    ccode_config: Option<Arc<RwLock<CcodeConfig>>>,
+    /// 反射路由器（脊髓反射弧：感官信号 → 模式匹配 → 运动指令）
+    reflex_router: ReflexRouter,
+    /// 自主神经系统（心跳监控 + 并发限流 + 内存池）
+    autonomic: Arc<AutonomicNervousSystem>,
+    /// 经历日志（闭环学习：记录反射弧执行结果，提取可学习模式）
+    #[allow(dead_code)]
+    experience_log: Arc<Mutex<ExperienceLog>>,
+    /// Agent 自愈管理器（向后兼容保留，已由 autonomic 接管）
+    #[allow(dead_code)]
+    self_healing: Option<Arc<SelfHealingManager>>,
+    /// 配置文件监听器（保持存活以维持 watch，不主动读取）
+    #[allow(dead_code)]
+    config_watcher: Option<ConfigWatcher>,
+    /// 配置变更事件接收端（由 ConfigWatcher 创建，在 run() 中消费）
+    config_event_rx: Option<mpsc::Receiver<crate::config::watcher::ConfigChangeEvent>>,
 }
 
 impl Kernel {
@@ -109,6 +145,33 @@ impl Kernel {
             config.router_addr.clone(),
             config.pub_addr.clone(),
         );
+
+        // 初始化自主神经系统（接管原 SelfHealingManager 的心跳监控职责）
+        let autonomic = Arc::new(AutonomicNervousSystem::new(
+            config.heartbeat_timeout_secs,
+            3,
+        ));
+
+        // 初始化反射路由器（脊髓反射弧：感官信号 → 运动指令）
+        let reflex_router = ReflexRouter::with_rules(builtin_reflex_rules());
+
+        // 初始化经历日志（闭环学习）
+        let experience_log = Arc::new(Mutex::new(ExperienceLog::new()));
+
+        // 尝试创建 ConfigWatcher（监听工作目录下的 config.toml）
+        // 失败时记录 warn 并跳过，不阻塞 Kernel 启动
+        let config_path = PathBuf::from(&config.working_dir).join("config.toml");
+        let (config_watcher, config_event_rx) = match ConfigWatcher::new(config_path, 64) {
+            Ok((watcher, rx)) => {
+                tracing::info!("ConfigWatcher 已创建，监听配置文件变更");
+                (Some(watcher), Some(rx))
+            }
+            Err(e) => {
+                tracing::warn!("ConfigWatcher 创建失败，跳过配置热更新：{}", e);
+                (None, None)
+            }
+        };
+
         Self {
             config,
             broker,
@@ -119,12 +182,21 @@ impl Kernel {
             param_server: ParamServer::new(),
             running: false,
             ccode_config: None,
+            reflex_router,
+            autonomic,
+            experience_log,
+            self_healing: None, // 向后兼容保留，已由 autonomic 接管
+            config_watcher,
+            config_event_rx,
         }
     }
 
     /// 设置 ccode 全局配置
+    ///
+    /// 内部包装为 Arc<RwLock<CcodeConfig>>，以便与 ConfigReloader 共享，
+    /// 配置热更新后 Kernel 也能读到最新配置。
     pub fn set_ccode_config(&mut self, config: CcodeConfig) {
-        self.ccode_config = Some(config);
+        self.ccode_config = Some(Arc::new(RwLock::new(config)));
     }
 
     /// 获取 NodeContext 供子 Node 连接
@@ -141,9 +213,14 @@ impl Kernel {
     ///
     /// 主循环流程：
     /// 1. 启动 KernelTransport（绑定 ZMQ socket）
-    /// 2. 进入事件循环：
+    /// 2. 启动 AutonomicNervousSystem 自主循环（心跳监控 + 并发限流 + 内存池）
+    /// 3. 启动 ConfigReloader（独立 tokio task，消费配置变更事件）
+    /// 4. 启动初始 Node 集合
+    /// 5. 进入事件循环：
     ///    - 接收 ROUTER 消息 → 处理系统消息或路由
-    ///    - 定期健康检查
+    ///    - 感官信号（nose/*/skin/*/eye/*）→ 反射弧路由 → 运动指令
+    ///    - 定期健康检查（清理超时 Node + 通知 ANS 注销）
+    ///    - 接收配置变更通知 → 广播 sys/config_change 到所有 Node
     ///    - 处理 Node spawn 请求
     pub async fn run(&mut self) -> Result<()> {
         self.running = true;
@@ -161,12 +238,66 @@ impl Kernel {
             &self.config.pub_addr,
         ).await?;
 
-        // 2. 启动初始 Node 集合
-        if let Some(ccfg) = self.ccode_config.take() {
+        // 2. 启动 AutonomicNervousSystem 自主循环（心跳监控 + 并发限流 + 内存池）
+        let mut heartbeat_rx = self.autonomic.clone().start_autonomic_loop();
+        tracing::info!("AutonomicNervousSystem 自主循环已启动（间隔 10 秒）");
+
+        // 3. 启动初始 Node 集合（从共享配置读取）
+        if let Some(ccfg_arc) = self.ccode_config.clone() {
+            let ccfg = ccfg_arc.read().await.clone();
             let mut launcher = launcher::NodeLauncher::new(self.config.clone(), ccfg);
             match launcher.spawn_initial_set().await {
                 Ok(nodes) => {
                     tracing::info!("初始 Node 集合启动完成：{} 个", nodes.len());
+
+                    // 广播每个 Node 的 spawn 事件（让 TUINode 等知道有哪些 Node 上线）
+                    // 特别是 ThinkerNode 的 spawn 事件，让 TUINode 能设置 primary_agent_id
+                    // 确定性等待：轮询 registry 直到所有 Node 完成注册（sys/register），再广播
+                    let node_ids: Vec<String> = nodes.iter().map(|n| n.id.to_string()).collect();
+                    let spawn_frames_list: Vec<Vec<Bytes>> = nodes.iter()
+                        .filter_map(|desc| {
+                            let spawn_msg = FrameCodec::new_message(
+                                Topic::sys_spawn(),
+                                "kernel",
+                                &serde_json::json!({
+                                    "node_id": desc.id.to_string(),
+                                    "node_type": desc.node_type.as_str(),
+                                    "name": desc.name,
+                                }),
+                            ).ok()?;
+                            let frames: Vec<Bytes> = FrameCodec::encode(&spawn_msg).ok()?
+                                .into_iter()
+                                .map(Bytes::from)
+                                .collect();
+                            Some(frames)
+                        })
+                        .collect();
+
+                    // 等待所有 Node 完成注册（最多 5 秒，每 100ms 检查一次）
+                    let mut all_registered = false;
+                    for _ in 0..50 {
+                        let registered = node_ids.iter().all(|id| {
+                            let nid: NodeId = id.parse().unwrap_or_else(|_| NodeId::from("invalid"));
+                            self.registry.get(&nid).is_some()
+                        });
+                        if registered {
+                            all_registered = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+
+                    if all_registered {
+                        for (frames, desc) in spawn_frames_list.iter().zip(nodes.iter()) {
+                            if let Err(e) = transport.broadcast(frames.clone()).await {
+                                tracing::warn!("广播 spawn 事件失败：{}", e);
+                            } else {
+                                tracing::debug!("广播 spawn 事件：{} ({:?})", desc.id, desc.node_type);
+                            }
+                        }
+                    } else {
+                        tracing::warn!("初始 Node 集合注册超时，跳过 spawn 广播");
+                    }
                 }
                 Err(e) => {
                     tracing::error!("初始 Node 集合启动失败：{}", e);
@@ -176,9 +307,28 @@ impl Kernel {
             tracing::warn!("未设置 ccode_config，跳过初始 Node 集合启动");
         }
 
-        // 3. 主事件循环
+        // 4. 启动配置热更新：创建 ConfigReloader 并 spawn 消费 task
+        //    ConfigReloader 重载配置后通过 notify_tx 通知主循环，由主循环广播到所有 Node
+        let (config_notify_tx, notify_rx) = mpsc::channel::<String>(32);
+        let mut config_notify_rx: Option<mpsc::Receiver<String>> = None;
+        let mut config_monitoring_active = false;
+        if let (Some(event_rx), Some(config)) = (self.config_event_rx.take(), self.ccode_config.clone()) {
+            let config_path = PathBuf::from(&self.config.working_dir).join("config.toml");
+            let reloader = ConfigReloader::new(config, config_path, config_notify_tx);
+            tokio::spawn(async move {
+                reloader.run(event_rx).await;
+            });
+            config_notify_rx = Some(notify_rx);
+            config_monitoring_active = true;
+            tracing::info!("ConfigReloader 已启动，配置变更将自动重载并广播");
+        }
+
+        // 5. 主事件循环
         let health_interval = Duration::from_secs(self.config.health_check_interval_secs);
         let mut health_timer = tokio::time::interval(health_interval);
+
+        // 经验学习：每 60 秒提取模式并提议规则
+        let mut experience_timer = tokio::time::interval(Duration::from_secs(60));
 
         while self.running {
             tokio::select! {
@@ -199,13 +349,115 @@ impl Kernel {
                         }
                     }
                 }
-                // 定期健康检查
+                // 定期健康检查：清理超时 Node + 通知 AutonomicNervousSystem 注销
                 _ = health_timer.tick() => {
                     let dead_nodes = self.registry.remove_stale(self.config.heartbeat_timeout_secs);
-                    for node_id in dead_nodes {
-                        tracing::warn!("Node 心跳超时，移除：{}", node_id);
-                        self.broker.deregister_identity(&node_id);
-                        Self::broadcast_node_deregister(&mut transport, &node_id).await;
+                    if !dead_nodes.is_empty() {
+                        for node_id in dead_nodes {
+                            tracing::warn!("Node 心跳超时，移除：{}", node_id);
+                            self.broker.deregister_identity(&node_id);
+                            // 通知 AutonomicNervousSystem 注销该 Agent
+                            self.autonomic.unregister_agent(&node_id.to_string()).await;
+                            Self::broadcast_node_deregister(&mut transport, &node_id).await;
+                        }
+                    }
+                }
+                // 心跳事件：ANS 检测到 Agent 心跳超时，通知 Kernel 重启
+                event = heartbeat_rx.recv() => {
+                    match event {
+                        Some(heartbeat) => {
+                            tracing::warn!(
+                                agent_id = %heartbeat.agent_id,
+                                restart_count = heartbeat.restart_count,
+                                "收到心跳超时事件，执行 Agent 重启"
+                            );
+                            // 实际重启逻辑：通过 NodeLauncher 重新 spawn 该 Agent
+                            if let Some(ccfg_arc) = self.ccode_config.clone() {
+                                let ccfg = ccfg_arc.read().await.clone();
+                                let mut launcher = launcher::NodeLauncher::new(self.config.clone(), ccfg);
+                                let agent_type = crate::agent::AgentType::Primary;
+                                let descriptor = launcher.spawn_subagent(
+                                    agent_type,
+                                    None,
+                                    format!("重启 Agent {}", heartbeat.agent_id),
+                                );
+                                // 重新注册到 ANS
+                                self.autonomic.register_agent(descriptor.id.to_string()).await;
+                                tracing::info!("Agent {} 已重启，新 ID：{}", heartbeat.agent_id, descriptor.id);
+                            }
+                        }
+                        None => {
+                            tracing::warn!("心跳事件通道已关闭，停止心跳监控");
+                        }
+                    }
+                }
+                // 经验学习：定期提取模式并提议规则到 ReflexRouter
+                _ = experience_timer.tick() => {
+                    let proposed = {
+                        let log = self.experience_log.lock().await;
+                        log.extract_patterns()
+                    };
+                    if !proposed.is_empty() {
+                        tracing::info!("经验学习提取到 {} 个可学习模式", proposed.len());
+                        for rule in proposed {
+                            // 代码修改类规则永远不升级到 L0（安全约束）
+                            let is_code_modification = rule.action.starts_with("hand/")
+                                || rule.action.starts_with("limb/")
+                                || rule.action.starts_with("mouth/");
+                            if is_code_modification {
+                                tracing::info!(
+                                    signal_topic = %rule.signal_topic,
+                                    action = %rule.action,
+                                    success_rate = %rule.success_rate,
+                                    "经验学习：跳过代码修改类规则（安全约束，永远走 LLM）"
+                                );
+                                continue;
+                            }
+                            // 提议为 L1_trial 规则（需经 LLM 确认多次后才能升级）
+                            let reflex_rule = ReflexRule {
+                                id: format!("learned_{}_{}", rule.signal_topic.replace('/', "_"), rule.action.replace('/', "_")),
+                                pattern: format!("(?i){}", regex::escape(&rule.pattern_hint)),
+                                signal_topic: rule.signal_topic.clone(),
+                                level: ReflexLevel::L1Trial,
+                                action: rule.action.clone(),
+                                params: serde_json::json!({
+                                    "source": "experience",
+                                    "success_rate": rule.success_rate,
+                                    "sample_count": rule.sample_count,
+                                }),
+                                source: "experience".into(),
+                                use_count: 0,
+                                success_count: 0,
+                                consecutive_fails: 0,
+                                disabled: false,
+                            };
+                            self.reflex_router.add_rule(reflex_rule);
+                            tracing::info!(
+                                signal_topic = %rule.signal_topic,
+                                action = %rule.action,
+                                success_rate = %rule.success_rate,
+                                sample_count = rule.sample_count,
+                                "经验学习：已提议 L1_trial 规则"
+                            );
+                        }
+                    }
+                }
+                // 配置变更通知：ConfigReloader 重载配置后通知主循环广播到所有 Node
+                notify = async {
+                    match &mut config_notify_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<String>>().await,
+                    }
+                }, if config_monitoring_active => {
+                    match notify {
+                        Some(change_type) => {
+                            Self::broadcast_config_change(&mut transport, &change_type).await;
+                        }
+                        None => {
+                            // 配置重载器已停止，禁用此分支避免 busy-loop
+                            config_monitoring_active = false;
+                            tracing::warn!("配置变更通知通道已关闭，停止配置变更广播");
+                        }
                     }
                 }
             }
@@ -233,10 +485,16 @@ impl Kernel {
         let identity = incoming.identity.clone();
         let src_node = incoming.message.header.src_node.clone();
         let sequence = incoming.message.header.sequence;
-        
+
         // 序列号检查（跳过注册消息）
         if topic != "sys/register" {
-            let node_id: NodeId = src_node.parse().unwrap();
+            let node_id: NodeId = match src_node.parse() {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!("序列号检查：src_node='{}' 无法解析为 NodeId: {}", src_node, e);
+                    return Ok(());
+                }
+            };
             match self.sequence_checker.check(&node_id, sequence) {
                 Ok(crate::message::SequenceCheckResult::InOrder) => {
                     // 正常顺序，继续处理
@@ -269,8 +527,21 @@ impl Kernel {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
                 let node_id_str = payload["node_id"].as_str().unwrap_or("");
                 let node_type_str = payload["node_type"].as_str().unwrap_or("agent");
-                let node_id: NodeId = node_id_str.parse().unwrap();
+                let node_id: NodeId = match node_id_str.parse() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!("sys/register: node_id='{}' 无法解析为 NodeId: {}", node_id_str, e);
+                        return Ok(());
+                    }
+                };
                 let node_type = parse_node_type(node_type_str);
+
+                // ACK：如果消息需要确认，回复 ACK
+                if incoming.message.header.requires_ack {
+                    if let Err(e) = Self::send_ack(&incoming.message, transport).await {
+                        tracing::warn!("发送 ACK 失败：{}", e);
+                    }
+                }
                 
                 // 注册成功，重置序列号检查器
                 self.sequence_checker.reset(&node_id);
@@ -317,8 +588,45 @@ impl Kernel {
                         self.broker.register_publisher(broker::PublisherInfo {
                             node_id: node_id.clone(),
                             pub_addr: pub_addr.clone(),
-                            topics: published_topics,
+                            topics: published_topics.clone(),
                         });
+
+                        // ROS 1 核心：通知已有订阅者，有新 Publisher 上线
+                        // 订阅者收到通知后会建立数据面 SUB 连接到新 Publisher
+                        let interested_subscribers = self.broker.find_subscribers_for_publisher(&published_topics);
+                        if !interested_subscribers.is_empty() {
+                            let change_msg = FrameCodec::new_message(
+                                Topic::sys_publisher_change(),
+                                "kernel",
+                                &serde_json::json!({
+                                    "type": "publisher_change",
+                                    "publishers": [{
+                                        "pattern": published_topics.join(","),
+                                        "publishers": [{
+                                            "node_id": node_id.to_string(),
+                                            "pub_addr": pub_addr,
+                                            "topics": published_topics,
+                                        }],
+                                    }],
+                                }),
+                            )?;
+                            let change_frames: Vec<Bytes> = FrameCodec::encode(&change_msg)?
+                                .into_iter()
+                                .map(Bytes::from)
+                                .collect();
+
+                            for subscriber_id in interested_subscribers {
+                                if subscriber_id == node_id {
+                                    continue; // 不通知自己
+                                }
+                                if let Some(identity) = self.broker.get_identity(&subscriber_id) {
+                                    let identity_bytes = Bytes::from(identity.to_vec());
+                                    if let Err(e) = transport.send_to(identity_bytes, change_frames.clone()).await {
+                                        tracing::warn!("通知订阅者 {} 关于新 Publisher 失败：{}", subscriber_id, e);
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // ROS 1 核心：注册 Service Provider 信息到 Broker
@@ -334,6 +642,9 @@ impl Kernel {
 
                     let latency_ms = now.elapsed().as_millis() as f64;
                     collector.record_success(latency_ms);
+
+                    // ✅ 注册到 AutonomicNervousSystem（心跳监控 + 自动重启）
+                    self.autonomic.register_agent(node_id_str.to_string()).await;
                 }
 
                 // ROS 1 核心：返回 publisher 发现信息给新注册的 Node
@@ -370,17 +681,42 @@ impl Kernel {
             "sys/heartbeat" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
                 let node_id_str = payload["node_id"].as_str().unwrap_or("");
-                let node_id: NodeId = node_id_str.parse().unwrap();
+                let node_id: NodeId = match node_id_str.parse() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!("sys/heartbeat: node_id='{}' 无法解析为 NodeId: {}", node_id_str, e);
+                        return Ok(());
+                    }
+                };
                 self.registry.heartbeat(&node_id);
                 tracing::trace!("心跳：{}", node_id);
+
+                // ✅ 通知 AutonomicNervousSystem 更新心跳（防止误判超时）
+                self.autonomic.record_heartbeat(node_id_str).await;
+
+                // ACK：如果心跳消息需要确认
+                if incoming.message.header.requires_ack {
+                    if let Err(e) = Self::send_ack(&incoming.message, transport).await {
+                        tracing::warn!("发送心跳 ACK 失败：{}", e);
+                    }
+                }
             }
 
             // 系统消息：Node 注销
             "sys/deregister" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
                 let node_id_str = payload["node_id"].as_str().unwrap_or("");
-                let node_id: NodeId = node_id_str.parse().unwrap();
+                let node_id: NodeId = match node_id_str.parse() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!("sys/deregister: node_id='{}' 无法解析为 NodeId: {}", node_id_str, e);
+                        return Ok(());
+                    }
+                };
                 self.deregister_node(&node_id);
+
+                // ✅ 通知 AutonomicNervousSystem 注销该 Agent
+                self.autonomic.unregister_agent(node_id_str).await;
             }
 
             // Agent spawn 请求
@@ -390,8 +726,21 @@ impl Kernel {
                 let model = payload["model"].as_str().map(String::from);
                 let task_desc = payload["task_description"].as_str().unwrap_or("");
 
-                let agent_type: crate::agent::AgentType = agent_type_str.parse().unwrap();
-                let parent_id: NodeId = incoming.message.header.src_node.as_str().parse().unwrap();
+                let agent_type: crate::agent::AgentType = match agent_type_str.parse() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("spawn: agent_type='{}' 无法解析: {}", agent_type_str, e);
+                        return Ok(());
+                    }
+                };
+                let src_node_str = incoming.message.header.src_node.as_str();
+                let parent_id: NodeId = match src_node_str.parse() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!("spawn: src_node='{}' 无法解析为 NodeId: {}", src_node_str, e);
+                        return Ok(());
+                    }
+                };
 
                 match self.request_spawn_subagent(transport, &parent_id, agent_type, model, task_desc.to_string()).await {
                     Ok(new_id) => {
@@ -408,7 +757,14 @@ impl Kernel {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
                 let service_name = payload["service_name"].as_str().unwrap_or("");
                 let rep_addr = payload["rep_addr"].as_str().unwrap_or("");
-                let node_id: NodeId = payload["node_id"].as_str().unwrap_or("").parse().unwrap();
+                let node_id_str = payload["node_id"].as_str().unwrap_or("");
+                let node_id: NodeId = match node_id_str.parse() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!("service/register: node_id='{}' 无法解析为 NodeId: {}", node_id_str, e);
+                        return Ok(());
+                    }
+                };
                 
                 if !service_name.is_empty() && !rep_addr.is_empty() {
                     self.broker.register_service_provider(broker::ServiceProviderInfo {
@@ -487,6 +843,155 @@ impl Kernel {
                     // 控制面消息转发：param/get 响应属于控制面通知（类似 ROS 1 Master 返回参数查询结果），
                     // 不是业务数据，经 Kernel 转发是符合 ROS 架构的
                     self.route_and_forward(&response, transport).await?;
+                }
+            }
+
+            // 反射弧：感官信号 → ReflexRouter → 运动指令
+            // 路线 A：ThinkerNode 内置感官处理后，通过 sensory/* topic 通知 Kernel
+            t if t.starts_with("sensory/") => {
+                // 先正常路由到订阅了此感官 topic 的 Node
+                self.route_and_forward(&incoming.message, transport).await?;
+
+                // 提取 payload 字符串用于反射规则匹配
+                let payload_str = match FrameCodec::decode_payload::<serde_json::Value>(&incoming.message) {
+                    Ok(v) => v.to_string(),
+                    Err(_) => String::new(),
+                };
+
+                // 记录到 ExperienceLog（每次感官信号都记录，供后续提取模式）
+                {
+                    let mut log = self.experience_log.lock().await;
+                    log.record(ExperienceEntry {
+                        timestamp: chrono::Utc::now(),
+                        signal: payload_str.chars().take(200).collect(),
+                        signal_topic: topic.to_string(),
+                        level: ReflexLevel::L0, // 初始记录为 L0，后续根据反射结果更新
+                        action: "sensory_received".to_string(),
+                        result: true,
+                        context: serde_json::json!({"source": "thinker"}),
+                    });
+                }
+
+                // 通过 ReflexRouter 匹配反射规则
+                match self.reflex_router.route(topic, &payload_str) {
+                    Some(reflex_action) => {
+                        match reflex_action {
+                            ReflexAction::Direct { action, params } => {
+                                // L0：直接构造 motor 消息发送
+                                tracing::info!(
+                                    topic = %topic,
+                                    action = %action,
+                                    "反射弧 L0：感官信号 → 直接运动指令"
+                                );
+                                if let Ok(motor_msg) = FrameCodec::new_message(
+                                    Topic::new(&action),
+                                    "kernel",
+                                    &params,
+                                ) {
+                                    let targets = self.broker.find_targets(&motor_msg);
+                                    if !targets.is_empty() {
+                                        let frames: Vec<Bytes> = FrameCodec::encode(&motor_msg)?
+                                            .into_iter()
+                                            .map(Bytes::from)
+                                            .collect();
+                                        for (identity, _node_id) in targets {
+                                            transport.send_to(Bytes::from(identity), frames.clone()).await?;
+                                        }
+                                    }
+                                }
+                            }
+                            ReflexAction::Instinct { action, params } => {
+                                // L1_formal：发送 motor 指令 + 通知 ThinkerNode
+                                tracing::info!(
+                                    topic = %topic,
+                                    action = %action,
+                                    "反射弧 L1_formal：感官信号 → 本能运动指令 + 通知 ThinkerNode"
+                                );
+                                if let Ok(motor_msg) = FrameCodec::new_message(
+                                    Topic::new(&action),
+                                    "kernel",
+                                    &params,
+                                ) {
+                                    let targets = self.broker.find_targets(&motor_msg);
+                                    if !targets.is_empty() {
+                                        let frames: Vec<Bytes> = FrameCodec::encode(&motor_msg)?
+                                            .into_iter()
+                                            .map(Bytes::from)
+                                            .collect();
+                                        for (identity, _node_id) in targets {
+                                            transport.send_to(Bytes::from(identity), frames.clone()).await?;
+                                        }
+                                    }
+                                }
+                                // 通知 ThinkerNode：发送 sensory/summary 到 cortex/{agent_id}/sensory
+                                let summary_msg = FrameCodec::new_message(
+                                    Topic::new("cortex/sensory"),
+                                    "kernel",
+                                    &serde_json::json!({
+                                        "signal_topic": topic,
+                                        "action": action,
+                                        "params": params,
+                                        "level": "L1_formal",
+                                    }),
+                                )?;
+                                self.route_and_forward(&summary_msg, transport).await?;
+                            }
+                            ReflexAction::Trial { action, params } => {
+                                // L1_trial：同 Instinct，但需 ThinkerNode 确认
+                                tracing::info!(
+                                    topic = %topic,
+                                    action = %action,
+                                    "反射弧 L1_trial：感官信号 → 试验运动指令（需 ThinkerNode 确认）"
+                                );
+                                if let Ok(motor_msg) = FrameCodec::new_message(
+                                    Topic::new(&action),
+                                    "kernel",
+                                    &params,
+                                ) {
+                                    let targets = self.broker.find_targets(&motor_msg);
+                                    if !targets.is_empty() {
+                                        let frames: Vec<Bytes> = FrameCodec::encode(&motor_msg)?
+                                            .into_iter()
+                                            .map(Bytes::from)
+                                            .collect();
+                                        for (identity, _node_id) in targets {
+                                            transport.send_to(Bytes::from(identity), frames.clone()).await?;
+                                        }
+                                    }
+                                }
+                                // 通知 ThinkerNode：发送 sensory/summary（标记需确认）
+                                let summary_msg = FrameCodec::new_message(
+                                    Topic::new("cortex/sensory"),
+                                    "kernel",
+                                    &serde_json::json!({
+                                        "signal_topic": topic,
+                                        "action": action,
+                                        "params": params,
+                                        "level": "L1_trial",
+                                        "needs_confirmation": true,
+                                    }),
+                                )?;
+                                self.route_and_forward(&summary_msg, transport).await?;
+                            }
+                        }
+                    }
+                    None => {
+                        // 无匹配反射规则 → 升级到 L2，转发给 ThinkerNode
+                        tracing::debug!(
+                            topic = %topic,
+                            "无匹配反射规则，升级到 L2（转发给 ThinkerNode）"
+                        );
+                        let l2_msg = FrameCodec::new_message(
+                            Topic::new("cortex/sensory"),
+                            "kernel",
+                            &serde_json::json!({
+                                "signal_topic": topic,
+                                "payload": payload_str,
+                                "level": "L2",
+                            }),
+                        )?;
+                        self.route_and_forward(&l2_msg, transport).await?;
+                    }
                 }
             }
 
@@ -635,6 +1140,10 @@ impl Kernel {
     }
 
     /// 请求 spawn 子 Agent
+    ///
+    /// 创建 SubAgentNode 并在独立 tokio task 中启动。
+    /// SubAgentNode 启动后会自动连接消息总线、注册、订阅 subagent/{id}/task。
+    /// 父 Agent 收到返回的 new_id 后，向 subagent/{new_id}/task 发送任务即可。
     async fn request_spawn_subagent(
         &mut self,
         transport: &mut KernelTransport,
@@ -658,7 +1167,58 @@ impl Kernel {
             new_id, parent_id, agent_type, model
         );
 
-        // 广播 spawn 事件
+        // 构造子代理定义
+        let definition = crate::agent::subagent::SubAgentDefinition {
+            agent_type,
+            model: model.clone(),
+            task_description: task_description.clone(),
+            max_turns: 20,
+            allowed_tools: Vec::new(),
+        };
+
+        // 构造 AgentConfig（子代理默认非交互、不可再 spawn 子代理）
+        // 从共享配置读取 default_model 和 permission_mode（支持热更新）
+        let (default_model, permission_mode) = if let Some(c) = &self.ccode_config {
+            let guard = c.read().await;
+            (guard.default_model.clone(), guard.permission_mode)
+        } else {
+            (String::new(), crate::node::PermissionMode::Trust)
+        };
+        let agent_config = crate::agent::AgentConfig {
+            agent_type,
+            model: model.clone().unwrap_or_else(|| default_model),
+            permission_mode,
+            max_turns: Some(definition.max_turns),
+            subagents_enabled: false,
+            non_interactive: true,
+            tools: Vec::new(),
+        };
+
+        // 创建 SubAgentNode
+        let subagent = crate::agent::subagent::SubAgentNode::new(
+            new_id.clone(),
+            parent_id.clone(),
+            agent_config,
+            definition,
+        );
+
+        // 创建 NodeContext（独立 PUB 地址，避免冲突）
+        let ctx = NodeContext {
+            router_addr: self.config.router_addr.clone(),
+            pub_addr: self.config.pub_addr.clone(),
+            data_pub_addr: format!("ipc:///tmp/ccode-pub-{}", new_id),
+            data_rep_addr: None,
+        };
+
+        // 在独立 tokio task 中启动 SubAgentNode
+        let sub_id = new_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::node::transport::run_node(subagent, ctx).await {
+                tracing::error!("子 Agent {} 异常退出：{}", sub_id, e);
+            }
+        });
+
+        // 广播 spawn 事件（通知其他 Node 有新子代理上线）
         let spawn_msg = FrameCodec::new_message(
             Topic::sys_spawn(),
             "kernel",
@@ -696,6 +1256,64 @@ impl Kernel {
                 }
             }
         }
+    }
+
+    /// 广播配置变更通知到所有 Node
+    ///
+    /// ConfigReloader 重载配置后，通过此方法广播 sys/config_change 消息，
+    /// 通知所有 Node 配置已更新，Node 可按需重新加载本地配置。
+    async fn broadcast_config_change(transport: &mut KernelTransport, change_type: &str) {
+        tracing::info!(change_type = %change_type, "广播配置变更通知");
+        match FrameCodec::new_message(
+            Topic::new("sys/config_change"),
+            "kernel",
+            &serde_json::json!({ "type": change_type }),
+        ) {
+            Ok(msg) => {
+                match FrameCodec::encode(&msg) {
+                    Ok(frames) => {
+                        let bytes_frames: Vec<Bytes> = frames.into_iter().map(Bytes::from).collect();
+                        if let Err(e) = transport.broadcast(bytes_frames).await {
+                            tracing::warn!(change_type = %change_type, error = %e, "广播配置变更失败");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(change_type = %change_type, error = %e, "编码配置变更消息失败");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(change_type = %change_type, error = %e, "构造配置变更消息失败");
+            }
+        }
+    }
+
+    /// 发送 ACK 确认消息
+    ///
+    /// 对 requires_ack=true 的消息，回复 ACK 以确认收到。
+    /// ACK 消息包含原始消息的 msg_id，用于关联。
+    async fn send_ack(
+        original_msg: &Message,
+        transport: &mut KernelTransport,
+    ) -> Result<()> {
+        let ack_msg = FrameCodec::new_reply(
+            Topic::sys_ack(),
+            "kernel",
+            original_msg.header.msg_id.clone(),
+            &serde_json::json!({
+                "ack_for": original_msg.header.msg_id,
+                "topic": original_msg.topic.as_str(),
+                "status": "received",
+            }),
+        )?;
+        let frames: Vec<Bytes> = FrameCodec::encode(&ack_msg)?
+            .into_iter()
+            .map(Bytes::from)
+            .collect();
+
+        // ACK 通过 PUB socket 广播（订阅者都能收到）
+        transport.broadcast(frames).await?;
+        Ok(())
     }
 
     /// 广播全局关闭信号
@@ -737,6 +1355,15 @@ fn parse_node_type(s: &str) -> NodeType {
         "state" => NodeType::State,
         "tui" => NodeType::TUI,
         "plugin" => NodeType::Plugin,
+        // 仿生器官
+        "eye" => NodeType::Eye,
+        "ear" => NodeType::Ear,
+        "nose" => NodeType::Nose,
+        "skin" => NodeType::Skin,
+        "mouth" => NodeType::Mouth,
+        "hand" => NodeType::Hand,
+        "limb" => NodeType::Limb,
+        "thinker" => NodeType::Thinker,
         _ => NodeType::Plugin,
     }
 }

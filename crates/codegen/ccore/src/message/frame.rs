@@ -32,6 +32,9 @@ pub struct MessageHeader {
     /// 序列号（用于顺序检查，每个 Node 独立递增）
     #[serde(default)]
     pub sequence: u64,
+    /// 是否需要 ACK 确认（用于关键控制面消息）
+    #[serde(default)]
+    pub requires_ack: bool,
 }
 
 /// 消息帧编解码器
@@ -60,6 +63,7 @@ impl FrameCodec {
             src_node: src_node.into(),
             reply_to: None,
             sequence,
+            requires_ack: false,
         };
         let payload = rmp_serde::to_vec(payload)?;
         Ok(Message { topic, header, payload })
@@ -89,6 +93,7 @@ impl FrameCodec {
             src_node: src_node.into(),
             reply_to: Some(reply_to_msg_id.into()),
             sequence,
+            requires_ack: false,
         };
         let payload = rmp_serde::to_vec(payload)?;
         Ok(Message { topic, header, payload })

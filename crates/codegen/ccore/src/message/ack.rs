@@ -193,6 +193,7 @@ pub fn create_ack_message(original_msg_id: &str, src_node: &str) -> Message {
             src_node: src_node.to_string(),
             reply_to: Some(original_msg_id.to_string()),
             sequence: 0,
+            requires_ack: false,
         },
         payload: serde_json::to_vec(&serde_json::json!({
             "original_msg_id": original_msg_id,
@@ -259,6 +260,7 @@ mod tests {
                 src_node: "test-node".to_string(),
                 reply_to: None,
                 sequence: 1,
+                requires_ack: false,
             },
             payload: vec![],
         };

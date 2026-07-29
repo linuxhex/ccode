@@ -70,7 +70,7 @@ pub extern "C" fn ccore_stop() {
 /// 调用者负责释放返回的字符串
 #[no_mangle]
 pub extern "C" fn ccore_version() -> *mut c_char {
-    let version = CString::new(env!("CARGO_PKG_VERSION")).unwrap();
+    let version = CString::new(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION 不应包含 NUL 字节");
     version.into_raw()
 }
 

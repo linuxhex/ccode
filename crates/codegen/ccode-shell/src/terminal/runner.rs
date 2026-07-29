@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent_client_protocol as acp;
-use ccode_pathss::AbsPathBuf;
+use ccode_paths::AbsPathBuf;
 
 #[derive(thiserror::Error, Debug)]
 pub enum TerminalError {
