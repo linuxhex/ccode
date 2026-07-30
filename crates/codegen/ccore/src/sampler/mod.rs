@@ -7,6 +7,8 @@ pub mod deepseek_compat;
 pub mod router;
 pub mod pool;
 pub mod retry;
+pub mod token_budget;
+pub mod cache_break;
 
 pub use provider::{Provider, SampleRequest, StreamChunk, SampleResponse, TokenUsage, ChatMessage, ToolDefinition as SamplerToolDefinition, ToolChoice, SamplerEvent, CancellationHandle, ContentBlock};
 pub use router::ProviderRouter;

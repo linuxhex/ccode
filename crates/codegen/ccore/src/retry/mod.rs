@@ -6,6 +6,7 @@
 
 pub mod backoff;
 pub mod llm_retry;
+pub mod circuit_breaker;
 
 pub use backoff::{RetryPolicy, retry_with_backoff};
 pub use llm_retry::retry_llm_call;

@@ -65,6 +65,8 @@ use crate::message::Message;
 use crate::message::SequenceChecker;
 use crate::message::param::ParamServer;
 use crate::node::{NodeId, NodeType, NodeContext};
+use crate::sampler::token_budget::TokenBudgetManager;
+use crate::retry::circuit_breaker::CircuitBreaker;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Mutex};
 
@@ -150,6 +152,10 @@ pub struct Kernel {
     coordinator: DecentralizedCoordinator,
     /// 元认知控制器（MAP/LAF）
     meta_cognitive: MetaCognitiveController,
+    /// Token 预算管理器（借鉴 Claude Code tokenBudget.ts）
+    token_budget: Arc<std::sync::Mutex<TokenBudgetManager>>,
+    /// 熔断器（借鉴 Claude Code withRetry.ts）
+    circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl Kernel {
@@ -208,6 +214,8 @@ impl Kernel {
             erl: ExperientialReflectiveLearner::new(100),
             coordinator: DecentralizedCoordinator::new(50),
             meta_cognitive: MetaCognitiveController::new(),
+            token_budget: Arc::new(std::sync::Mutex::new(TokenBudgetManager::new("claude-3.5-sonnet"))),
+            circuit_breaker: Arc::new(CircuitBreaker::new(crate::retry::circuit_breaker::CircuitBreakerConfig::default())),
         }
     }
 
@@ -237,6 +245,16 @@ impl Kernel {
     /// 获取元认知控制器
     pub fn meta_cognitive(&self) -> &MetaCognitiveController {
         &self.meta_cognitive
+    }
+
+    /// 获取 Token 预算管理器
+    pub fn token_budget(&self) -> &Arc<std::sync::Mutex<TokenBudgetManager>> {
+        &self.token_budget
+    }
+
+    /// 获取熔断器
+    pub fn circuit_breaker(&self) -> &Arc<CircuitBreaker> {
+        &self.circuit_breaker
     }
 
     /// 获取 NodeContext 供子 Node 连接

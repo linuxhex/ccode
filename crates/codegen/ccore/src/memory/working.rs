@@ -65,6 +65,10 @@ pub struct CompactionPolicy {
     pub memory_flush_enabled: bool,
     /// 压缩挂钟时间预算（秒）
     pub wall_clock_budget_secs: u64,
+    /// 部分压缩时保留最近N轮对话（Claude Code: partial compaction）
+    pub keep_recent_turns: usize,
+    /// 压缩失败后是否回退到更小的预算重试
+    pub fallback_on_failure: bool,
 }
 
 impl Default for CompactionPolicy {
@@ -74,7 +78,19 @@ impl Default for CompactionPolicy {
             compact_model: None,
             memory_flush_enabled: false,
             wall_clock_budget_secs: 300,
+            keep_recent_turns: 4,
+            fallback_on_failure: true,
         }
+    }
+}
+
+impl CompactionPolicy {
+    /// 自动压缩触发条件（借鉴 Claude Code autoCompact.ts）
+    ///
+    /// 当token使用量超过80%上下文窗口时自动触发
+    pub fn should_auto_compact(&self, token_usage_ratio: f64) -> bool {
+        let threshold = self.auto_compact_threshold_percent as f64 / 100.0;
+        token_usage_ratio >= threshold
     }
 }
 
@@ -586,6 +602,81 @@ impl WorkingMemory {
         let joined = contents.join(" → ");
         let truncated: String = joined.chars().take(200).collect();
         format!("[对话摘要] {}", truncated)
+    }
+
+    /// 部分压缩（借鉴 Claude Code partial compaction）
+    ///
+    /// 只压缩旧消息，保留最近N轮对话完整
+    pub fn partial_compact(&mut self, keep_recent_turns: usize) -> CompactionResult {
+        let tokens_before = self.used_tokens();
+        let turns = self.group_by_turns();
+        let total_turns = turns.len();
+
+        if total_turns <= keep_recent_turns {
+            return CompactionResult {
+                tokens_before,
+                tokens_after: tokens_before,
+                entries_compacted: 0,
+                compacted_range: (0, 0),
+            };
+        }
+
+        let keep_from = total_turns - keep_recent_turns;
+        let mut compacted_start = self.entries.len();
+        let mut compacted_end = 0;
+        let mut entries_compacted = 0usize;
+
+        // 先降级已有的 Warm→Cold
+        for entry in &mut self.entries {
+            if let WorkingEntry::Warm {
+                summary,
+                token_count,
+                source_range,
+            } = entry
+            {
+                let placeholder = format!("[冷缓存] {}", &summary[..summary.len().min(40)]);
+                let cold_tokens = (*token_count / 4).max(1);
+                *entry = WorkingEntry::Cold {
+                    placeholder,
+                    source_range: *source_range,
+                    token_count: cold_tokens,
+                };
+            }
+        }
+
+        // 压缩旧轮次（从后往前避免索引偏移）
+        for &turn_start in turns[..keep_from].iter().rev() {
+            let turn_end = turns.iter().find(|&&t| t > turn_start).copied().unwrap_or(self.entries.len());
+            if turn_start >= turn_end {
+                continue;
+            }
+
+            let turn_entries: Vec<&WorkingEntry> = self.entries[turn_start..turn_end].iter().collect();
+            let summary = self.summarize_turn(&turn_entries);
+
+            // 移除原条目
+            let drained: Vec<WorkingEntry> = self.entries.drain(turn_start..turn_end).collect();
+            entries_compacted += drained.len();
+            compacted_start = compacted_start.min(turn_start);
+            compacted_end = compacted_end.max(turn_end.min(self.entries.len() + drained.len()));
+
+            // 插入摘要条目
+            let summary_tokens = (summary.len() as u32 / 4).max(1);
+            self.entries.insert(turn_start, WorkingEntry::Warm {
+                summary,
+                token_count: summary_tokens,
+                source_range: (turn_start, turn_start),
+            });
+        }
+
+        let tokens_after = self.used_tokens();
+
+        CompactionResult {
+            tokens_before,
+            tokens_after,
+            entries_compacted,
+            compacted_range: (compacted_start, compacted_end),
+        }
     }
 
     /// 添加 embedding 向量到索引
