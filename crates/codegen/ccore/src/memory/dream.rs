@@ -47,6 +47,10 @@ impl Drop for DreamLock {
             "lock released"
         );
         let _ = std::fs::remove_file(&self.path);
+        #[cfg(debug_assertions)]
+        {
+            crate::kernel::lock_order::checker::pop_held("DreamLock");
+        }
     }
 }
 
@@ -75,6 +79,12 @@ impl DreamOrganizer {
     /// 否则写入当前进程 PID 并返回 DreamLock（RAII 释放）。
     pub async fn try_acquire_lock(&self, lock_dir: &Path) -> anyhow::Result<Option<DreamLock>> {
         let lock_path = lock_dir.join("dream.lock");
+
+        #[cfg(debug_assertions)]
+        {
+            crate::kernel::lock_order::checker::push_held("DreamLock");
+            crate::kernel::lock_order::checker::check_order("DreamLock");
+        }
 
         if lock_path.exists() {
             // 检查持有锁的进程是否仍活跃
@@ -295,6 +305,125 @@ Output a single consolidated markdown section:"#,
         // 获取锁成功，执行整理
         tracing::info!("DreamLock 已获取，开始整理");
         self.organize(short_term, long_term).await
+    }
+
+    /// 带锁执行 Dream 整理并同时编码到情景记忆（EpisodicMemoryStore）
+    ///
+    /// 在整理冷条目到 L2 长期记忆的同时，将内容编码到 EpisodicMemoryStore 的知识网络中，
+    /// 建立 Zettelkasten 双向链接，支持后续的情景上下文重建。
+    pub async fn run_with_episodic(
+        &self,
+        lock_dir: &Path,
+        short_term: &mut ShortTermMemory,
+        long_term: &LongTermMemory,
+        episodic: &super::episodic::EpisodicMemoryStore,
+        session_id: &str,
+    ) -> anyhow::Result<DreamResult> {
+        // 自动触发检测
+        if !self.should_auto_trigger(short_term) {
+            return Ok(DreamResult {
+                consolidated: 0,
+                removed_from_l1: 0,
+            });
+        }
+
+        // 尝试获取 DreamLock
+        let _lock = match self.try_acquire_lock(lock_dir).await? {
+            Some(lock) => lock,
+            None => {
+                tracing::info!("Dream 整理锁被占用，跳过本轮整理");
+                return Ok(DreamResult {
+                    consolidated: 0,
+                    removed_from_l1: 0,
+                });
+            }
+        };
+
+        // 获取锁成功，执行整理
+        tracing::info!("DreamLock 已获取，开始整理（含情景记忆编码）");
+        self.organize_with_episodic(short_term, long_term, episodic, session_id).await
+    }
+
+    /// 带情景记忆编码的整理逻辑
+    async fn organize_with_episodic(
+        &self,
+        short_term: &mut ShortTermMemory,
+        long_term: &LongTermMemory,
+        episodic: &super::episodic::EpisodicMemoryStore,
+        session_id: &str,
+    ) -> anyhow::Result<DreamResult> {
+        let current_turn = short_term.current_turn();
+        let all_entries = short_term.all_entries();
+
+        tracing::info!(
+            target: "ccore::dream",
+            entries = all_entries.len(),
+            "dream organizing with episodic encoding started"
+        );
+
+        // 计算每条条目的简化热度，筛选冷条目
+        let cold_ids: Vec<String> = all_entries
+            .iter()
+            .filter(|entry| {
+                let heat = self.compute_simple_heat(entry, current_turn);
+                heat < self.config.heat_threshold
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
+
+        // 冷条目数量不足，不触发整理
+        if cold_ids.len() < self.config.min_cold_entries {
+            return Ok(DreamResult {
+                consolidated: 0,
+                removed_from_l1: 0,
+            });
+        }
+
+        // 构建 HashSet 用于 O(1) 查找
+        let cold_id_set: HashSet<String> = cold_ids.iter().cloned().collect();
+
+        // 将冷条目转化为知识条目存入 L2 + 编码到情景记忆
+        let mut consolidated = 0usize;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        for entry in all_entries.iter() {
+            if !cold_id_set.contains(&entry.id) {
+                continue;
+            }
+
+            let knowledge = KnowledgeEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                category: Self::infer_category(&entry.role, &entry.content),
+                content: entry.content.clone(),
+                embedding: entry.embedding.clone(),
+                metadata: serde_json::json!({
+                    "source_id": entry.id,
+                    "source_turn": entry.turn,
+                    "source_role": entry.role,
+                    "recall_count": entry.recall_count,
+                }),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+
+            // 同时存储到 L2 和情景记忆网络
+            long_term.store_with_episodic(knowledge, episodic, session_id).await?;
+            consolidated += 1;
+        }
+
+        // 从 L1 中移除已整理的冷条目
+        let removed = short_term.remove_entries(&cold_ids);
+
+        tracing::info!(
+            target: "ccore::dream",
+            entries = consolidated,
+            "dream organizing with episodic encoding completed"
+        );
+
+        Ok(DreamResult {
+            consolidated,
+            removed_from_l1: removed,
+        })
     }
 
     /// 计算简化热度（不依赖完整 HeatInput，基于 recency + activity）

@@ -55,6 +55,10 @@ use crate::kernel::experience::{ExperienceLog, ExperienceEntry};
 use crate::kernel::transport::{IncomingMessage, KernelTransport};
 use crate::kernel::backpressure::{BackpressureController, BackpressureConfig};
 use crate::kernel::metrics::{MonitoringService, HealthCheckConfig};
+use crate::memory::episodic::EpisodicMemoryStore;
+use crate::agent::experiential::ExperientialReflectiveLearner;
+use crate::agent::decentralized::DecentralizedCoordinator;
+use crate::agent::meta_cognitive::MetaCognitiveController;
 use crate::message::frame::FrameCodec;
 use crate::message::Topic;
 use crate::message::Message;
@@ -138,6 +142,14 @@ pub struct Kernel {
     config_watcher: Option<ConfigWatcher>,
     /// 配置变更事件接收端（由 ConfigWatcher 创建，在 run() 中消费）
     config_event_rx: Option<mpsc::Receiver<crate::config::watcher::ConfigChangeEvent>>,
+    /// 情景记忆存储（Zettelkasten知识网络）
+    episodic_memory: EpisodicMemoryStore,
+    /// 经验反思学习引擎（ERL/MAR）
+    erl: ExperientialReflectiveLearner,
+    /// 去中心化DAG协调器（AgentNet/Symphony）
+    coordinator: DecentralizedCoordinator,
+    /// 元认知控制器（MAP/LAF）
+    meta_cognitive: MetaCognitiveController,
 }
 
 impl Kernel {
@@ -192,6 +204,10 @@ impl Kernel {
             self_healing: None, // 向后兼容保留，已由 autonomic 接管
             config_watcher,
             config_event_rx,
+            episodic_memory: EpisodicMemoryStore::new(),
+            erl: ExperientialReflectiveLearner::new(100),
+            coordinator: DecentralizedCoordinator::new(50),
+            meta_cognitive: MetaCognitiveController::new(),
         }
     }
 
@@ -201,6 +217,26 @@ impl Kernel {
     /// 配置热更新后 Kernel 也能读到最新配置。
     pub fn set_ccode_config(&mut self, config: CcodeConfig) {
         self.ccode_config = Some(Arc::new(RwLock::new(config)));
+    }
+
+    /// 获取情景记忆存储
+    pub fn episodic_memory(&self) -> &EpisodicMemoryStore {
+        &self.episodic_memory
+    }
+
+    /// 获取经验反思学习引擎
+    pub fn erl(&self) -> &ExperientialReflectiveLearner {
+        &self.erl
+    }
+
+    /// 获取去中心化DAG协调器
+    pub fn coordinator(&self) -> &DecentralizedCoordinator {
+        &self.coordinator
+    }
+
+    /// 获取元认知控制器
+    pub fn meta_cognitive(&self) -> &MetaCognitiveController {
+        &self.meta_cognitive
     }
 
     /// 获取 NodeContext 供子 Node 连接

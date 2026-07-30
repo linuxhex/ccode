@@ -1,7 +1,10 @@
 //! Doom Loop 检测 - 检测 Agent 是否陷入重复循环
 //!
-//! 检测到循环后，不仅给出判定，还会生成一组“逃脱动作”供 Agent 节点执行，
+//! 检测到循环后，不仅给出判定，还会生成一组"逃脱动作"供 Agent 节点执行，
 //! 帮助 Agent 跳出重复执行：注入换策略提示、临时禁用重复工具、降级模型推理强度。
+//!
+//! 与 MetaCognitiveController 的集成：当检测到 doom loop 时，
+//! 推荐策略变更为 ReflectiveExecution，帮助 Agent 跳出循环。
 
 use std::collections::{HashMap, VecDeque};
 use serde::{Deserialize, Serialize};
@@ -115,6 +118,19 @@ impl DoomLoopDetector {
                 if self.model_degrade_level < 3 {
                     escape_actions.push(EscapeAction::DegradeModel);
                 }
+
+                // 4. 元认知策略建议：推荐切换到反思式执行策略
+                //    当检测到 doom loop 时，推荐使用 ReflectiveExecution 策略
+                //    帮助 Agent 跳出循环
+                use super::meta_cognitive::{DifficultyLevel, ExecutionStrategy};
+                let current_difficulty = DifficultyLevel::Complex;
+                let new_strategy = ExecutionStrategy::ReflectiveExecution;
+                tracing::info!(
+                    target: "ccore::loop",
+                    strategy = ?new_strategy,
+                    difficulty = ?current_difficulty,
+                    "recommending strategy change to escape doom loop"
+                );
 
                 return DoomLoopResult {
                     detected: true,

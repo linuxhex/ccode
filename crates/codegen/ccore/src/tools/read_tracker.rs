@@ -27,14 +27,33 @@ impl ReadTracker {
     /// 记录文件已被读取
     pub fn mark_read(&self, path: &str) {
         if let Ok(mut files) = self.read_files.lock() {
+            #[cfg(debug_assertions)]
+            {
+                crate::kernel::lock_order::checker::push_held("READ_TRACKER");
+                crate::kernel::lock_order::checker::check_order("READ_TRACKER");
+            }
             files.insert(path.to_string());
+            #[cfg(debug_assertions)]
+            {
+                crate::kernel::lock_order::checker::pop_held("READ_TRACKER");
+            }
         }
     }
 
     /// 检查文件是否已被读取
     pub fn has_been_read(&self, path: &str) -> bool {
         if let Ok(files) = self.read_files.lock() {
-            files.contains(path)
+            #[cfg(debug_assertions)]
+            {
+                crate::kernel::lock_order::checker::push_held("READ_TRACKER");
+                crate::kernel::lock_order::checker::check_order("READ_TRACKER");
+            }
+            let result = files.contains(path);
+            #[cfg(debug_assertions)]
+            {
+                crate::kernel::lock_order::checker::pop_held("READ_TRACKER");
+            }
+            result
         } else {
             false
         }

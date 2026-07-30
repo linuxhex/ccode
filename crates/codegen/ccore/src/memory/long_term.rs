@@ -108,6 +108,58 @@ impl LongTermMemory {
         Ok(entry.id.clone())
     }
 
+    /// 存储知识条目并同时编码到情景记忆（EpisodicMemoryStore）
+    ///
+    /// 在 L2 长期记忆存储的同时，将内容编码到 EpisodicMemoryStore 的知识网络中，
+    /// 建立 Zettelkasten 双向链接，支持后续的情景上下文重建。
+    pub async fn store_with_episodic(
+        &self,
+        entry: KnowledgeEntry,
+        episodic: &super::episodic::EpisodicMemoryStore,
+        session_id: &str,
+    ) -> anyhow::Result<String> {
+        // 先存储到 L2 长期记忆
+        let id = self.store(entry.clone()).await?;
+
+        // 同时编码到情景记忆网络
+        use super::episodic::{MemoryType, MemorySource};
+
+        let memory_type = match entry.category {
+            KnowledgeCategory::Architecture | KnowledgeCategory::CodePattern => MemoryType::Semantic,
+            KnowledgeCategory::ErrorFix => MemoryType::Episodic,
+            KnowledgeCategory::Decision | KnowledgeCategory::UserPreference => MemoryType::Procedural,
+        };
+
+        let keywords = tokenize(&entry.content)
+            .into_iter()
+            .take(5)
+            .collect();
+
+        let source = MemorySource {
+            session_id: session_id.to_string(),
+            timestamp: chrono::Utc::now().timestamp(),
+            message_index: None,
+            confidence: 0.8,
+        };
+
+        episodic.encode(
+            memory_type,
+            &entry.content,
+            &format!("L2知识: {:?}", entry.category),
+            keywords,
+            source,
+        );
+
+        tracing::debug!(
+            target: "ccore::memory",
+            id = %id,
+            category = ?entry.category,
+            "knowledge stored to L2 + episodic memory"
+        );
+
+        Ok(id)
+    }
+
     /// 加载所有知识条目
     async fn load_all(&self) -> anyhow::Result<Vec<KnowledgeEntry>> {
         self.ensure_dir().await?;

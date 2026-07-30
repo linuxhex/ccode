@@ -67,6 +67,12 @@ impl ConnectionPool {
             .map_err(|_| anyhow::anyhow!("ConnectionPool semaphore 已关闭"))?;
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
+        #[cfg(debug_assertions)]
+        {
+            crate::kernel::lock_order::checker::push_held("ConnectionPool");
+            crate::kernel::lock_order::checker::check_order("ConnectionPool");
+        }
+
         // 记录连接活跃时间
         let conn_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) as usize;
         {
@@ -143,6 +149,10 @@ impl<'a> Drop for ConnectionGuard<'a> {
         // 使用 try_lock 避免死锁，失败时静默跳过（记录会在 cleanup_idle 中清理）
         if let Ok(mut active) = self.pool.active_connections.try_lock() {
             active.remove(&self.conn_id);
+        }
+        #[cfg(debug_assertions)]
+        {
+            crate::kernel::lock_order::checker::pop_held("ConnectionPool");
         }
     }
 }
@@ -319,6 +329,112 @@ impl RetryPolicy {
 
         Err(last_error.expect("所有重试均失败但没有捕获到错误"))
     }
+
+    /// 使用 classify_sampler_error 进行错误分类的重试执行
+    ///
+    /// 在每次重试前，通过 classify_sampler_error 判断错误是否可重试，
+    /// 对于不可重试的错误（如认证错误、上下文溢出等）立即中止。
+    pub async fn execute_with_classification<F, T>(
+        &self,
+        mut f: F,
+        retry_count: u32,
+        max_retries: u32,
+    ) -> anyhow::Result<T>
+    where
+        F: FnMut() -> std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send>> + Send,
+    {
+        let mut current_retry = retry_count;
+
+        loop {
+            match f().await {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    let error_msg = error.to_string();
+                    let status_code = extract_status_code(&error_msg);
+                    let decision = super::retry::classify_sampler_error(
+                        &error_msg,
+                        status_code,
+                        current_retry,
+                        max_retries,
+                    );
+
+                    match decision {
+                        super::retry::RetryDecision::Fatal(msg) => {
+                            tracing::warn!(
+                                target: "ccore::retry",
+                                "non-retryable error, aborting: {}", msg
+                            );
+                            return Err(error);
+                        }
+                        super::retry::RetryDecision::Retry { backoff } => {
+                            current_retry += 1;
+                            if current_retry >= max_retries {
+                                tracing::error!(
+                                    target: "ccore::retry",
+                                    attempts = current_retry,
+                                    "retry exhausted"
+                                );
+                                return Err(error);
+                            }
+                            tracing::info!(
+                                target: "ccore::retry",
+                                attempt = current_retry,
+                                max = max_retries,
+                                backoff_ms = backoff.as_millis() as u64,
+                                "retrying after classified error"
+                            );
+                            sleep(backoff).await;
+                        }
+                        super::retry::RetryDecision::RetryWithBackoff { backoff, .. } => {
+                            current_retry += 1;
+                            if current_retry >= max_retries {
+                                return Err(error);
+                            }
+                            tracing::info!(
+                                target: "ccore::retry",
+                                attempt = current_retry,
+                                max = max_retries,
+                                backoff_ms = backoff.as_millis() as u64,
+                                "retrying after rate limit"
+                            );
+                            sleep(backoff).await;
+                        }
+                        super::retry::RetryDecision::RetryImmediate { backoff } => {
+                            current_retry += 1;
+                            if current_retry >= max_retries {
+                                return Err(error);
+                            }
+                            tracing::info!(
+                                target: "ccore::retry",
+                                attempt = current_retry,
+                                backoff_ms = backoff.as_millis() as u64,
+                                "retrying immediately (doom loop)"
+                            );
+                            sleep(backoff).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 从错误消息中提取HTTP状态码
+fn extract_status_code(error_msg: &str) -> Option<u16> {
+    // 尝试从常见的错误消息模式中提取状态码
+    if let Some(captures) = regex::Regex::new(r"(\d{3})")
+        .ok()
+        .and_then(|re| re.captures(error_msg))
+    {
+        if let Some(m) = captures.get(1) {
+            if let Ok(code) = m.as_str().parse::<u16>() {
+                if (400..600).contains(&code) {
+                    return Some(code);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 健康检查器

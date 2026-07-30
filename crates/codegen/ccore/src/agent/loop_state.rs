@@ -2,11 +2,15 @@
 //!
 //! 将主循环从隐式 `loop {}` 升级为显式状态机驱动，使状态变迁可观测、可中断、可恢复。
 //! 使用 ccore 已有的 AgentState 枚举表示当前阶段，并集成 DoomLoopDetector 的检测结果。
+//!
+//! 与 ExperientialReflectiveLearner 的集成：当循环结束时（成功或失败），
+//! 从状态机中提取 TaskTrajectory，供 ERL 提取 heuristics 使用。
 
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use super::doom_loop::DoomLoopResult;
+use super::experiential::{TaskTrajectory, TrajectoryStep};
 
 /// 循环结束原因
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +144,9 @@ const AUTO_COMPACT_THRESHOLD_RATIO: f64 = 0.8;
 /// 使用 ccore 已有的 AgentState 表示当前阶段，
 /// 追踪 turn_count / tokens_used / consecutive_failures / created_at，
 /// 并在状态变迁时输出 LoopAction 指导主循环执行。
+///
+/// 集成 ExperientialReflectiveLearner：在循环执行过程中收集步骤轨迹，
+/// 循环结束时可通过 extract_trajectory() 提取 TaskTrajectory 供 ERL 使用。
 pub struct LoopStateMachine {
     /// 当前状态
     state: super::AgentState,
@@ -153,6 +160,10 @@ pub struct LoopStateMachine {
     consecutive_failures: usize,
     /// 创建时间
     created_at: Instant,
+    /// 收集的步骤轨迹（供 ERL 提取 heuristics）
+    collected_steps: Vec<TrajectoryStep>,
+    /// 任务描述（用于 ERL trajectory）
+    task_description: Option<String>,
 }
 
 impl LoopStateMachine {
@@ -165,6 +176,41 @@ impl LoopStateMachine {
             tokens_used: 0,
             consecutive_failures: 0,
             created_at: Instant::now(),
+            collected_steps: Vec::new(),
+            task_description: None,
+        }
+    }
+
+    /// 设置任务描述（用于 ERL trajectory 提取）
+    pub fn set_task_description(&mut self, desc: String) {
+        self.task_description = Some(desc);
+    }
+
+    /// 记录步骤到轨迹（供 ERL 提取 heuristics）
+    pub fn record_step(&mut self, step_type: &str, content: &str) {
+        self.collected_steps.push(TrajectoryStep {
+            step_type: step_type.to_string(),
+            content: content.to_string(),
+        });
+    }
+
+    /// 从状态机提取 TaskTrajectory（供 ERL 提取 heuristics）
+    ///
+    /// 在循环结束时调用，将收集的步骤转换为 TaskTrajectory，
+    /// 供 ExperientialReflectiveLearner::extract_heuristics() 使用。
+    pub fn extract_trajectory(&self) -> TaskTrajectory {
+        let success = matches!(self.done_reason, Some(DoneReason::ModelEndTurn));
+        let failure_reason = if success {
+            None
+        } else {
+            self.done_reason.as_ref().map(|r| format!("{:?}", r))
+        };
+
+        TaskTrajectory {
+            task: self.task_description.clone().unwrap_or_default(),
+            steps: self.collected_steps.clone(),
+            success,
+            failure_reason,
         }
     }
 
@@ -490,6 +536,8 @@ impl LoopStateMachine {
         self.tokens_used = 0;
         self.consecutive_failures = 0;
         self.created_at = Instant::now();
+        self.collected_steps.clear();
+        self.task_description = None;
     }
 }
 

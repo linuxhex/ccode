@@ -379,6 +379,9 @@ pub struct PromptContext {
     /// 模板渲染器（动态工具名注入）
     #[serde(skip)]
     pub template_renderer: TemplateRenderer,
+    /// 自定义注入段落（heuristics、difficulty等运行时动态内容）
+    #[serde(skip)]
+    pub custom_sections: Vec<String>,
 }
 
 impl Clone for PromptContext {
@@ -397,6 +400,7 @@ impl Clone for PromptContext {
             active_personas: self.active_personas.clone(),
             renderer: None, // Renderer 不参与 Clone，设为 None
             template_renderer: TemplateRenderer::new(), // 重新创建默认渲染器
+            custom_sections: self.custom_sections.clone(),
         }
     }
 }
@@ -419,6 +423,7 @@ impl Default for PromptContext {
             active_personas: Vec::new(),
             renderer: None,
             template_renderer: TemplateRenderer::new(),
+            custom_sections: Vec::new(),
         }
     }
 }
@@ -504,6 +509,14 @@ impl PromptContext {
             prompt.push_str(&hot_entries);
         }
 
+        // 8. Custom sections (heuristics, difficulty assessment, etc.)
+        for section in &self.custom_sections {
+            if !section.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(section);
+            }
+        }
+
         prompt
     }
 
@@ -551,6 +564,21 @@ impl PromptContext {
     pub fn with_working_directory(mut self, dir: impl Into<String>) -> Self {
         self.working_directory = Some(dir.into());
         self
+    }
+
+    /// 注入经验启发文本到上下文
+    pub fn inject_heuristics(&mut self, heuristics_text: &str) {
+        if !heuristics_text.is_empty() {
+            self.custom_sections.push(heuristics_text.to_string());
+        }
+    }
+
+    /// 注入元认知难度评估到上下文
+    pub fn inject_difficulty_assessment(&mut self, difficulty: &str, strategy: &str) {
+        self.custom_sections.push(format!(
+            "\n[元认知评估] 任务难度: {} | 推荐策略: {}\n",
+            difficulty, strategy
+        ));
     }
 
     /// Add a persona to active personas

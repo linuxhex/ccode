@@ -36,7 +36,7 @@ pub fn record_release(lock_name: &str, seq: u64) {
 
 /// 锁顺序检查器（Debug构建时检查）
 #[cfg(debug_assertions)]
-mod checker {
+pub(crate) mod checker {
     use std::cell::RefCell;
     
     thread_local! {
