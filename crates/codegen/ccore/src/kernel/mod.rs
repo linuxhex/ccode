@@ -145,12 +145,20 @@ pub struct Kernel {
     /// 配置变更事件接收端（由 ConfigWatcher 创建，在 run() 中消费）
     config_event_rx: Option<mpsc::Receiver<crate::config::watcher::ConfigChangeEvent>>,
     /// 情景记忆存储（Zettelkasten知识网络）
+    /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.episodic 访问
+    #[allow(dead_code)]
     episodic_memory: EpisodicMemoryStore,
     /// 经验反思学习引擎（ERL/MAR）
+    /// 保留供 standalone ccore 模式使用；shell 模式不直接使用此字段
+    #[allow(dead_code)]
     erl: ExperientialReflectiveLearner,
     /// 去中心化DAG协调器（AgentNet/Symphony）
+    /// 保留供 standalone ccore 模式使用；shell 模式不直接使用此字段
+    #[allow(dead_code)]
     coordinator: DecentralizedCoordinator,
     /// 元认知控制器（MAP/LAF）
+    /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.meta_cognitive 访问
+    #[allow(dead_code)]
     meta_cognitive: MetaCognitiveController,
     /// Token 预算管理器（借鉴 Claude Code tokenBudget.ts）
     token_budget: Arc<std::sync::Mutex<TokenBudgetManager>>,
@@ -228,31 +236,43 @@ impl Kernel {
     }
 
     /// 获取情景记忆存储
+    /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.episodic 访问
+    #[allow(dead_code)]
     pub fn episodic_memory(&self) -> &EpisodicMemoryStore {
         &self.episodic_memory
     }
 
     /// 获取经验反思学习引擎
+    /// 保留供 standalone ccore 模式使用；shell 模式不直接调用此方法
+    #[allow(dead_code)]
     pub fn erl(&self) -> &ExperientialReflectiveLearner {
         &self.erl
     }
 
     /// 获取去中心化DAG协调器
+    /// 保留供 standalone ccore 模式使用；shell 模式不直接调用此方法
+    #[allow(dead_code)]
     pub fn coordinator(&self) -> &DecentralizedCoordinator {
         &self.coordinator
     }
 
     /// 获取元认知控制器
+    /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.meta_cognitive 访问
+    #[allow(dead_code)]
     pub fn meta_cognitive(&self) -> &MetaCognitiveController {
         &self.meta_cognitive
     }
 
     /// 获取 Token 预算管理器
+    /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.token_budget 访问
+    #[allow(dead_code)]
     pub fn token_budget(&self) -> &Arc<std::sync::Mutex<TokenBudgetManager>> {
         &self.token_budget
     }
 
     /// 获取熔断器
+    /// 保留供 standalone ccore 模式使用；shell 模式不直接调用此方法
+    #[allow(dead_code)]
     pub fn circuit_breaker(&self) -> &Arc<CircuitBreaker> {
         &self.circuit_breaker
     }

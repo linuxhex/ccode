@@ -82,15 +82,36 @@ pub struct EpisodicMemoryStore {
     type_index: RwLock<HashMap<MemoryType, Vec<MemoryId>>>,
     /// 计数器（确保ID唯一）
     counter: AtomicU64,
+    /// 最大记忆容量（FIFO淘汰）
+    max_memories: usize,
+    /// 插入顺序（用于FIFO淘汰）
+    insertion_order: RwLock<Vec<MemoryId>>,
 }
 
 impl EpisodicMemoryStore {
+    /// 默认最大记忆容量
+    const DEFAULT_MAX_MEMORIES: usize = 1000;
+
     pub fn new() -> Self {
         Self {
             nodes: RwLock::new(HashMap::new()),
             keyword_index: RwLock::new(HashMap::new()),
             type_index: RwLock::new(HashMap::new()),
             counter: AtomicU64::new(0),
+            max_memories: Self::DEFAULT_MAX_MEMORIES,
+            insertion_order: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// 创建指定容量的情景记忆存储
+    pub fn with_capacity(max: usize) -> Self {
+        Self {
+            nodes: RwLock::new(HashMap::new()),
+            keyword_index: RwLock::new(HashMap::new()),
+            type_index: RwLock::new(HashMap::new()),
+            counter: AtomicU64::new(0),
+            max_memories: max,
+            insertion_order: RwLock::new(Vec::new()),
         }
     }
 
@@ -137,6 +158,16 @@ impl EpisodicMemoryStore {
                 }
             }
             nodes.insert(id.clone(), node);
+            self.insertion_order.write().unwrap().push(id.clone());
+        }
+
+        // FIFO 淘汰：超出容量时移除最早插入的记忆
+        {
+            let mut insertion_order = self.insertion_order.write().unwrap();
+            while insertion_order.len() > self.max_memories {
+                let oldest_id = insertion_order.remove(0);
+                self.evict_memory(&oldest_id);
+            }
         }
 
         // 更新索引
@@ -164,6 +195,36 @@ impl EpisodicMemoryStore {
         );
 
         id
+    }
+
+    /// 淘汰指定记忆：从节点图和所有索引中移除
+    fn evict_memory(&self, id: &MemoryId) {
+        // 从节点图中移除，并清理其他节点中指向该记忆的链接
+        if let Some(removed) = self.nodes.write().unwrap().remove(id) {
+            // 清理前向链接引用
+            for forward_id in &removed.forward_links {
+                if let Some(node) = self.nodes.write().unwrap().get_mut(forward_id) {
+                    node.back_links.retain(|l| l != id);
+                }
+            }
+            // 清理后向链接引用
+            for back_id in &removed.back_links {
+                if let Some(node) = self.nodes.write().unwrap().get_mut(back_id) {
+                    node.forward_links.retain(|l| l != id);
+                }
+            }
+            // 清理关键词索引
+            for kw in &removed.keywords {
+                if let Some(vec) = self.keyword_index.write().unwrap().get_mut(kw) {
+                    vec.retain(|l| l != id);
+                }
+            }
+            // 清理类型索引
+            if let Some(vec) = self.type_index.write().unwrap().get_mut(&removed.memory_type) {
+                vec.retain(|l| l != id);
+            }
+        }
+        tracing::debug!(target: "ccore::episodic", id = %id, "memory evicted (FIFO)");
     }
 
     /// 情景上下文重建（E-mem核心思想）

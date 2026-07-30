@@ -24,12 +24,20 @@ pub(super) async fn dispatch_tool(
         mode = "local",
         "dispatch_tool"
     );
-    // ccore 融合：先读后写检查（持久化 ccore_state）
+    // ccore 融合：先读后写检查（持久化 ccore_state）——阻断式，要求先读取文件
     if let Some(warning) = ccore_state.check_write_without_read(
         &prepared.tool_name,
         &prepared.parsed_args,
     ) {
         tracing::warn!(tool = %prepared.tool_name, "{}", warning);
+        // Return the warning as a tool error so the LLM sees it and reads the file first
+        return Ok(ToolRunResult {
+            output: ToolsToolOutput::Text(
+                format!("Error: {}", warning).into(),
+            ),
+            prompt_text: format!("Error: {}", warning),
+            effective_tool_name: None,
+        });
     }
     let result = workspace_ops
         .call_tool(

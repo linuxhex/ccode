@@ -1899,6 +1899,19 @@ impl SessionActor {
             );
             return Some(trigger_info);
         }
+        // ccore 融合：基于 TokenBudget 的压缩触发
+        if self.ccore_state.token_budget.lock().should_compact() {
+            let percentage = ccode_tokens::usage_percentage_u8(estimated_total, cw);
+            tracing::info!(
+                "ccore TokenBudget auto-compact trigger: model={model}, \
+                 {percentage}% full ({estimated_total}/{cw} tokens)",
+            );
+            return Some(AutoCompactTriggerInfo {
+                tokens_used: estimated_total,
+                context_window: cw,
+                percentage,
+            });
+        }
         None
     }
     /// Returns `Some` when tool call outputs have pushed the estimated token
