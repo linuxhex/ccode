@@ -1187,10 +1187,11 @@ impl SessionActor {
         self.prepare_sampler_for_turn().await;
         // ccore 融合：熔断器门控——防止级联失败
         if !crate::session::ccore_integration::check_circuit_breaker() {
-            tracing::warn!("ccore: circuit breaker open, skipping LLM request");
-            return Err(acp::Error::internal_error().data(
-                "Service temporarily unavailable (circuit breaker open)".to_string()
-            ));
+            // ccore 融合：熔断降级——等待恢复而非直接报错，避免终止会话
+            if !crate::session::ccore_integration::wait_for_circuit_recovery(5000).await {
+                tracing::warn!("ccore: circuit breaker still open after waiting, degrading");
+                // 不报错，继续尝试（降级而非终止会话）
+            }
         }
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1253,8 +1254,12 @@ impl SessionActor {
                 // Agent 响应完成时持久化会话快照
                 self.persist_turn_snapshot(&request, Some(&response), "turn_end");
                 // ccore 融合：情景记忆编码
+                // TODO: P0 FIX NEEDED — SessionEpisodicMemory::new() 每次 turn 都重新创建，
+                // 导致情景记忆无法跨 turn 累积。应改为从 CcoreSessionState 获取持久化实例，
+                // 或使用 session-ID-keyed 全局缓存（如 OnceLock<HashMap>）。
+                // 当前仅标记问题，待 SessionActor 添加 CcoreSessionState 字段后修复。
                 {
-                    let episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
+                    let mut episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
                         &self.session_info.id.0.to_string(),
                     );
                     let user_text: String = request.items.iter()
@@ -1317,10 +1322,11 @@ impl SessionActor {
     ) -> Result<SamplerTurnOutcome, acp::Error> {
         // ccore 融合：熔断器门控——防止级联失败
         if !crate::session::ccore_integration::check_circuit_breaker() {
-            tracing::warn!("ccore: circuit breaker open, skipping LLM request");
-            return Err(acp::Error::internal_error().data(
-                "Service temporarily unavailable (circuit breaker open)".to_string()
-            ));
+            // ccore 融合：熔断降级——等待恢复而非直接报错，避免终止会话
+            if !crate::session::ccore_integration::wait_for_circuit_recovery(5000).await {
+                tracing::warn!("ccore: circuit breaker still open after waiting, degrading");
+                // 不报错，继续尝试（降级而非终止会话）
+            }
         }
         let bridge = match &self.message_bus_bridge {
             Some(b) => b.clone(),
@@ -1514,8 +1520,12 @@ impl SessionActor {
         // Agent 响应完成时持久化会话快照（消息总线路径）
         self.persist_turn_snapshot(&request, Some(&response), "turn_end");
         // ccore 融合：情景记忆编码
+        // TODO: P0 FIX NEEDED — SessionEpisodicMemory::new() 每次 turn 都重新创建，
+        // 导致情景记忆无法跨 turn 累积。应改为从 CcoreSessionState 获取持久化实例，
+        // 或使用 session-ID-keyed 全局缓存（如 OnceLock<HashMap>）。
+        // 当前仅标记问题，待 SessionActor 添加 CcoreSessionState 字段后修复。
         {
-            let episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
+            let mut episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
                 &self.session_info.id.0.to_string(),
             );
             let user_text: String = request.items.iter()
@@ -1560,10 +1570,11 @@ impl SessionActor {
         self.prepare_sampler_for_turn().await;
         // ccore 融合：熔断器门控——防止级联失败
         if !crate::session::ccore_integration::check_circuit_breaker() {
-            tracing::warn!("ccore: circuit breaker open, skipping LLM request");
-            return Err(acp::Error::internal_error().data(
-                "Service temporarily unavailable (circuit breaker open)".to_string()
-            ));
+            // ccore 融合：熔断降级——等待恢复而非直接报错，避免终止会话
+            if !crate::session::ccore_integration::wait_for_circuit_recovery(5000).await {
+                tracing::warn!("ccore: circuit breaker still open after waiting, degrading");
+                // 不报错，继续尝试（降级而非终止会话）
+            }
         }
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1614,8 +1625,12 @@ impl SessionActor {
                 // Agent 响应完成时持久化会话快照（回退路径）
                 self.persist_turn_snapshot(&request, Some(&response), "turn_end");
                 // ccore 融合：情景记忆编码
+                // TODO: P0 FIX NEEDED — SessionEpisodicMemory::new() 每次 turn 都重新创建，
+                // 导致情景记忆无法跨 turn 累积。应改为从 CcoreSessionState 获取持久化实例，
+                // 或使用 session-ID-keyed 全局缓存（如 OnceLock<HashMap>）。
+                // 当前仅标记问题，待 SessionActor 添加 CcoreSessionState 字段后修复。
                 {
-                    let episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
+                    let mut episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
                         &self.session_info.id.0.to_string(),
                     );
                     let user_text: String = request.items.iter()

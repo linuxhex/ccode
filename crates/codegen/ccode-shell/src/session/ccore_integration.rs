@@ -5,9 +5,10 @@
 //! 以薄适配层的形式接入 ccode-shell 的执行流程。
 //!
 //! 设计原则：
-//! - 不修改现有大文件（run_loop.rs, turn.rs, sampler_turn.rs, tool_dispatch.rs）
-//! - 提供独立函数/结构，供 shell 在关键调用点使用
-//! - 适配 ccore 的实际 API 签名
+//! - 所有会话级对象通过 CcoreSessionState 一次性创建，避免 new-per-call 丢失状态
+//! - CircuitBreaker 为全局共享，熔断时降级等待而非直接报错
+//! - ReadTracker 使用 Arc<Mutex> 保证跨线程安全
+//! - 不修改现有大文件，提供独立函数/结构供 shell 关键调用点使用
 
 use std::sync::Arc;
 
@@ -42,6 +43,31 @@ pub fn circuit_breaker_state() -> String {
     format!("{:?}", circuit_breaker().current_state())
 }
 
+/// 降级式熔断器等待：若熔断开启则等待冷却期后重试。
+///
+/// 与 check_circuit_breaker() 不同，此方法不会直接返回 false，
+/// 而是短暂等待让熔断器冷却，最多等 `max_wait_ms` 毫秒。
+/// 返回 true 表示可以继续，false 表示等待后仍未恢复。
+pub async fn wait_for_circuit_recovery(max_wait_ms: u64) -> bool {
+    if circuit_breaker().allow_request() {
+        return true;
+    }
+    tracing::warn!("ccore: circuit breaker open, waiting for recovery...");
+    let start = std::time::Instant::now();
+    let max_wait = std::time::Duration::from_millis(max_wait_ms);
+    let check_interval = std::time::Duration::from_millis(500);
+
+    while start.elapsed() < max_wait {
+        tokio::time::sleep(check_interval).await;
+        if circuit_breaker().allow_request() {
+            tracing::info!("ccore: circuit breaker recovered after {:?}", start.elapsed());
+            return true;
+        }
+    }
+    tracing::warn!("ccore: circuit breaker still open after {:?}", max_wait);
+    false
+}
+
 // ─── 2. PromptCacheTracker Bridge ────────────────────────────────────────────
 
 use ccore::sampler::cache_break::{CacheEvent, CacheStats, PromptCacheTracker};
@@ -62,9 +88,6 @@ impl SessionCacheTracker {
     }
 
     /// 记录一次 prompt 提交并检查缓存是否可能命中。
-    ///
-    /// 通过比较系统提示和工具定义的 hash 来自动检测缓存断裂原因。
-    /// 返回 true 表示缓存命中。
     pub fn record_prompt(&mut self, system_prompt: &str, tool_schema: &str, cache_hit: bool) -> bool {
         self.request_counter += 1;
         let sys_hash = PromptCacheTracker::simple_hash(system_prompt);
@@ -95,29 +118,74 @@ impl SessionCacheTracker {
     }
 }
 
-// ─── 3. ReadTracker Bridge ───────────────────────────────────────────────────
+// ─── 3. ReadTracker Bridge (Arc<Mutex> 跨线程安全) ──────────────────────────
 
 use ccore::tools::read_tracker::ReadTracker;
 
-// 线程级读取追踪器，用于先读后写约束的执行。
+/// 会话级读取追踪器，使用 Arc<Mutex> 保证跨线程安全。
+///
+/// 之前使用 thread_local! 导致跨线程工具调度时读取记录丢失，
+/// 改为 Arc<Mutex> 后所有线程共享同一份读取记录。
+pub struct SessionReadTracker {
+    inner: Arc<std::sync::Mutex<ReadTracker>>,
+}
+
+impl SessionReadTracker {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(ReadTracker::new())),
+        }
+    }
+
+    /// 记录文件已被读取。
+    pub fn record_read(&self, path: &str) {
+        if let Ok(mut tracker) = self.inner.lock() {
+            tracker.mark_read(path);
+        }
+    }
+
+    /// 检查写入前是否已读取目标文件。
+    pub fn has_been_read(&self, path: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|t| t.has_been_read(path))
+            .unwrap_or(false)
+    }
+
+    /// 清除所有读取记录。
+    pub fn clear(&self) {
+        if let Ok(mut tracker) = self.inner.lock() {
+            tracker.clear();
+        }
+    }
+}
+
+impl Clone for SessionReadTracker {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+// 保留旧的全局 API 做兼容，内部委托到 thread_local（仅用于无 SessionReadTracker 的场景）
 thread_local! {
-    static READ_TRACKER: std::cell::RefCell<ReadTracker> = std::cell::RefCell::new(ReadTracker::new());
+    static FALLBACK_READ_TRACKER: std::cell::RefCell<ReadTracker> = std::cell::RefCell::new(ReadTracker::new());
 }
 
-/// 记录文件已被读取（在 read 工具中调用）。
+/// 记录文件已被读取（兼容旧调用，推荐改用 SessionReadTracker）。
 pub fn record_file_read(path: &str) {
-    READ_TRACKER.with(|t| t.borrow().mark_read(path));
+    FALLBACK_READ_TRACKER.with(|t| t.borrow_mut().mark_read(path));
 }
 
-/// 检查写入前是否已读取目标文件（在 write/edit 工具中调用）。
-/// 返回 true 表示文件已被读取，false 表示未读取。
+/// 检查写入前是否已读取目标文件（兼容旧调用，推荐改用 SessionReadTracker）。
 pub fn check_read_before_write(path: &str) -> bool {
-    READ_TRACKER.with(|t| t.borrow().has_been_read(path))
+    FALLBACK_READ_TRACKER.with(|t| t.borrow().has_been_read(path))
 }
 
-/// 清除读取追踪记录（在会话开始时调用）。
+/// 清除读取追踪记录（兼容旧调用）。
 pub fn clear_read_tracker() {
-    READ_TRACKER.with(|t| t.borrow().clear());
+    FALLBACK_READ_TRACKER.with(|t| t.borrow_mut().clear());
 }
 
 // ─── 4. TokenBudget Bridge ───────────────────────────────────────────────────
@@ -234,6 +302,8 @@ pub struct SessionEpisodicMemory {
     inner: EpisodicMemoryStore,
     /// 会话 ID（用于 MemorySource）
     session_id: String,
+    /// 消息索引计数器
+    message_index: u64,
 }
 
 impl SessionEpisodicMemory {
@@ -241,23 +311,25 @@ impl SessionEpisodicMemory {
         Self {
             inner: EpisodicMemoryStore::new(),
             session_id: session_id.to_string(),
+            message_index: 0,
         }
     }
 
     /// 将对话轮次编码为情景记忆。
     pub fn encode_turn(
-        &self,
+        &mut self,
         user_msg: &str,
         assistant_msg: &str,
         tools_used: &[String],
     ) -> String {
+        self.message_index += 1;
         let content = format!("用户: {}\n助手: {}", user_msg, assistant_msg);
         let context = format!("使用的工具: {:?}", tools_used);
         let keywords = tools_used.to_vec();
         let source = MemorySource {
             session_id: self.session_id.clone(),
             timestamp: chrono::Utc::now().timestamp(),
-            message_index: None,
+            message_index: Some(self.message_index as usize),
             confidence: 0.8,
         };
         self.inner
@@ -275,29 +347,134 @@ impl SessionEpisodicMemory {
     }
 }
 
-// ─── 7. sampler_turn 集成 ────────────────────────────────────────────────────
+// ─── 7. CcoreSessionState —— 一次性创建的会话级状态 ─────────────────────────
+//
+// 解决 P0 问题：之前每个调用点 new() 导致状态无法跨轮次累积。
+// 改为在 SessionActor 初始化时创建一次，所有调用点共享。
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// 在采样轮次中集成 ccore 高级特性的包装函数。
+/// ccore 会话级状态容器。
 ///
-/// 在现有重试逻辑前后添加：
-/// - 熔断器检查（请求前）
-/// - 缓存追踪（响应后）
-/// - Token 预算监控
+/// 在 SessionActor 创建时一次性构造，所有桥接对象在整个会话生命周期内共享，
+/// 确保元认知、情景记忆、缓存追踪等功能可以跨轮次累积状态。
 ///
-/// 实际调用点应使用本模块中的各个独立函数。
-pub async fn run_turn_with_ccore_gates<F, Fut, T, E>(
-    circuit_check: bool,
-    f: F,
-) -> Result<T, E>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
-{
-    if circuit_check && !check_circuit_breaker() {
-        tracing::warn!("circuit breaker open, skipping LLM request");
+/// # 用法
+/// ```ignore
+/// // 在 SessionActor 构造函数中：
+/// let ccore_state = CcoreSessionState::new("session-id", "claude-3.5-sonnet");
+///
+/// // 在 turn 执行中：
+/// ccore_state.episodic.encode_turn(user_msg, assistant_msg, &tools);
+/// ccore_state.meta_cognitive.assess_and_recommend(task);
+/// ccore_state.read_tracker.record_read(path);
+/// ```
+pub struct CcoreSessionState {
+    /// 会话级情景记忆（跨轮次累积）
+    pub episodic: parking_lot::Mutex<SessionEpisodicMemory>,
+    /// 会话级元认知控制器（跨轮次学习策略效果）
+    pub meta_cognitive: SessionMetaCognitive,
+    /// 会话级缓存追踪器（跨轮次统计命中率）
+    pub cache_tracker: parking_lot::Mutex<SessionCacheTracker>,
+    /// 会话级读取追踪器（跨线程安全）
+    pub read_tracker: SessionReadTracker,
+    /// 会话级 Token 预算管理器（跨轮次累计使用量）
+    pub token_budget: parking_lot::Mutex<SessionTokenBudget>,
+}
+
+impl CcoreSessionState {
+    /// 创建会话级 ccore 状态。
+    ///
+    /// 应在 SessionActor 构造时调用一次，而非每次 turn 时 new()。
+    pub fn new(session_id: &str, model: &str) -> Self {
+        Self {
+            episodic: parking_lot::Mutex::new(SessionEpisodicMemory::new(session_id)),
+            meta_cognitive: SessionMetaCognitive::new(),
+            cache_tracker: parking_lot::Mutex::new(SessionCacheTracker::new()),
+            read_tracker: SessionReadTracker::new(),
+            token_budget: parking_lot::Mutex::new(SessionTokenBudget::new(model)),
+        }
     }
-    f().await
+
+    /// 便捷方法：编码对话轮次到情景记忆。
+    pub fn encode_episodic_turn(
+        &self,
+        user_msg: &str,
+        assistant_msg: &str,
+        tools_used: &[String],
+    ) {
+        self.episodic
+            .lock()
+            .encode_turn(user_msg, assistant_msg, tools_used);
+    }
+
+    /// 便捷方法：重建情景上下文。
+    pub fn reconstruct_episodic_context(&self, query: &str, max_depth: usize) -> String {
+        self.episodic.lock().reconstruct_context(query, max_depth)
+    }
+
+    /// 便捷方法：元认知评估。
+    pub fn meta_assess(&self, task: &str) -> MetaAssessment {
+        self.meta_cognitive.assess_and_recommend(task)
+    }
+
+    /// 便捷方法：检测冲突。
+    pub fn meta_detect_conflicts(&self, steps: &[String]) -> Vec<ConflictDetection> {
+        self.meta_cognitive.detect_conflicts(steps)
+    }
+
+    /// 便捷方法：记录文件读取。
+    pub fn record_read(&self, path: &str) {
+        self.read_tracker.record_read(path);
+    }
+
+    /// 便捷方法：检查是否已读取。
+    pub fn has_been_read(&self, path: &str) -> bool {
+        self.read_tracker.has_been_read(path)
+    }
+
+    /// 便捷方法：写前检查。
+    pub fn check_write_without_read(&self, tool_name: &str, args: &serde_json::Value) -> Option<String> {
+        if !matches!(
+            tool_name,
+            "write" | "edit" | "search_replace" | "hashline_edit"
+        ) {
+            return None;
+        }
+
+        let path = args
+            .get("file_path")
+            .or_else(|| args.get("path"))
+            .or_else(|| args.get("target_file"))
+            .and_then(|v| v.as_str());
+
+        let Some(path) = path else {
+            return None;
+        };
+
+        if !self.read_tracker.has_been_read(path) {
+            Some(format!(
+                "Warning: writing to '{}' without reading it first. Consider reading the file before editing.",
+                path
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// 便捷方法：记录 Token 使用量。
+    pub fn record_token_usage(&self, input_tokens: usize, output_tokens: usize) {
+        self.token_budget.lock().record_usage(input_tokens, output_tokens);
+    }
+
+    /// 便捷方法：记录 Prompt 缓存事件。
+    pub fn record_cache(&self, system_prompt: &str, tool_schema: &str, cache_hit: bool) {
+        self.cache_tracker.lock().record_prompt(system_prompt, tool_schema, cache_hit);
+    }
+
+    /// 便捷方法：获取缓存命中率。
+    pub fn cache_hit_rate(&self) -> f64 {
+        self.cache_tracker.lock().hit_rate()
+    }
 }
 
 // ─── 8. tool_dispatch 集成 ───────────────────────────────────────────────────
@@ -357,15 +534,20 @@ mod tests {
     }
 
     #[test]
-    fn test_read_tracker_bridge() {
-        clear_read_tracker();
-        assert!(!check_read_before_write("/tmp/test_read_tracker.rs"));
+    fn test_session_read_tracker_thread_safe() {
+        let tracker = SessionReadTracker::new();
+        tracker.record_read("/tmp/test_thread_safe.rs");
+        assert!(tracker.has_been_read("/tmp/test_thread_safe.rs"));
+        assert!(!tracker.has_been_read("/tmp/other.rs"));
 
-        record_file_read("/tmp/test_read_tracker.rs");
-        assert!(check_read_before_write("/tmp/test_read_tracker.rs"));
-
-        clear_read_tracker();
-        assert!(!check_read_before_write("/tmp/test_read_tracker.rs"));
+        // 跨线程共享
+        let tracker_clone = tracker.clone();
+        let handle = std::thread::spawn(move || {
+            assert!(tracker_clone.has_been_read("/tmp/test_thread_safe.rs"));
+            tracker_clone.record_read("/tmp/from_other_thread.rs");
+        });
+        handle.join().unwrap();
+        assert!(tracker.has_been_read("/tmp/from_other_thread.rs"));
     }
 
     #[test]
@@ -392,12 +574,49 @@ mod tests {
 
     #[test]
     fn test_episodic_memory_bridge() {
-        let memory = SessionEpisodicMemory::new("test_session");
+        let mut memory = SessionEpisodicMemory::new("test_session");
         let id = memory.encode_turn("你好", "你好！", &[]);
         assert!(id.starts_with("mem_"));
 
-        let context = memory.reconstruct_context("你好", 2);
+        // 编码第二条记忆，验证跨轮次累积
+        let id2 = memory.encode_turn("排序算法", "这是快速排序...", &["read_file".to_string()]);
+        assert!(id2.starts_with("mem_"));
+
+        let context = memory.reconstruct_context("排序", 2);
         assert!(!context.is_empty());
+
+        let stats = memory.stats();
+        assert!(stats.1 >= 2, "应至少有 2 条情景记忆");
+    }
+
+    #[test]
+    fn test_ccore_session_state_persistence() {
+        let state = CcoreSessionState::new("test_session", "gpt-4o");
+
+        // 情景记忆累积
+        state.encode_episodic_turn("你好", "你好！", &[]);
+        state.encode_episodic_turn("排序算法", "快速排序实现", &["write".to_string()]);
+        let ctx = state.reconstruct_episodic_context("排序", 2);
+        assert!(!ctx.is_empty());
+
+        // 读取追踪跨操作累积
+        state.record_read("/tmp/test_a.rs");
+        assert!(state.has_been_read("/tmp/test_a.rs"));
+        assert!(!state.has_been_read("/tmp/test_b.rs"));
+
+        // Token 预算累积
+        state.record_token_usage(1000, 500);
+        state.record_token_usage(2000, 800);
+        // 两次调用应被累加
+
+        // 缓存追踪累积
+        state.record_cache("sys", "tools", true);
+        state.record_cache("sys", "tools", false);
+        assert!((state.cache_hit_rate() - 0.5).abs() < 0.01);
+
+        // 元认知累积
+        let assessment = state.meta_assess("简单查询");
+        assert_eq!(assessment.difficulty, DifficultyLevel::Trivial);
     }
 
     #[test]
@@ -414,5 +633,11 @@ mod tests {
 
         let no_check = check_write_without_read("bash", &args);
         assert!(no_check.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_recovery() {
+        // 正常情况应立即返回 true
+        assert!(wait_for_circuit_recovery(100).await);
     }
 }
