@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ccore = { path = "../ccore" }
+ccode-shell = { path = "../ccode-shell" }
 clap = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
