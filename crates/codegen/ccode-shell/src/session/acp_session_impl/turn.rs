@@ -1555,6 +1555,17 @@ impl SessionActor {
             self.goal_harness_enabled(),
             self.goal_tracker.lock().status(),
         );
+        // ccore 融合：元认知难度评估——连续失败时推荐策略变更
+        {
+            let mut meta = crate::session::ccore_integration::SessionMetaCognitive::new();
+            let feedback = self.pending_compile_feedback.lock();
+            if let Some(ref hint) = *feedback {
+                let conflicts = meta.detect_conflicts(&[hint.clone()]);
+                if !conflicts.is_empty() {
+                    tracing::warn!("ccore: 元认知检测到冲突循环，推荐调整策略");
+                }
+            }
+        }
         if turn_succeeded && goal_active_now {
             self.goal_continuation_streak
                 .store(0, std::sync::atomic::Ordering::Relaxed);

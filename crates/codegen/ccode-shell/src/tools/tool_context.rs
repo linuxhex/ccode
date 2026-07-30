@@ -16,6 +16,11 @@ use ccode_paths::AbsPathBuf;
 use ccode_workspace::file_system::{AsyncFileSystem, AsyncFsWrapper};
 use ccode_workspace::session::file_state::FileStateHandle;
 use ccode_hunk::HunkTrackerHandle;
+// NOTE: ccore provides an advanced version of this functionality.
+// See ccore::sampler::TokenBudgetManager for the full-featured implementation
+// (model context windows, auto-compact thresholds, character estimation, etc.).
+// This simpler struct tracks only task output token budgets.
+// It will be migrated once the ccore bridge is fully validated.
 #[derive(Debug, Clone, Default)]
 pub struct TaskOutputTokenBudget {
     inner: Arc<parking_lot::Mutex<TaskOutputTokenBudgetState>>,

@@ -107,6 +107,11 @@ use crate::session::mcp_dispatcher::{
 ///
 /// Wall-clock targets: `t=1s, t=5s, t=21s` (cumulative). Total worst-case
 /// window before the task gives up and parks the server is 21 s.
+///
+/// NOTE: ccore provides a general-purpose exponential backoff via
+/// `ccore::retry::backoff::RetryPolicy::backoff_duration()`. This domain-specific
+/// array is retained because MCP restart needs precise wall-clock targets and
+/// cancellation integration. It will be migrated once the ccore bridge is fully validated.
 pub const BACKOFF: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(4),

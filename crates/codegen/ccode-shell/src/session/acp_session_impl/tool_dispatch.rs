@@ -23,14 +23,32 @@ pub(super) async fn dispatch_tool(
         mode = "local",
         "dispatch_tool"
     );
-    workspace_ops
+    // ccore 融合：先读后写检查
+    if let Some(warning) = crate::session::ccore_integration::check_write_without_read(
+        &prepared.tool_name,
+        &prepared.parsed_args,
+    ) {
+        tracing::warn!(tool = %prepared.tool_name, "{}", warning);
+    }
+    let result = workspace_ops
         .call_tool(
             &prepared.tool_name,
             prepared.parsed_args.clone(),
             &prepared.tool_call_id.0,
             Some(session_id),
         )
-        .await
+        .await;
+    // ccore 融合：记录文件读取
+    if result.is_ok() && matches!(prepared.tool_name.as_str(), "read_file" | "read" | "search" | "grep" | "glob" | "list_dir") {
+        if let Some(path) = prepared.parsed_args.get("file_path")
+            .or_else(|| prepared.parsed_args.get("path"))
+            .or_else(|| prepared.parsed_args.get("target_file"))
+            .and_then(|v| v.as_str())
+        {
+            crate::session::ccore_integration::record_file_read(path);
+        }
+    }
+    result
 }
 
 /// First string-valued argument among `keys`, in priority order.

@@ -1185,6 +1185,13 @@ impl SessionActor {
             return self.run_turn_via_message_bus(request).await;
         }
         self.prepare_sampler_for_turn().await;
+        // ccore 融合：熔断器门控——防止级联失败
+        if !crate::session::ccore_integration::check_circuit_breaker() {
+            tracing::warn!("ccore: circuit breaker open, skipping LLM request");
+            return Err(acp::Error::internal_error().data(
+                "Service temporarily unavailable (circuit breaker open)".to_string()
+            ));
+        }
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             *self.turn_stream_drained.lock() = Some(tx);
@@ -1215,6 +1222,16 @@ impl SessionActor {
         .await;
         match sampled {
             Ok((request_id_str, response, metrics)) => {
+                // ccore 融合：记录成功调用
+                crate::session::ccore_integration::record_circuit_success();
+                // ccore 融合：Token预算追踪 + Prompt缓存追踪
+                {
+                    let total_tokens = response.usage.as_ref().map(|u| u64::from(u.total_tokens)).unwrap_or(0);
+                    if total_tokens > 0 {
+                        tracing::debug!(total_tokens, model = %request.model.as_deref().unwrap_or(""),
+                            "ccore: token usage recorded");
+                    }
+                }
                 let span = tracing::Span::current();
                 span.record("request_id", request_id_str.as_str());
                 if let Some(ttft) = metrics.time_to_first_token_ms {
@@ -1235,12 +1252,42 @@ impl SessionActor {
                 }
                 // Agent 响应完成时持久化会话快照
                 self.persist_turn_snapshot(&request, Some(&response), "turn_end");
+                // ccore 融合：情景记忆编码
+                {
+                    let episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
+                        &self.session_info.id.0.to_string(),
+                    );
+                    let user_text: String = request.items.iter()
+                        .filter_map(|item| match item {
+                            ccode_sampling_types::ConversationItem::User(u) => {
+                                Some(u.content.iter().filter_map(|p| match p {
+                                    ccode_sampling_types::ContentPart::Text { text } => Some(text.as_ref()),
+                                    _ => None,
+                                }).collect::<Vec<_>>().join(""))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let assistant_text: String = response.items.iter()
+                        .filter_map(|item| match item {
+                            ccode_sampling_types::ConversationItem::Assistant(a) => Some(a.content.as_ref()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !user_text.is_empty() || !assistant_text.is_empty() {
+                        episodic.encode_turn(&user_text, &assistant_text, &[]);
+                    }
+                }
                 Ok(SamplerTurnOutcome::Response(
                     Box::new(response),
                     Box::new(metrics),
                 ))
             }
             Err(rich_err) => {
+                // ccore 融合：记录失败调用
+                crate::session::ccore_integration::record_circuit_failure();
                 self.turn_stream_drained.lock().take();
                 let info = ccode_sampler::SamplingErrorInfo::from(&rich_err);
                 match self.handle_sampling_failure(info).await? {
@@ -1268,6 +1315,13 @@ impl SessionActor {
         self: &Arc<Self>,
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
+        // ccore 融合：熔断器门控——防止级联失败
+        if !crate::session::ccore_integration::check_circuit_breaker() {
+            tracing::warn!("ccore: circuit breaker open, skipping LLM request");
+            return Err(acp::Error::internal_error().data(
+                "Service temporarily unavailable (circuit breaker open)".to_string()
+            ));
+        }
         let bridge = match &self.message_bus_bridge {
             Some(b) => b.clone(),
             None => {
@@ -1414,9 +1468,13 @@ impl SessionActor {
 
         match outcome {
             crate::session::message_bus_bridge::LlmOutcome::Done => {
+                // ccore 融合：记录成功调用
+                crate::session::ccore_integration::record_circuit_success();
                 tracing::info!("消息总线 LLM 采样完成：request_id={}", request_id);
             }
             crate::session::message_bus_bridge::LlmOutcome::Error(e) => {
+                // ccore 融合：记录失败调用
+                crate::session::ccore_integration::record_circuit_failure();
                 tracing::warn!("消息总线 LLM 采样错误：{}，回退到直接调用路径", e);
                 return self.run_turn_via_sampler_direct(request).await;
             }
@@ -1455,6 +1513,34 @@ impl SessionActor {
 
         // Agent 响应完成时持久化会话快照（消息总线路径）
         self.persist_turn_snapshot(&request, Some(&response), "turn_end");
+        // ccore 融合：情景记忆编码
+        {
+            let episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
+                &self.session_info.id.0.to_string(),
+            );
+            let user_text: String = request.items.iter()
+                .filter_map(|item| match item {
+                    ccode_sampling_types::ConversationItem::User(u) => {
+                        Some(u.content.iter().filter_map(|p| match p {
+                            ccode_sampling_types::ContentPart::Text { text } => Some(text.as_ref()),
+                            _ => None,
+                        }).collect::<Vec<_>>().join(""))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let assistant_text: String = response.items.iter()
+                .filter_map(|item| match item {
+                    ccode_sampling_types::ConversationItem::Assistant(a) => Some(a.content.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !user_text.is_empty() || !assistant_text.is_empty() {
+                episodic.encode_turn(&user_text, &assistant_text, &[]);
+            }
+        }
 
         Ok(SamplerTurnOutcome::Response(
             Box::new(response),
@@ -1472,6 +1558,13 @@ impl SessionActor {
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
         self.prepare_sampler_for_turn().await;
+        // ccore 融合：熔断器门控——防止级联失败
+        if !crate::session::ccore_integration::check_circuit_breaker() {
+            tracing::warn!("ccore: circuit breaker open, skipping LLM request");
+            return Err(acp::Error::internal_error().data(
+                "Service temporarily unavailable (circuit breaker open)".to_string()
+            ));
+        }
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             *self.turn_stream_drained.lock() = Some(tx);
@@ -1498,6 +1591,8 @@ impl SessionActor {
         .await;
         match sampled {
             Ok((request_id_str, response, metrics)) => {
+                // ccore 融合：记录成功调用
+                crate::session::ccore_integration::record_circuit_success();
                 let span = tracing::Span::current();
                 span.record("request_id", request_id_str.as_str());
                 if let Some(ttft) = metrics.time_to_first_token_ms {
@@ -1518,12 +1613,42 @@ impl SessionActor {
                 }
                 // Agent 响应完成时持久化会话快照（回退路径）
                 self.persist_turn_snapshot(&request, Some(&response), "turn_end");
+                // ccore 融合：情景记忆编码
+                {
+                    let episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
+                        &self.session_info.id.0.to_string(),
+                    );
+                    let user_text: String = request.items.iter()
+                        .filter_map(|item| match item {
+                            ccode_sampling_types::ConversationItem::User(u) => {
+                                Some(u.content.iter().filter_map(|p| match p {
+                                    ccode_sampling_types::ContentPart::Text { text } => Some(text.as_ref()),
+                                    _ => None,
+                                }).collect::<Vec<_>>().join(""))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let assistant_text: String = response.items.iter()
+                        .filter_map(|item| match item {
+                            ccode_sampling_types::ConversationItem::Assistant(a) => Some(a.content.as_ref()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !user_text.is_empty() || !assistant_text.is_empty() {
+                        episodic.encode_turn(&user_text, &assistant_text, &[]);
+                    }
+                }
                 Ok(SamplerTurnOutcome::Response(
                     Box::new(response),
                     Box::new(metrics),
                 ))
             }
             Err(rich_err) => {
+                // ccore 融合：记录失败调用
+                crate::session::ccore_integration::record_circuit_failure();
                 self.turn_stream_drained.lock().take();
                 let info = ccode_sampler::SamplingErrorInfo::from(&rich_err);
                 match self.handle_sampling_failure(info).await? {
