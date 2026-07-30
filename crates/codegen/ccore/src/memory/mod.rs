@@ -12,3 +12,4 @@ pub mod mmr;
 pub mod chunker;
 pub mod storage;
 pub mod watcher;
+pub mod episodic;

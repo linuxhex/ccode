@@ -7,6 +7,9 @@ pub mod doom_loop;
 pub mod loop_state;
 pub mod plan_execute;
 pub mod skills;
+pub mod experiential;
+pub mod decentralized;
+pub mod meta_cognitive;
 
 use serde::{Deserialize, Serialize};
 
