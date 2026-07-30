@@ -1359,6 +1359,8 @@ impl SessionActor {
             }),
             max_tokens: request.max_output_tokens,
             temperature: request.temperature.map(|t| t as f64),
+            system_prompt: None,
+            tool_choice: None,
         };
 
         // 2. 发送到消息总线
