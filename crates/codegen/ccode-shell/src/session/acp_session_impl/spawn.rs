@@ -201,7 +201,6 @@ pub(crate) async fn spawn_session_actor(
     >,
     max_turns: Option<usize>,
     forked_tool_override: Option<Vec<ToolSpec>>,
-    use_message_bus: bool,
     message_bus_router_addr: String,
     message_bus_pub_addr: String,
 ) -> Result<
@@ -1643,7 +1642,6 @@ pub(crate) async fn spawn_session_actor(
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle,
-        use_message_bus,
         message_bus_bridge: std::cell::RefCell::new(None),
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,
@@ -1665,8 +1663,8 @@ pub(crate) async fn spawn_session_actor(
             finished_marginal,
         );
     }
-    // Initialize MessageBusBridge when use_message_bus=true
-    if use_message_bus {
+    // Initialize MessageBusBridge (always, since we always use distributed mode)
+    {
         let agent_id = session_info.id.0.to_string();
         let bridge_session = session.clone();
         let router_addr_clone = message_bus_router_addr.clone();
@@ -2186,7 +2184,6 @@ pub(crate) async fn spawn_session_on_thread(
     >,
     max_turns: Option<usize>,
     forked_tool_override: Option<Vec<ToolSpec>>,
-    use_message_bus: bool,
     message_bus_router_addr: String,
     message_bus_pub_addr: String,
 ) -> Result<
@@ -2349,7 +2346,6 @@ pub(crate) async fn spawn_session_on_thread(
                         parent_scheduler_handle,
                         max_turns,
                         forked_tool_override,
-                        use_message_bus,
                         message_bus_router_addr,
                         message_bus_pub_addr,
                     )

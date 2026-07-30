@@ -84,62 +84,31 @@ impl NodeLauncher {
     /// 4. Thinker（大脑皮层 + 内置 Eye/Ear/Nose/Skin 感官层）— 核心
     /// 5. TUI（用户交互 = Ear + Mouth 交互层）— 用户界面
     pub async fn spawn_initial_set(&mut self) -> anyhow::Result<Vec<NodeDescriptor>> {
-        // 1. Sampler Node（使用 ccode_config 中的 Provider 配置）
+        // 并行 spawn 5 个 Node（构造 + tokio::spawn 均在并行块中完成）
+        // tokio::join! 确保所有 spawn 完成后再继续
+
+        // 1. Sampler Node
         let sampler_ctx = self.node_context();
         let sampler_id = NodeId::new();
+        let sampler_id_clone = sampler_id.clone();
         let sampler = SamplerNode::with_configs(sampler_id.clone(), &self.ccode_config.providers);
-        let sampler_handle = tokio::spawn(async move {
-            if let Err(e) = run_node(sampler, sampler_ctx).await {
-                tracing::error!("Sampler Node 异常退出：{}", e);
-            }
-        });
-        self.task_handles.push(sampler_handle);
-        self.launched_nodes.push(NodeDescriptor {
-            id: sampler_id,
-            node_type: NodeType::Sampler,
-            name: "sampler-primary".into(),
-        });
-        tracing::info!("Sampler Node 已 spawn");
 
         // 2. State Node
         let state_ctx = self.node_context();
         let state_id = NodeId::new();
+        let state_id_clone = state_id.clone();
         let state = StateNode::new(state_id.clone());
-        let state_handle = tokio::spawn(async move {
-            if let Err(e) = run_node(state, state_ctx).await {
-                tracing::error!("State Node 异常退出：{}", e);
-            }
-        });
-        self.task_handles.push(state_handle);
-        self.launched_nodes.push(NodeDescriptor {
-            id: state_id,
-            node_type: NodeType::State,
-            name: "state-primary".into(),
-        });
-        tracing::info!("State Node 已 spawn");
 
-        // 3. Tool Node（运动层：Hand + Limb 的能力由 ToolNode 统一执行）
+        // 3. Tool Node
         let tool_ctx = self.node_context();
         let tool_id = NodeId::new();
+        let tool_id_clone = tool_id.clone();
         let tool = ToolNode::new(tool_id.clone());
-        let tool_handle = tokio::spawn(async move {
-            if let Err(e) = run_node(tool, tool_ctx).await {
-                tracing::error!("Tool Node 异常退出：{}", e);
-            }
-        });
-        self.task_handles.push(tool_handle);
-        self.launched_nodes.push(NodeDescriptor {
-            id: tool_id,
-            node_type: NodeType::Tool,
-            name: "tool-primary".into(),
-        });
-        tracing::info!("Tool Node 已 spawn");
 
-        // 4. Thinker Node（大脑皮层 + 内置感官层）
-        //    感官层（Eye/Ear/Nose/Skin）作为 ThinkerNode 内部方法，
-        //    不拆独立进程，通过 agent/{id}/tool_call → ToolNode 执行
+        // 4. Thinker Node
         let thinker_ctx = self.node_context();
         let thinker_id = NodeId::new();
+        let thinker_id_clone = thinker_id.clone();
         let thinker_config = AgentConfig {
             agent_type: AgentType::Primary,
             model: self.ccode_config.default_model.clone(),
@@ -147,38 +116,77 @@ impl NodeLauncher {
             max_turns: None,
             subagents_enabled: true,
             non_interactive: false,
-            tools: Vec::new(), // 将通过 tool/register 消息动态填充
+            tools: Vec::new(),
         };
         let thinker = ThinkerNode::new(thinker_id.clone(), thinker_config);
-        let thinker_handle = tokio::spawn(async move {
-            if let Err(e) = run_node(thinker, thinker_ctx).await {
-                tracing::error!("Thinker Node 异常退出：{}", e);
-            }
-        });
+
+        // 5. TUI Node
+        let tui_ctx = self.node_context();
+        let tui_id = NodeId::new();
+        let tui_id_clone = tui_id.clone();
+        let tui = TUINode::new(tui_id.clone());
+
+        // 并行 spawn 所有 Node
+        let (sampler_handle, state_handle, tool_handle, thinker_handle, tui_handle) = tokio::join!(
+            tokio::spawn(async move {
+                if let Err(e) = run_node(sampler, sampler_ctx).await {
+                    tracing::error!("Sampler Node 异常退出：{}", e);
+                }
+            }),
+            tokio::spawn(async move {
+                if let Err(e) = run_node(state, state_ctx).await {
+                    tracing::error!("State Node 异常退出：{}", e);
+                }
+            }),
+            tokio::spawn(async move {
+                if let Err(e) = run_node(tool, tool_ctx).await {
+                    tracing::error!("Tool Node 异常退出：{}", e);
+                }
+            }),
+            tokio::spawn(async move {
+                if let Err(e) = run_node(thinker, thinker_ctx).await {
+                    tracing::error!("Thinker Node 异常退出：{}", e);
+                }
+            }),
+            tokio::spawn(async move {
+                if let Err(e) = crate::node::tui::run_tui_node(tui, tui_ctx).await {
+                    tracing::error!("TUI Node 异常退出：{}", e);
+                }
+            }),
+        );
+
+        // 收集 handles 和描述符
+        self.task_handles.push(sampler_handle);
+        self.task_handles.push(state_handle);
+        self.task_handles.push(tool_handle);
         self.task_handles.push(thinker_handle);
+        self.task_handles.push(tui_handle);
+
         self.launched_nodes.push(NodeDescriptor {
-            id: thinker_id,
+            id: sampler_id_clone,
+            node_type: NodeType::Sampler,
+            name: "sampler-primary".into(),
+        });
+        self.launched_nodes.push(NodeDescriptor {
+            id: state_id_clone,
+            node_type: NodeType::State,
+            name: "state-primary".into(),
+        });
+        self.launched_nodes.push(NodeDescriptor {
+            id: tool_id_clone,
+            node_type: NodeType::Tool,
+            name: "tool-primary".into(),
+        });
+        self.launched_nodes.push(NodeDescriptor {
+            id: thinker_id_clone,
             node_type: NodeType::Thinker,
             name: "thinker-primary".into(),
         });
-        tracing::info!("Thinker Node（大脑皮层 + 内置感官层）已 spawn");
-
-        // 5. TUI Node（交互层：Ear + Mouth 的能力由 TUINode 统一处理）
-        let tui_ctx = self.node_context();
-        let tui_id = NodeId::new();
-        let tui = TUINode::new(tui_id.clone());
-        let tui_handle = tokio::spawn(async move {
-            if let Err(e) = crate::node::tui::run_tui_node(tui, tui_ctx).await {
-                tracing::error!("TUI Node 异常退出：{}", e);
-            }
-        });
-        self.task_handles.push(tui_handle);
         self.launched_nodes.push(NodeDescriptor {
-            id: tui_id,
+            id: tui_id_clone,
             node_type: NodeType::TUI,
             name: "tui-primary".into(),
         });
-        tracing::info!("TUI Node 已 spawn");
 
         tracing::info!("仿生架构（路线 A）初始 Node 集合启动完成（共 {} 个）", self.launched_nodes.len());
         Ok(self.launched_nodes.clone())

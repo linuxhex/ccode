@@ -1022,14 +1022,7 @@ pub(crate) struct SessionActor {
     /// tests and other constructor sites use `SamplerHandle::noop()`.
     /// All inference flows through this handle.
     pub(crate) sampler_handle: ccode_sampler::SamplerHandle,
-    /// 是否使用消息总线路由 LLM 请求和工具调用（默认 false，直接调用 ccode-sampler/ccode-tools）。
-    ///
-    /// 当 `true` 时，`run_turn_via_sampler` 和 `execute_tool_calls` 通过
-    /// `message_bus_bridge` 将请求路由到消息总线上的 SamplerNode 和 ToolNode，
-    /// 而非直接调用本地 ccode-sampler/ccode-tools。
-    /// 保留 `false` 路径以支持并行运行和渐进迁移。
-    pub(crate) use_message_bus: bool,
-    /// 消息总线桥接器（仅当 `use_message_bus=true` 时存在）。
+    /// 消息总线桥接器（始终存在，分布式模式下始终通过消息总线路由）。
     ///
     /// 持有 ccore 的 `NodeTransport` 连接，提供 LLM 请求和工具调用的消息总线路径。
     /// 通过 `MessageBusBridge::connect()` 创建，生命周期与 SessionActor 一致。

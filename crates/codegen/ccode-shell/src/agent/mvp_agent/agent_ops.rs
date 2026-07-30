@@ -3718,9 +3718,9 @@ impl MvpAgent {
                     None,
                     max_turns,
                     None,
-                    self.cfg.borrow().session.use_message_bus,
-                    self.cfg.borrow().session.message_bus_router_addr.clone(),
-                    self.cfg.borrow().session.message_bus_pub_addr.clone(),
+                    // ZMQ addresses come from the kernel; use defaults matching KernelConfig
+                    "ipc:///tmp/ccode-router".to_string(),
+                    "ipc:///tmp/ccode-pub".to_string(),
                 )
                 .await?
         };

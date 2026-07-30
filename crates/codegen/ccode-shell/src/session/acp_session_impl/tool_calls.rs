@@ -285,18 +285,14 @@ impl SessionActor {
         &self,
         tool_calls: Vec<crate::sampling::types::ToolCallResponse>,
     ) -> Result<ToolLoop, acp::Error> {
-        // 消息总线路径：当 use_message_bus=true 且 bridge 可用时，工具调用通过 MessageBusBridge
-        // 路由到消息总线上的 ToolNode，而非直接调用本地 ccode-tools。
-        // 如果 bridge 不可用，回退到直接调用路径以确保工具执行不中断。
-        if self.use_message_bus {
-            if !self.message_bus_bridge.borrow().is_none() {
-                return self.execute_tool_calls_via_message_bus(tool_calls).await;
-            } else {
-                tracing::warn!(
-                    "use_message_bus=true 但 message_bus_bridge 未初始化，回退到直接调用路径"
-                );
-                // 继续执行下面的直接调用路径
-            }
+        // 消息总线路径：始终尝试通过 MessageBusBridge 路由到消息总线上的 ToolNode。
+        // 如果 bridge 不可用，回退到本地工具调用路径以确保工具执行不中断。
+        if !self.message_bus_bridge.borrow().is_none() {
+            return self.execute_tool_calls_via_message_bus(tool_calls).await;
+        } else {
+            tracing::warn!(
+                "message_bus_bridge 未初始化，回退到本地工具调用路径"
+            );
         }
         if let Some(cfg) = self.chat_state_handle.get_sampling_config().await {
             tracing::Span::current().record("model_id", cfg.model.as_str());
@@ -905,7 +901,7 @@ impl SessionActor {
 
     /// 消息总线路径：通过 MessageBusBridge 将工具调用路由到消息总线上的 ToolNode。
     ///
-    /// 当 `use_message_bus=true` 时，`execute_tool_calls` 委托到此方法。
+    /// 当消息总线可用时，`execute_tool_calls` 委托到此方法。
     /// 流程：
     /// 1. 对每个 ToolCallResponse，解析参数并通过 `MessageBusBridge::send_tool_call` 发送
     /// 2. 等待 ToolNode 通过消息总线返回执行结果
@@ -924,7 +920,7 @@ impl SessionActor {
             Some(b) => b.clone(),
             None => {
                 tracing::warn!(
-                    "use_message_bus=true 但 message_bus_bridge 未初始化，工具调用走消息总线路径失败"
+                    "message_bus_bridge 未初始化，工具调用走消息总线路径失败"
                 );
                 return Ok(ToolLoop::Continue);
             }

@@ -1,16 +1,16 @@
 //! MessageBusBridge - ccode-shell 与 ccore 消息总线的桥接器
 //!
-//! 当 `use_message_bus=true` 时，SessionActor 通过此桥接器将 LLM 请求和工具调用
-//! 路由到消息总线上的 SamplerNode 和 ToolNode，而非直接调用 ccode-sampler/ccode-tools。
+//! SessionActor 始终通过此桥接器将 LLM 请求和工具调用路由到消息总线上的 SamplerNode
+//! 和 ToolNode。如果桥接器不可用，则回退到直接调用 ccode-sampler/ccode-tools。
 //!
-//! 架构：
+//! 架构（分布式模式统一后）：
 //! ```text
 //! SessionActor
-//!   ├─ use_message_bus=false → 直接调用 ccode-sampler/ccode-tools（原有路径）
-//!   └─ use_message_bus=true  → MessageBusBridge
-//!                                ├─ send_llm_request() → 消息总线 → SamplerNode
-//!                                ├─ send_tool_call()   → 消息总线 → ToolNode
-//!                                └─ broadcast_state()  → 消息总线 → TUI/监控
+//!   └─ MessageBusBridge（主路径）
+//!      ├─ send_llm_request() → 消息总线 → SamplerNode
+//!      ├─ send_tool_call()   → 消息总线 → ToolNode
+//!      ├─ broadcast_state()  → 消息总线 → TUI/监控
+//!      └─ 回退：桥接器不可用时 → 本地 ccode-sampler/ccode-tools
 //! ```
 //!
 //! 桥接器内部运行一个消息循环（类似 ccore 的 `run_node`），负责：

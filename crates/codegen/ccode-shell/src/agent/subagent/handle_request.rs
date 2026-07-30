@@ -1142,9 +1142,9 @@ pub(crate) async fn run_shell_child(
         } else {
             None
         },
-        false, // use_message_bus: subagents use direct calls, parent session handles bus routing
-        String::new(), // message_bus_router_addr: unused when use_message_bus=false
-        String::new(), // message_bus_pub_addr: unused when use_message_bus=false
+        // Subagents share the same ZMQ message bus as the parent session
+        "ipc:///tmp/ccode-router".to_string(),
+        "ipc:///tmp/ccode-pub".to_string(),
     )
     .await;
     let (child_handle, mut permission_rx, _system_prompt, child_thread) = match spawn_result {

@@ -68,7 +68,7 @@ use crate::node::{NodeId, NodeType, NodeContext};
 use crate::sampler::token_budget::TokenBudgetManager;
 use crate::retry::circuit_breaker::CircuitBreaker;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock, Mutex};
+use tokio::sync::{mpsc, RwLock, Mutex, watch};
 
 /// Kernel 配置
 #[derive(Debug, Clone)]
@@ -144,26 +144,28 @@ pub struct Kernel {
     config_watcher: Option<ConfigWatcher>,
     /// 配置变更事件接收端（由 ConfigWatcher 创建，在 run() 中消费）
     config_event_rx: Option<mpsc::Receiver<crate::config::watcher::ConfigChangeEvent>>,
-    /// 情景记忆存储（Zettelkasten知识网络）
+    /// 情景记忆存储（Zettelkasten知识网络）— 懒初始化
     /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.episodic 访问
     #[allow(dead_code)]
-    episodic_memory: EpisodicMemoryStore,
-    /// 经验反思学习引擎（ERL/MAR）
+    episodic_memory: std::sync::OnceLock<EpisodicMemoryStore>,
+    /// 经验反思学习引擎（ERL/MAR）— 懒初始化
     /// 保留供 standalone ccore 模式使用；shell 模式不直接使用此字段
     #[allow(dead_code)]
-    erl: ExperientialReflectiveLearner,
-    /// 去中心化DAG协调器（AgentNet/Symphony）
+    erl: std::sync::OnceLock<ExperientialReflectiveLearner>,
+    /// 去中心化DAG协调器（AgentNet/Symphony）— 懒初始化
     /// 保留供 standalone ccore 模式使用；shell 模式不直接使用此字段
     #[allow(dead_code)]
-    coordinator: DecentralizedCoordinator,
-    /// 元认知控制器（MAP/LAF）
+    coordinator: std::sync::OnceLock<DecentralizedCoordinator>,
+    /// 元认知控制器（MAP/LAF）— 懒初始化
     /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.meta_cognitive 访问
     #[allow(dead_code)]
-    meta_cognitive: MetaCognitiveController,
+    meta_cognitive: std::sync::OnceLock<MetaCognitiveController>,
     /// Token 预算管理器（借鉴 Claude Code tokenBudget.ts）
     token_budget: Arc<std::sync::Mutex<TokenBudgetManager>>,
     /// 熔断器（借鉴 Claude Code withRetry.ts）
     circuit_breaker: Arc<CircuitBreaker>,
+    /// 注册通知发送端（Node 注册成功时发送当前注册数量，用于事件驱动等待）
+    registration_notify_tx: watch::Sender<usize>,
 }
 
 impl Kernel {
@@ -202,6 +204,9 @@ impl Kernel {
             }
         };
 
+        // 注册通知 channel（事件驱动：Node 注册时发送当前数量，替代轮询等待）
+        let (registration_notify_tx, _registration_notify_rx) = watch::channel(0usize);
+
         Self {
             config,
             broker,
@@ -218,12 +223,13 @@ impl Kernel {
             self_healing: None, // 向后兼容保留，已由 autonomic 接管
             config_watcher,
             config_event_rx,
-            episodic_memory: EpisodicMemoryStore::new(),
-            erl: ExperientialReflectiveLearner::new(100),
-            coordinator: DecentralizedCoordinator::new(50),
-            meta_cognitive: MetaCognitiveController::new(),
+            episodic_memory: std::sync::OnceLock::new(),
+            erl: std::sync::OnceLock::new(),
+            coordinator: std::sync::OnceLock::new(),
+            meta_cognitive: std::sync::OnceLock::new(),
             token_budget: Arc::new(std::sync::Mutex::new(TokenBudgetManager::new("claude-3.5-sonnet"))),
             circuit_breaker: Arc::new(CircuitBreaker::new(crate::retry::circuit_breaker::CircuitBreakerConfig::default())),
+            registration_notify_tx,
         }
     }
 
@@ -235,32 +241,32 @@ impl Kernel {
         self.ccode_config = Some(Arc::new(RwLock::new(config)));
     }
 
-    /// 获取情景记忆存储
+    /// 获取情景记忆存储（懒初始化）
     /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.episodic 访问
     #[allow(dead_code)]
     pub fn episodic_memory(&self) -> &EpisodicMemoryStore {
-        &self.episodic_memory
+        self.episodic_memory.get_or_init(|| EpisodicMemoryStore::new())
     }
 
-    /// 获取经验反思学习引擎
+    /// 获取经验反思学习引擎（懒初始化）
     /// 保留供 standalone ccore 模式使用；shell 模式不直接调用此方法
     #[allow(dead_code)]
     pub fn erl(&self) -> &ExperientialReflectiveLearner {
-        &self.erl
+        self.erl.get_or_init(|| ExperientialReflectiveLearner::new(100))
     }
 
-    /// 获取去中心化DAG协调器
+    /// 获取去中心化DAG协调器（懒初始化）
     /// 保留供 standalone ccore 模式使用；shell 模式不直接调用此方法
     #[allow(dead_code)]
     pub fn coordinator(&self) -> &DecentralizedCoordinator {
-        &self.coordinator
+        self.coordinator.get_or_init(|| DecentralizedCoordinator::new(50))
     }
 
-    /// 获取元认知控制器
+    /// 获取元认知控制器（懒初始化）
     /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.meta_cognitive 访问
     #[allow(dead_code)]
     pub fn meta_cognitive(&self) -> &MetaCognitiveController {
-        &self.meta_cognitive
+        self.meta_cognitive.get_or_init(|| MetaCognitiveController::new())
     }
 
     /// 获取 Token 预算管理器
@@ -360,18 +366,41 @@ impl Kernel {
                         })
                         .collect();
 
-                    // 等待所有 Node 完成注册（最多 5 秒，每 100ms 检查一次）
+                    // 等待所有 Node 完成注册（事件驱动：通过 watch channel 通知，替代轮询）
+                    let expected_count = node_ids.len();
                     let mut all_registered = false;
-                    for _ in 0..50 {
-                        let registered = node_ids.iter().all(|id| {
-                            let nid: NodeId = id.parse().unwrap_or_else(|_| NodeId::from("invalid"));
-                            self.registry.get(&nid).is_some()
-                        });
-                        if registered {
-                            all_registered = true;
-                            break;
+                    let mut reg_rx = self.registration_notify_tx.subscribe();
+                    // 先做一次即时检查（可能 Node 已全部注册完成）
+                    let already_done = node_ids.iter().all(|id| {
+                        let nid: NodeId = id.parse().unwrap_or_else(|_| NodeId::from("invalid"));
+                        self.registry.get(&nid).is_some()
+                    });
+                    if already_done {
+                        all_registered = true;
+                    } else {
+                        // 等待 watch channel 通知，最多 5 秒超时
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            async {
+                                while reg_rx.changed().await.is_ok() {
+                                    let count = *reg_rx.borrow();
+                                    if count >= expected_count {
+                                        // 再次确认所有目标 Node 都已注册
+                                        let registered = node_ids.iter().all(|id| {
+                                            let nid: NodeId = id.parse().unwrap_or_else(|_| NodeId::from("invalid"));
+                                            self.registry.get(&nid).is_some()
+                                        });
+                                        if registered {
+                                            return true;
+                                        }
+                                    }
+                                }
+                                false
+                            }
+                        ).await {
+                            Ok(true) => all_registered = true,
+                            _ => {}
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
 
                     if all_registered {
@@ -745,6 +774,9 @@ impl Kernel {
 
                     // ✅ 注册到 AutonomicNervousSystem（心跳监控 + 自动重启）
                     self.autonomic.register_agent(node_id_str.to_string()).await;
+
+                    // 通知注册等待者（事件驱动：替代轮询）
+                    let _ = self.registration_notify_tx.send(self.registry.len());
                 }
 
                 // ROS 1 核心：返回 publisher 发现信息给新注册的 Node

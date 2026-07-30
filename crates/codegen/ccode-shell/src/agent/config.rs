@@ -1756,32 +1756,6 @@ pub struct SessionConfig {
     /// round-trips as absent on disk (managed config wins over default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_envrc: Option<bool>,
-    /// Whether to route LLM requests and tool calls through the message bus
-    /// (ccore Kernel) instead of calling ccode-sampler/ccode-tools directly.
-    /// Set to `true` in distributed mode so the SessionActor connects to the
-    /// Kernel via MessageBusBridge. Defaults to `false` (direct calls).
-    #[serde(default)]
-    pub use_message_bus: bool,
-    /// ZMQ ROUTER socket address for the message bus (Kernel).
-    /// Used by MessageBusBridge to connect when `use_message_bus=true`.
-    /// Defaults to `"ipc:///tmp/ccode-router"`.
-    #[serde(default = "default_message_bus_router_addr")]
-    pub message_bus_router_addr: String,
-    /// ZMQ PUB socket address for the message bus (Kernel).
-    /// Used by MessageBusBridge to connect when `use_message_bus=true`.
-    /// Defaults to `"ipc:///tmp/ccode-pub"`.
-    #[serde(default = "default_message_bus_pub_addr")]
-    pub message_bus_pub_addr: String,
-}
-
-/// Default ZMQ ROUTER address for the message bus.
-fn default_message_bus_router_addr() -> String {
-    "ipc:///tmp/ccode-router".into()
-}
-
-/// Default ZMQ PUB address for the message bus.
-fn default_message_bus_pub_addr() -> String {
-    "ipc:///tmp/ccode-pub".into()
 }
 /// Configuration for change-archive deduplication.
 #[derive(Debug, Clone, Serialize, Deserialize)]

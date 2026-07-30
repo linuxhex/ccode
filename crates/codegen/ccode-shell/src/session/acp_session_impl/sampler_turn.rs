@@ -1163,9 +1163,11 @@ impl SessionActor {
     }
     /// Drive a single turn through the sampler-based path.
     ///
-    /// Calls `prepare_sampler_for_turn` first (auth refresh + config
-    /// push), then submits via `SamplerHandle::submit_and_collect` and
-    /// returns:
+    /// Always routes through the message bus (ZMQ → SamplerNode) since we
+    /// unified to the distributed mode. Falls back to direct sampler calls
+    /// when the message bus bridge is not yet connected.
+    ///
+    /// Returns:
     /// * `Ok(SamplerTurnOutcome::Response(_))` - model responded.
     /// * `Ok(SamplerTurnOutcome::CompactAndResubmit)` - compaction
     ///    ran, the outer turn loop should `continue`.
@@ -1179,131 +1181,12 @@ impl SessionActor {
     ) -> Result<SamplerTurnOutcome, acp::Error> {
         // 用户消息加入时持久化会话快照（best-effort，不阻塞主流程）
         self.persist_turn_snapshot(&request, None, "turn_start");
-        // 消息总线路径：当 use_message_bus=true 时，LLM 请求通过 MessageBusBridge 路由
-        // 到消息总线上的 SamplerNode，而非直接调用本地 ccode-sampler。
-        if self.use_message_bus {
-            return self.run_turn_via_message_bus(request).await;
-        }
-        self.prepare_sampler_for_turn().await;
-        // ccore 融合：熔断器门控——防止级联失败
-        if !crate::session::ccore_integration::check_circuit_breaker() {
-            // ccore 融合：熔断降级——等待恢复而非直接报错，避免终止会话
-            if !crate::session::ccore_integration::wait_for_circuit_recovery(5000).await {
-                tracing::warn!("ccore: circuit breaker still open after waiting, degrading");
-                // 不报错，继续尝试（降级而非终止会话）
-            }
-        }
-        let stream_drained_rx = {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            *self.turn_stream_drained.lock() = Some(tx);
-            rx
-        };
-        // 用 retry_with_backoff 包装 LLM 采样调用：仅对网络超时/5xx/限流等可恢复
-        // 错误重试（max_retries=3, initial=1s, max=30s）；401/参数错误/流式中断不
-        // 重试，分别交由 handle_sampling_failure 与既有恢复链处理。每次重试使用
-        // 新的 request_id，且仅在流式开始前重试，保证幂等（不产生重复输出）。
-        let retry_policy = ccore::retry::RetryPolicy {
-            max_retries: 3,
-            initial_backoff_ms: 1000,
-            max_backoff_ms: 30000,
-            retryable_codes: vec![408, 429, 500, 502, 503, 504],
-        };
-        let sampled = ccore::retry::backoff::retry_with_error_check(
-            &retry_policy,
-            || async {
-                let attempt_id = ccode_sampler::RequestId::random();
-                let attempt_id_str = attempt_id.as_str().to_string();
-                self.sampler_handle
-                    .submit_and_collect(attempt_id, request.clone())
-                    .await
-                    .map(|(response, metrics)| (attempt_id_str, response, metrics))
-            },
-            retryable_sampling_error_code,
-        )
-        .await;
-        match sampled {
-            Ok((request_id_str, response, metrics)) => {
-                // ccore 融合：记录成功调用
-                crate::session::ccore_integration::record_circuit_success();
-                // ccore 融合：Token预算追踪（持久化 ccore_state，跨轮次累积）
-                {
-                    if let Some(ref usage) = response.usage {
-                        let input_tokens = u64::from(usage.prompt_tokens);
-                        let output_tokens = u64::from(usage.completion_tokens);
-                        if input_tokens > 0 || output_tokens > 0 {
-                            self.ccore_state.record_token_usage(input_tokens as usize, output_tokens as usize);
-                        }
-                    }
-                }
-                let span = tracing::Span::current();
-                span.record("request_id", request_id_str.as_str());
-                if let Some(ttft) = metrics.time_to_first_token_ms {
-                    span.record("ttft_ms", ttft as i64);
-                }
-                if metrics.attempts > 0 {
-                    span.record("attempt", i64::from(metrics.attempts));
-                }
-                if tokio::time::timeout(std::time::Duration::from_secs(5), stream_drained_rx)
-                    .await
-                    .is_err()
-                {
-                    self.turn_stream_drained.lock().take();
-                    tracing::warn!(
-                        "stream-drain barrier timed out; proceeding to emit tool \
-                         calls (eventId ordering may be imperfect this turn)"
-                    );
-                }
-                // Agent 响应完成时持久化会话快照
-                self.persist_turn_snapshot(&request, Some(&response), "turn_end");
-                // ccore 融合：情景记忆编码（持久化 ccore_state，跨轮次累积）
-                {
-                    let user_text: String = request.items.iter()
-                        .filter_map(|item| match item {
-                            ccode_sampling_types::ConversationItem::User(u) => {
-                                Some(u.content.iter().filter_map(|p| match p {
-                                    ccode_sampling_types::ContentPart::Text { text } => Some(text.as_ref()),
-                                    _ => None,
-                                }).collect::<Vec<_>>().join(""))
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let assistant_text: String = response.items.iter()
-                        .filter_map(|item| match item {
-                            ccode_sampling_types::ConversationItem::Assistant(a) => Some(a.content.as_ref()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if !user_text.is_empty() || !assistant_text.is_empty() {
-                        self.ccore_state.encode_episodic_turn(&user_text, &assistant_text, &[]);
-                    }
-                }
-                Ok(SamplerTurnOutcome::Response(
-                    Box::new(response),
-                    Box::new(metrics),
-                ))
-            }
-            Err(rich_err) => {
-                // ccore 融合：记录失败调用
-                crate::session::ccore_integration::record_circuit_failure();
-                self.turn_stream_drained.lock().take();
-                let info = ccode_sampler::SamplingErrorInfo::from(&rich_err);
-                match self.handle_sampling_failure(info).await? {
-                    SamplerFailureRecovery::CompactAndResubmit => {
-                        Ok(SamplerTurnOutcome::CompactAndResubmit)
-                    }
-                    SamplerFailureRecovery::RefreshAuthAndResubmit => {
-                        Ok(SamplerTurnOutcome::RefreshAuthAndResubmit)
-                    }
-                }
-            }
-        }
+        // 始终走消息总线路径
+        self.run_turn_via_message_bus(request).await
     }
     /// 消息总线路径：通过 MessageBusBridge 将 LLM 请求路由到消息总线上的 SamplerNode。
     ///
-    /// 当 `use_message_bus=true` 时，`run_turn_via_sampler` 委托到此方法。
+    /// 这是唯一的 LLM 采样路径（分布式模式统一后）。
     /// 流程：
     /// 1. 将 `ConversationRequest` 转换为 ccore 的 `SampleRequest`
     /// 2. 通过 `MessageBusBridge::send_llm_request` 发送到消息总线
@@ -1327,9 +1210,9 @@ impl SessionActor {
             Some(b) => b.clone(),
             None => {
                 tracing::warn!(
-                    "use_message_bus=true 但 message_bus_bridge 未初始化，回退到直接调用路径"
+                    "message_bus_bridge 未初始化，回退到本地 sampler 路径"
                 );
-                return self.run_turn_via_sampler_direct(request).await;
+                return self.run_turn_local_fallback(request).await;
             }
         };
 
@@ -1422,8 +1305,8 @@ impl SessionActor {
         let (mut chunk_rx, done_rx) = match bridge.send_llm_request(sample_request).await {
             Ok(result) => result,
             Err(e) => {
-                tracing::warn!("消息总线 LLM 请求发送失败：{}，回退到直接调用路径", e);
-                return self.run_turn_via_sampler_direct(request).await;
+                tracing::warn!("消息总线 LLM 请求发送失败：{}，回退到本地 sampler 路径", e);
+                return self.run_turn_local_fallback(request).await;
             }
         };
 
@@ -1476,8 +1359,8 @@ impl SessionActor {
             crate::session::message_bus_bridge::LlmOutcome::Error(e) => {
                 // ccore 融合：记录失败调用
                 crate::session::ccore_integration::record_circuit_failure();
-                tracing::warn!("消息总线 LLM 采样错误：{}，回退到直接调用路径", e);
-                return self.run_turn_via_sampler_direct(request).await;
+                tracing::warn!("消息总线 LLM 采样错误：{}，回退到本地 sampler 路径", e);
+                return self.run_turn_local_fallback(request).await;
             }
         }
 
@@ -1546,22 +1429,18 @@ impl SessionActor {
         ))
     }
 
-    /// 直接调用路径（绕过消息总线检查）。
+    /// 本地 sampler 回退路径：当消息总线不可用时，直接调用 ccode-sampler。
     ///
-    /// 当消息总线路径失败需要回退时使用。此方法不检查 `use_message_bus` 标志，
-    /// 直接调用 ccode-sampler。同样用 `retry_with_backoff` 包装采样调用，
-    /// 仅对网络超时/5xx/限流重试。
-    async fn run_turn_via_sampler_direct(
+    /// 用 `retry_with_backoff` 包装采样调用，仅对网络超时/5xx/限流重试。
+    async fn run_turn_local_fallback(
         self: &Arc<Self>,
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
         self.prepare_sampler_for_turn().await;
-        // ccore 融合：熔断器门控——防止级联失败
+        // ccore 融合：熔断器门控
         if !crate::session::ccore_integration::check_circuit_breaker() {
-            // ccore 融合：熔断降级——等待恢复而非直接报错，避免终止会话
             if !crate::session::ccore_integration::wait_for_circuit_recovery(5000).await {
                 tracing::warn!("ccore: circuit breaker still open after waiting, degrading");
-                // 不报错，继续尝试（降级而非终止会话）
             }
         }
         let stream_drained_rx = {
@@ -1590,8 +1469,17 @@ impl SessionActor {
         .await;
         match sampled {
             Ok((request_id_str, response, metrics)) => {
-                // ccore 融合：记录成功调用
                 crate::session::ccore_integration::record_circuit_success();
+                // ccore 融合：Token预算追踪
+                {
+                    if let Some(ref usage) = response.usage {
+                        let input_tokens = u64::from(usage.prompt_tokens);
+                        let output_tokens = u64::from(usage.completion_tokens);
+                        if input_tokens > 0 || output_tokens > 0 {
+                            self.ccore_state.record_token_usage(input_tokens as usize, output_tokens as usize);
+                        }
+                    }
+                }
                 let span = tracing::Span::current();
                 span.record("request_id", request_id_str.as_str());
                 if let Some(ttft) = metrics.time_to_first_token_ms {
@@ -1610,9 +1498,8 @@ impl SessionActor {
                          calls (eventId ordering may be imperfect this turn)"
                     );
                 }
-                // Agent 响应完成时持久化会话快照（回退路径）
                 self.persist_turn_snapshot(&request, Some(&response), "turn_end");
-                // ccore 融合：情景记忆编码（持久化 ccore_state，跨轮次累积）
+                // ccore 融合：情景记忆编码
                 {
                     let user_text: String = request.items.iter()
                         .filter_map(|item| match item {
@@ -1643,7 +1530,6 @@ impl SessionActor {
                 ))
             }
             Err(rich_err) => {
-                // ccore 融合：记录失败调用
                 crate::session::ccore_integration::record_circuit_failure();
                 self.turn_stream_drained.lock().take();
                 let info = ccode_sampler::SamplingErrorInfo::from(&rich_err);
@@ -1658,6 +1544,7 @@ impl SessionActor {
             }
         }
     }
+
     /// Proactively refresh the auth token if near expiry.
     ///
     /// Session-token path is best-effort: on success, update credentials and

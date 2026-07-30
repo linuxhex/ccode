@@ -401,7 +401,6 @@ pub(crate) async fn create_test_actor_ex(
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle: ccode_sampler::SamplerHandle::noop(),
-        use_message_bus: false,
         message_bus_bridge: std::cell::RefCell::new(None),
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
