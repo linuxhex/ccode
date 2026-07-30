@@ -1142,6 +1142,9 @@ pub(crate) async fn run_shell_child(
         } else {
             None
         },
+        false, // use_message_bus: subagents use direct calls, parent session handles bus routing
+        String::new(), // message_bus_router_addr: unused when use_message_bus=false
+        String::new(), // message_bus_pub_addr: unused when use_message_bus=false
     )
     .await;
     let (child_handle, mut permission_rx, _system_prompt, child_thread) = match spawn_result {

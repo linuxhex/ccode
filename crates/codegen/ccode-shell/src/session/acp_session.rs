@@ -1033,7 +1033,7 @@ pub(crate) struct SessionActor {
     ///
     /// 持有 ccore 的 `NodeTransport` 连接，提供 LLM 请求和工具调用的消息总线路径。
     /// 通过 `MessageBusBridge::connect()` 创建，生命周期与 SessionActor 一致。
-    pub(crate) message_bus_bridge: Option<Arc<crate::session::message_bus_bridge::MessageBusBridge>>,
+    pub(crate) message_bus_bridge: std::cell::RefCell<Option<Arc<crate::session::message_bus_bridge::MessageBusBridge>>>,
     /// Cached recipe for constructing this session's [`ccode_agent::Agent`].
     ///
     /// Populated once at session spawn and then reused by

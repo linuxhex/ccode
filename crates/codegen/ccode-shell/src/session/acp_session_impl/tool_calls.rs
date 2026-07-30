@@ -289,7 +289,7 @@ impl SessionActor {
         // 路由到消息总线上的 ToolNode，而非直接调用本地 ccode-tools。
         // 如果 bridge 不可用，回退到直接调用路径以确保工具执行不中断。
         if self.use_message_bus {
-            if self.message_bus_bridge.is_some() {
+            if !self.message_bus_bridge.borrow().is_none() {
                 return self.execute_tool_calls_via_message_bus(tool_calls).await;
             } else {
                 tracing::warn!(
@@ -920,7 +920,7 @@ impl SessionActor {
         &self,
         tool_calls: Vec<crate::sampling::types::ToolCallResponse>,
     ) -> Result<ToolLoop, acp::Error> {
-        let bridge = match &self.message_bus_bridge {
+        let bridge = match self.message_bus_bridge.borrow().as_ref() {
             Some(b) => b.clone(),
             None => {
                 tracing::warn!(

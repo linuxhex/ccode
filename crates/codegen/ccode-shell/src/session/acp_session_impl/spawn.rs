@@ -201,6 +201,9 @@ pub(crate) async fn spawn_session_actor(
     >,
     max_turns: Option<usize>,
     forked_tool_override: Option<Vec<ToolSpec>>,
+    use_message_bus: bool,
+    message_bus_router_addr: String,
+    message_bus_pub_addr: String,
 ) -> Result<
     (
         SessionHandle,
@@ -1640,8 +1643,8 @@ pub(crate) async fn spawn_session_actor(
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
         turn_stream_drained: parking_lot::Mutex::new(None),
         sampler_handle,
-        use_message_bus: false,
-        message_bus_bridge: None,
+        use_message_bus,
+        message_bus_bridge: std::cell::RefCell::new(None),
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
@@ -1661,6 +1664,37 @@ pub(crate) async fn spawn_session_actor(
             tokens_used,
             finished_marginal,
         );
+    }
+    // Initialize MessageBusBridge when use_message_bus=true
+    if use_message_bus {
+        let agent_id = session_info.id.0.to_string();
+        let bridge_session = session.clone();
+        let router_addr_clone = message_bus_router_addr.clone();
+        let pub_addr_clone = message_bus_pub_addr.clone();
+        tokio::task::spawn_local(async move {
+            match crate::session::message_bus_bridge::MessageBusBridge::connect(
+                &router_addr_clone,
+                &pub_addr_clone,
+                agent_id.clone(),
+            )
+            .await
+            {
+                Ok(bridge) => {
+                    tracing::info!(
+                        session_id = %agent_id,
+                        "MessageBusBridge 已连接：启用消息总线路径"
+                    );
+                    *bridge_session.message_bus_bridge.borrow_mut() = Some(bridge);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %agent_id,
+                        error = %e,
+                        "MessageBusBridge 连接失败，回退到直接调用路径"
+                    );
+                }
+            }
+        });
     }
     session.emit_resolved_tool_overrides();
     {
@@ -2152,6 +2186,9 @@ pub(crate) async fn spawn_session_on_thread(
     >,
     max_turns: Option<usize>,
     forked_tool_override: Option<Vec<ToolSpec>>,
+    use_message_bus: bool,
+    message_bus_router_addr: String,
+    message_bus_pub_addr: String,
 ) -> Result<
     (
         SessionHandle,
@@ -2312,6 +2349,9 @@ pub(crate) async fn spawn_session_on_thread(
                         parent_scheduler_handle,
                         max_turns,
                         forked_tool_override,
+                        use_message_bus,
+                        message_bus_router_addr,
+                        message_bus_pub_addr,
                     )
                     .await
                     {

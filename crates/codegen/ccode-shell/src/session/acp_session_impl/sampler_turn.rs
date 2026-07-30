@@ -1323,7 +1323,7 @@ impl SessionActor {
                 // 不报错，继续尝试（降级而非终止会话）
             }
         }
-        let bridge = match &self.message_bus_bridge {
+        let bridge = match self.message_bus_bridge.borrow().as_ref() {
             Some(b) => b.clone(),
             None => {
                 tracing::warn!(

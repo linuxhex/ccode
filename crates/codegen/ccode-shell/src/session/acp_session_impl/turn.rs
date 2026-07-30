@@ -923,7 +923,7 @@ impl SessionActor {
                 // 状态变迁广播到消息总线：使 TUI/监控可观测循环阶段
                 // 仅在 use_message_bus=true 且桥接器可用时发送，失败不阻塞主循环
                 if self.use_message_bus {
-                    if let Some(bridge) = &self.message_bus_bridge {
+                    if let Some(bridge) = self.message_bus_bridge.borrow().as_ref() {
                         let state_name = format!("{:?}", loop_sm.state());
                         let metadata = serde_json::json!({
                             "turn_count": loop_sm.turn_count(),

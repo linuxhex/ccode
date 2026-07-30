@@ -174,6 +174,8 @@ async fn quick_start(config: ccore::config::CcodeConfig) -> anyhow::Result<()> {
 
     // 2. 构造 shell Config（从 ccode 配置映射）
     let mut shell_config = ccode_shell::agent::config::Config::default();
+    // 快速启动模式不使用消息总线（直接调用 ccode-sampler/ccode-tools）
+    shell_config.session.use_message_bus = false;
     // 应用模型覆盖
     if !config.default_model.is_empty() {
         shell_config.default_model_override = Some(config.default_model.clone());
