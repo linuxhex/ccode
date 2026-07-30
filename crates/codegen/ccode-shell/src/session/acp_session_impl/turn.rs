@@ -1555,16 +1555,11 @@ impl SessionActor {
             self.goal_harness_enabled(),
             self.goal_tracker.lock().status(),
         );
-        // ccore 融合：元认知难度评估——连续失败时推荐策略变更
-        // TODO: P0 FIX NEEDED — SessionMetaCognitive::new() 每次 turn 都重新创建，
-        // 导致元认知状态无法跨 turn 累积（如连续失败计数、策略变更历史）。
-        // 应改为从 CcoreSessionState 获取持久化实例，或使用 session-ID-keyed 全局缓存。
-        // 当前仅标记问题，待 SessionActor 添加 CcoreSessionState 字段后修复。
+        // ccore 融合：元认知难度评估（持久化 ccore_state，跨轮次累积策略效果）
         {
-            let mut meta = crate::session::ccore_integration::SessionMetaCognitive::new();
             let feedback = self.pending_compile_feedback.lock();
             if let Some(ref hint) = *feedback {
-                let conflicts = meta.detect_conflicts(&[hint.clone()]);
+                let conflicts = self.ccore_state.meta_detect_conflicts(&[hint.clone()]);
                 if !conflicts.is_empty() {
                     tracing::warn!("ccore: 元认知检测到冲突循环，推荐调整策略");
                 }

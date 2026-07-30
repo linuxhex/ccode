@@ -1225,12 +1225,14 @@ impl SessionActor {
             Ok((request_id_str, response, metrics)) => {
                 // ccore 融合：记录成功调用
                 crate::session::ccore_integration::record_circuit_success();
-                // ccore 融合：Token预算追踪 + Prompt缓存追踪
+                // ccore 融合：Token预算追踪（持久化 ccore_state，跨轮次累积）
                 {
-                    let total_tokens = response.usage.as_ref().map(|u| u64::from(u.total_tokens)).unwrap_or(0);
-                    if total_tokens > 0 {
-                        tracing::debug!(total_tokens, model = %request.model.as_deref().unwrap_or(""),
-                            "ccore: token usage recorded");
+                    if let Some(ref usage) = response.usage {
+                        let input_tokens = u64::from(usage.prompt_tokens);
+                        let output_tokens = u64::from(usage.completion_tokens);
+                        if input_tokens > 0 || output_tokens > 0 {
+                            self.ccore_state.record_token_usage(input_tokens as usize, output_tokens as usize);
+                        }
                     }
                 }
                 let span = tracing::Span::current();
@@ -1253,15 +1255,8 @@ impl SessionActor {
                 }
                 // Agent 响应完成时持久化会话快照
                 self.persist_turn_snapshot(&request, Some(&response), "turn_end");
-                // ccore 融合：情景记忆编码
-                // TODO: P0 FIX NEEDED — SessionEpisodicMemory::new() 每次 turn 都重新创建，
-                // 导致情景记忆无法跨 turn 累积。应改为从 CcoreSessionState 获取持久化实例，
-                // 或使用 session-ID-keyed 全局缓存（如 OnceLock<HashMap>）。
-                // 当前仅标记问题，待 SessionActor 添加 CcoreSessionState 字段后修复。
+                // ccore 融合：情景记忆编码（持久化 ccore_state，跨轮次累积）
                 {
-                    let mut episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
-                        &self.session_info.id.0.to_string(),
-                    );
                     let user_text: String = request.items.iter()
                         .filter_map(|item| match item {
                             ccode_sampling_types::ConversationItem::User(u) => {
@@ -1282,7 +1277,7 @@ impl SessionActor {
                         .collect::<Vec<_>>()
                         .join(" ");
                     if !user_text.is_empty() || !assistant_text.is_empty() {
-                        episodic.encode_turn(&user_text, &assistant_text, &[]);
+                        self.ccore_state.encode_episodic_turn(&user_text, &assistant_text, &[]);
                     }
                 }
                 Ok(SamplerTurnOutcome::Response(
@@ -1519,15 +1514,8 @@ impl SessionActor {
 
         // Agent 响应完成时持久化会话快照（消息总线路径）
         self.persist_turn_snapshot(&request, Some(&response), "turn_end");
-        // ccore 融合：情景记忆编码
-        // TODO: P0 FIX NEEDED — SessionEpisodicMemory::new() 每次 turn 都重新创建，
-        // 导致情景记忆无法跨 turn 累积。应改为从 CcoreSessionState 获取持久化实例，
-        // 或使用 session-ID-keyed 全局缓存（如 OnceLock<HashMap>）。
-        // 当前仅标记问题，待 SessionActor 添加 CcoreSessionState 字段后修复。
+        // ccore 融合：情景记忆编码（持久化 ccore_state，跨轮次累积）
         {
-            let mut episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
-                &self.session_info.id.0.to_string(),
-            );
             let user_text: String = request.items.iter()
                 .filter_map(|item| match item {
                     ccode_sampling_types::ConversationItem::User(u) => {
@@ -1548,7 +1536,7 @@ impl SessionActor {
                 .collect::<Vec<_>>()
                 .join(" ");
             if !user_text.is_empty() || !assistant_text.is_empty() {
-                episodic.encode_turn(&user_text, &assistant_text, &[]);
+                self.ccore_state.encode_episodic_turn(&user_text, &assistant_text, &[]);
             }
         }
 
@@ -1624,15 +1612,8 @@ impl SessionActor {
                 }
                 // Agent 响应完成时持久化会话快照（回退路径）
                 self.persist_turn_snapshot(&request, Some(&response), "turn_end");
-                // ccore 融合：情景记忆编码
-                // TODO: P0 FIX NEEDED — SessionEpisodicMemory::new() 每次 turn 都重新创建，
-                // 导致情景记忆无法跨 turn 累积。应改为从 CcoreSessionState 获取持久化实例，
-                // 或使用 session-ID-keyed 全局缓存（如 OnceLock<HashMap>）。
-                // 当前仅标记问题，待 SessionActor 添加 CcoreSessionState 字段后修复。
+                // ccore 融合：情景记忆编码（持久化 ccore_state，跨轮次累积）
                 {
-                    let mut episodic = crate::session::ccore_integration::SessionEpisodicMemory::new(
-                        &self.session_info.id.0.to_string(),
-                    );
                     let user_text: String = request.items.iter()
                         .filter_map(|item| match item {
                             ccode_sampling_types::ConversationItem::User(u) => {
@@ -1653,7 +1634,7 @@ impl SessionActor {
                         .collect::<Vec<_>>()
                         .join(" ");
                     if !user_text.is_empty() || !assistant_text.is_empty() {
-                        episodic.encode_turn(&user_text, &assistant_text, &[]);
+                        self.ccore_state.encode_episodic_turn(&user_text, &assistant_text, &[]);
                     }
                 }
                 Ok(SamplerTurnOutcome::Response(

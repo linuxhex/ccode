@@ -1094,6 +1094,10 @@ pub(crate) struct SessionActor {
     /// session spawn; concurrent appends rely on `O_APPEND`'s atomic
     /// guarantee for writes under `PIPE_BUF` (JSONL lines fit).
     pub(crate) laziness_debug_log: Option<std::sync::Arc<std::path::Path>>,
+    /// ccore 会话级状态（情景记忆/元认知/缓存追踪/读取追踪/Token预算）。
+    /// 在 SessionActor 构造时一次性创建，所有调用点共享，确保跨轮次状态累积。
+    /// 使用 Arc 包装以便在 'static 异步闭包中传递（如 dispatch_tool）。
+    pub(crate) ccore_state: std::sync::Arc<crate::session::ccore_integration::CcoreSessionState>,
 }
 /// Template for building trace configs on synthetic auto-wake turns.
 ///

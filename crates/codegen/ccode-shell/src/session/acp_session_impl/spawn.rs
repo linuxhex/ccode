@@ -1648,6 +1648,10 @@ pub(crate) async fn spawn_session_actor(
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: workspace_ops.clone(),
         trace_config_template: std::cell::RefCell::new(None),
+        ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new(
+            &session_info.id.0.to_string(),
+            &sampling_config.model,
+        )),
     });
     if goal_was_restored {
         let current_tokens = session.chat_state_handle.get_total_tokens().await as i64;

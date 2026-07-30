@@ -513,6 +513,7 @@ impl SessionActor {
         let workspace_ops = self.workspace_ops.clone();
         let pending_interjections = self.pending_interjections.clone();
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
+        let ccore_state = self.ccore_state.clone();
         let dispatch_futures: Vec<_> = approved
             .iter()
             .enumerate()
@@ -522,6 +523,7 @@ impl SessionActor {
                 let shared_recovery = Arc::clone(&shared_recovery);
                 let workspace_ops = workspace_ops.clone();
                 let session_id = session_id.clone();
+                let ccore_state = ccore_state.clone();
                 let pending_interjections = pending_interjections.clone();
                 let blocking_wait_depth = self.tool_context.blocking_wait_depth.clone();
                 let interruptible =
@@ -534,6 +536,7 @@ impl SessionActor {
                         let prepared = Arc::clone(&prepared);
                         let workspace_ops = workspace_ops.clone();
                         let session_id = session_id.clone();
+                        let ccore_state = ccore_state.clone();
                         let lock = lock.clone();
                         async move {
                             let _guard = if let Some(ref l) = lock {
@@ -541,7 +544,7 @@ impl SessionActor {
                             } else {
                                 None
                             };
-                            dispatch_tool(&workspace_ops, &prepared, &session_id).await
+                            dispatch_tool(&workspace_ops, &prepared, &session_id, &ccore_state).await
                         }
                     };
                     let result = if interruptible {
@@ -625,7 +628,7 @@ impl SessionActor {
                     }
                 };
                 if auth_rejected && self.reactive_managed_reauth(&server).await.is_ok() {
-                    result = dispatch_tool(&self.workspace_ops, &prepared, &self.session_info.id.0)
+                    result = dispatch_tool(&self.workspace_ops, &prepared, &self.session_info.id.0, &self.ccore_state)
                         .await;
                 }
             }

@@ -168,26 +168,6 @@ impl Clone for SessionReadTracker {
     }
 }
 
-// 保留旧的全局 API 做兼容，内部委托到 thread_local（仅用于无 SessionReadTracker 的场景）
-thread_local! {
-    static FALLBACK_READ_TRACKER: std::cell::RefCell<ReadTracker> = std::cell::RefCell::new(ReadTracker::new());
-}
-
-/// 记录文件已被读取（兼容旧调用，推荐改用 SessionReadTracker）。
-pub fn record_file_read(path: &str) {
-    FALLBACK_READ_TRACKER.with(|t| t.borrow_mut().mark_read(path));
-}
-
-/// 检查写入前是否已读取目标文件（兼容旧调用，推荐改用 SessionReadTracker）。
-pub fn check_read_before_write(path: &str) -> bool {
-    FALLBACK_READ_TRACKER.with(|t| t.borrow().has_been_read(path))
-}
-
-/// 清除读取追踪记录（兼容旧调用）。
-pub fn clear_read_tracker() {
-    FALLBACK_READ_TRACKER.with(|t| t.borrow_mut().clear());
-}
-
 // ─── 4. TokenBudget Bridge ───────────────────────────────────────────────────
 
 use ccore::sampler::token_budget::{BudgetStatus, TokenBudgetManager};
@@ -477,38 +457,7 @@ impl CcoreSessionState {
     }
 }
 
-// ─── 8. tool_dispatch 集成 ───────────────────────────────────────────────────
-
-/// 预调度钩子：检查 write/edit 工具是否已先读取目标文件。
-///
-/// 返回 Some(warning) 表示文件未被读取，返回 None 表示正常。
-pub fn check_write_without_read(tool_name: &str, args: &serde_json::Value) -> Option<String> {
-    if !matches!(
-        tool_name,
-        "write" | "edit" | "search_replace" | "hashline_edit"
-    ) {
-        return None;
-    }
-
-    let path = args
-        .get("file_path")
-        .or_else(|| args.get("path"))
-        .or_else(|| args.get("target_file"))
-        .and_then(|v| v.as_str());
-
-    let Some(path) = path else {
-        return None;
-    };
-
-    if !check_read_before_write(path) {
-        Some(format!(
-            "Warning: writing to '{}' without reading it first. Consider reading the file before editing.",
-            path
-        ))
-    } else {
-        None
-    }
-}
+// ─── 8. tool_dispatch 集成（已迁移到 CcoreSessionState.check_write_without_read）──
 
 #[cfg(test)]
 mod tests {
@@ -621,17 +570,17 @@ mod tests {
 
     #[test]
     fn test_check_write_without_read() {
-        clear_read_tracker();
+        let state = CcoreSessionState::new("test_session", "gpt-4o");
 
         let args = serde_json::json!({"file_path": "/tmp/test_write_check.rs"});
-        let warning = check_write_without_read("write", &args);
+        let warning = state.check_write_without_read("write", &args);
         assert!(warning.is_some());
 
-        record_file_read("/tmp/test_write_check.rs");
-        let no_warning = check_write_without_read("write", &args);
+        state.record_read("/tmp/test_write_check.rs");
+        let no_warning = state.check_write_without_read("write", &args);
         assert!(no_warning.is_none());
 
-        let no_check = check_write_without_read("bash", &args);
+        let no_check = state.check_write_without_read("bash", &args);
         assert!(no_check.is_none());
     }
 

@@ -15,6 +15,7 @@ pub(super) async fn dispatch_tool(
     workspace_ops: &ccode_workspace::WorkspaceOps,
     prepared: &PreparedToolCall,
     session_id: &str,
+    ccore_state: &std::sync::Arc<crate::session::ccore_integration::CcoreSessionState>,
 ) -> Result<ToolRunResult, ccode_tool_runtime::ToolError> {
     tracing::debug!(
         tool = %prepared.tool_name,
@@ -23,8 +24,8 @@ pub(super) async fn dispatch_tool(
         mode = "local",
         "dispatch_tool"
     );
-    // ccore 融合：先读后写检查
-    if let Some(warning) = crate::session::ccore_integration::check_write_without_read(
+    // ccore 融合：先读后写检查（持久化 ccore_state）
+    if let Some(warning) = ccore_state.check_write_without_read(
         &prepared.tool_name,
         &prepared.parsed_args,
     ) {
@@ -38,14 +39,14 @@ pub(super) async fn dispatch_tool(
             Some(session_id),
         )
         .await;
-    // ccore 融合：记录文件读取
+    // ccore 融合：记录文件读取（持久化 ccore_state）
     if result.is_ok() && matches!(prepared.tool_name.as_str(), "read_file" | "read" | "search" | "grep" | "glob" | "list_dir") {
         if let Some(path) = prepared.parsed_args.get("file_path")
             .or_else(|| prepared.parsed_args.get("path"))
             .or_else(|| prepared.parsed_args.get("target_file"))
             .and_then(|v| v.as_str())
         {
-            crate::session::ccore_integration::record_file_read(path);
+            ccore_state.record_read(path);
         }
     }
     result
