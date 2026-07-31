@@ -1,10 +1,11 @@
 //! Node trait 定义 - 所有 Node 进程的统一接口
 //!
-//! 仿生架构（路线 A）：感官内置，5 个活跃 Node
-//! - Sampler / State / Tool / Thinker / TUI
+//! 仿生架构（路线 A）+ ACP 融合：6 个活跃 Node
+//! - Sampler / State / Tool / Thinker / TUI / Acp
 //! - 感官能力（Eye/Ear/Nose/Skin）内置到 ThinkerNode，不拆独立进程
 //! - 运动能力（Hand/Limb）由 ToolNode 统一执行
 //! - 交互能力（Ear/Mouth）由 TUINode 统一处理
+//! - AcpNode：IDE/stdio ACP client 与消息总线之间的边界
 
 pub mod agent;
 pub mod sampler;
@@ -13,6 +14,7 @@ pub mod tool;
 pub mod state;
 pub mod transport;
 pub mod thinker;
+pub mod acp;
 
 // 仿生器官模块（路线 A：已废弃独立进程，感官内置到 ThinkerNode）
 // 保留模块以兼容现有类型引用，但不再由 Launcher spawn
@@ -106,6 +108,7 @@ pub enum NodeType {
     State,
     TUI,
     Plugin,
+    Acp,
     // 仿生器官（路线 A：已废弃独立进程，保留类型用于兼容）
     Eye,
     Ear,
@@ -127,6 +130,7 @@ impl NodeType {
             Self::State => "state",
             Self::TUI => "tui",
             Self::Plugin => "plugin",
+            Self::Acp => "acp",
             Self::Eye => "eye",
             Self::Ear => "ear",
             Self::Nose => "nose",
