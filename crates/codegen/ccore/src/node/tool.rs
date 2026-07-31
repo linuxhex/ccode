@@ -1,5 +1,8 @@
 //! Tool Node - 接收工具调用请求，执行并返回结果
 //!
+//! Fusion: ToolNode 以生产 ccode-tools 能力为准。
+//! Ask 模式：发布 agent/{id}/permission，等待 PermissionResponse 再执行。
+//!
 //! Tool Node 的完整工作流：
 //! 1. 订阅 agent/*/tool_call topic
 //! 2. 收到 ToolCallRequest → 权限检查 → 并发限流 → 执行工具 → 返回 ToolCallResult
@@ -9,9 +12,11 @@
 //! 对应 ANS 的 tool_semaphore，但运行在 ToolNode 本地（独立进程无法共享 ANS）。
 
 use async_trait::async_trait;
-use tokio::sync::Semaphore;
+use std::collections::HashMap;
+use tokio::sync::{Mutex, Semaphore, oneshot};
 
 use crate::message::frame::FrameCodec;
+use crate::message::payloads::{PermissionRequest, PermissionResponse};
 use crate::message::Message;
 use crate::message::Topic;
 use crate::metrics::AgentMetrics;
@@ -32,6 +37,8 @@ pub struct ToolNode {
     permission_mode: PermissionMode,
     /// 并发限流信号量（对应 ANS 的 tool_semaphore）
     concurrency_semaphore: Semaphore,
+    /// 待处理的权限请求（tool_call_id → oneshot sender）
+    pending_permissions: Mutex<HashMap<String, oneshot::Sender<bool>>>,
 }
 
 impl ToolNode {
@@ -41,12 +48,56 @@ impl ToolNode {
             bridge: ToolBridge::new(),
             permission_mode: PermissionMode::Trust,
             concurrency_semaphore: Semaphore::new(DEFAULT_MAX_CONCURRENT_TOOLS),
+            pending_permissions: Mutex::new(HashMap::new()),
         }
     }
 
     /// 设置权限模式
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
         self.permission_mode = mode;
+    }
+
+    /// 等待权限响应（通过总线）
+    async fn wait_permission(&self, tool_call_id: &str) -> anyhow::Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_permissions.lock().await;
+            pending.insert(tool_call_id.to_string(), tx);
+        }
+        // 等待权限响应，超时 60 秒
+        match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
+            Ok(Ok(allowed)) => Ok(allowed),
+            Ok(Err(_)) => {
+                tracing::warn!("权限通道关闭：tool_call_id={}", tool_call_id);
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::warn!("权限请求超时：tool_call_id={}", tool_call_id);
+                // 清理超时的请求
+                let mut pending = self.pending_permissions.lock().await;
+                pending.remove(tool_call_id);
+                Ok(false)
+            }
+        }
+    }
+
+    /// 处理权限响应（来自 AcpNode/TUINode）
+    async fn handle_permission_response(&self, response: PermissionResponse) -> anyhow::Result<()> {
+        let mut pending = self.pending_permissions.lock().await;
+        if let Some(tx) = pending.remove(&response.tool_call_id) {
+            let _ = tx.send(response.allowed);
+            tracing::info!(
+                "权限响应：tool_call_id={}, allowed={}",
+                response.tool_call_id,
+                response.allowed
+            );
+        } else {
+            tracing::warn!(
+                "权限响应无匹配请求：tool_call_id={}",
+                response.tool_call_id
+            );
+        }
+        Ok(())
     }
 
     /// 处理工具调用请求，通过消息总线返回结果
@@ -73,20 +124,53 @@ impl ToolNode {
         if self.bridge.needs_confirmation(&request.tool_name, self.permission_mode) {
             match self.permission_mode {
                 PermissionMode::Ask => {
-                    // Ask 模式下拒绝未确认的工具调用
-                    AgentMetrics::global().record_error("tool_permission_denied");
-                    let result_msg = FrameCodec::new_message(
-                        Topic::agent_tool_result(&request.agent_id),
+                    // Ask 模式：发布权限请求到总线，等待响应
+                    let perm_req = PermissionRequest {
+                        agent_id: request.agent_id.clone(),
+                        tool_call_id: request.tool_call_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                        arguments: request.arguments.clone(),
+                        reason: None,
+                    };
+                    let perm_msg = FrameCodec::new_message(
+                        Topic::agent_permission(&request.agent_id),
                         self.id.as_str(),
-                        &serde_json::json!({
-                            "tool_call_id": request.tool_call_id,
-                            "output": format!("工具 {} 需要用户确认，当前权限模式为 Ask，已拒绝执行", request.tool_name),
-                            "success": false,
-                            "duration_ms": 0,
-                        }),
+                        &perm_req,
                     )?;
-                    transport.send_message(&result_msg).await?;
-                    return Ok(());
+                    if let Err(e) = transport.publish_data(&perm_msg).await {
+                        tracing::warn!("data-plane publish failed: {}, falling back", e);
+                        transport.send_message(&perm_msg).await?;
+                    }
+                    tracing::info!(
+                        "权限请求已发布：tool={}, tool_call_id={}",
+                        request.tool_name,
+                        request.tool_call_id
+                    );
+
+                    // 等待权限响应
+                    let allowed = self.wait_permission(&request.tool_call_id).await?;
+                    if !allowed {
+                        AgentMetrics::global().record_error("tool_permission_denied");
+                        let result_msg = FrameCodec::new_message(
+                            Topic::agent_tool_result(&request.agent_id),
+                            self.id.as_str(),
+                            &serde_json::json!({
+                                "tool_call_id": request.tool_call_id,
+                                "output": format!("工具 {} 被用户拒绝", request.tool_name),
+                                "success": false,
+                                "duration_ms": 0,
+                            }),
+                        )?;
+                        if let Err(e) = transport.publish_data(&result_msg).await {
+                            transport.send_message(&result_msg).await?;
+                        }
+                        return Ok(());
+                    }
+                    tracing::info!(
+                        "权限已批准：tool={}, tool_call_id={}",
+                        request.tool_name,
+                        request.tool_call_id
+                    );
                 }
                 PermissionMode::Trust => {
                     tracing::info!(
@@ -159,6 +243,11 @@ impl Node for ToolNode {
                 );
                 self.handle_tool_call(request, transport).await?;
             }
+            t if t.ends_with("/permission") => {
+                // 处理权限响应（来自 AcpNode/TUINode）
+                let response: PermissionResponse = FrameCodec::decode_payload(&msg)?;
+                self.handle_permission_response(response).await?;
+            }
             "sys/spawn" => {
                 // 收到 Node 上线广播，广播工具列表给 Agent
                 let tool_defs: Vec<crate::sampler::provider::ToolDefinition> = self.bridge
@@ -188,6 +277,7 @@ impl Node for ToolNode {
     fn subscriptions(&self) -> Vec<String> {
         vec![
             "agent/*/tool_call".into(),
+            "agent/*/permission".into(),
             "sys/spawn".into(),
             "sys/shutdown".into(),
         ]
