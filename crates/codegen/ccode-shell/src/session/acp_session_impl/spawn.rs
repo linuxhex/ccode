@@ -92,6 +92,7 @@ mod cli_catchall_drop_tests {
         initial_prompt_texts.is_empty(){"new"}else{"resumed"},
     ),
 )]
+#[deprecated(note = "Fusion: SessionActor 双路径已废弃，产品入口统一走 ccore::kernel::Kernel")]
 pub(crate) async fn spawn_session_actor(
     session_info: SessionInfo,
     gateway: GatewaySender,
