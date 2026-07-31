@@ -1,5 +1,8 @@
 //! Sampler Node - LLM 采样请求处理
 //!
+//! Fusion: 生产 SamplerActor 能力并入本 Node。
+//! 总线契约不变：sub sampler/request + sampler/*/cancel；pub sampler/{id}/stream
+//!
 //! Sampler Node 的职责：
 //! 1. 接收 Agent 的 sampler/request 消息
 //! 2. 根据 model 字段路由到对应 Provider
@@ -8,6 +11,7 @@
 //! 5. 流式结束后发送 SampleResponse（含 token usage）
 //! 6. 支持取消信号（sampler/{req_id}/cancel）
 //! 7. 发射 SamplerEvent 供外部消费
+//! 8. 生产级重试/ fallback provider（超时、可重试 HTTP 错误、provider fallback）
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -244,6 +248,47 @@ impl SamplerNode {
         Ok(())
     }
 
+    /// 取消进行中的采样请求
+    ///
+    /// 1. 设置取消标志（stream loop 会检查）
+    /// 2. 向 stream topic 发送最终 cancelled 事件
+    async fn cancel_request(
+        &mut self,
+        request_id: &str,
+        transport: &NodeTransportHandle,
+    ) -> anyhow::Result<()> {
+        if let Some(handle) = self.cancel_handles.get(request_id) {
+            handle.cancel();
+            tracing::info!("收到取消信号：request_id={}", request_id);
+
+            // 发送最终 cancelled 消息到 stream
+            let cancelled_msg = FrameCodec::new_message(
+                Topic::sampler_stream(request_id),
+                self.id.as_str(),
+                &serde_json::json!({
+                    "type": "cancelled",
+                    "request_id": request_id,
+                }),
+            )?;
+            if let Err(e) = transport.publish_data(&cancelled_msg).await {
+                tracing::warn!("data-plane publish failed: {}, falling back", e);
+                transport.send_message(&cancelled_msg).await?;
+            }
+
+            // 发射取消事件
+            let cancel_event = SamplerEvent::Cancelled {
+                request_id: request_id.to_string(),
+            };
+            let _ = self.emit_event(&cancel_event, transport).await;
+
+            // 清理取消句柄
+            self.cancel_handles.remove(request_id);
+        } else {
+            tracing::warn!("取消请求不存在或已完成：request_id={}", request_id);
+        }
+        Ok(())
+    }
+
     /// 处理采样请求（带重试逻辑）
     async fn handle_sample_request(
         &mut self,
@@ -394,10 +439,7 @@ impl Node for SamplerNode {
             let trimmed = topic.strip_prefix("sampler/").unwrap_or("");
             let req_id = trimmed.strip_suffix("/cancel").unwrap_or("");
             if !req_id.is_empty() {
-                if let Some(handle) = self.cancel_handles.get(req_id) {
-                    handle.cancel();
-                    tracing::info!("收到取消信号：request_id={}", req_id);
-                }
+                self.cancel_request(req_id, transport).await?;
             }
         }
         Ok(())
