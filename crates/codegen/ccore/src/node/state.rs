@@ -1,14 +1,20 @@
 //! State Node - 对话持久化、记忆管理、token 计数
 //!
+//! Fusion: 唯一会话真相源。
+//! 吸收 ChatStateActor 语义 + shell JSONL persistence + ccode-compaction。
+//! Topics: state/persist, state/query → state/response, state/compact, agent/*/event
+//!
 //! State Node 的职责：
 //! 1. 接收 state/persist 消息 → 持久化对话到磁盘
 //! 2. 接收 state/query 消息 → 查询对话状态并回复
-//! 3. 接收 agent/{id}/event → 监听 Agent 状态变化，触发滑动窗口更新
+//! 3. 接收 state/compact 消息 → 执行上下文压缩并回复 CompactResult
+//! 4. 接收 agent/{id}/event → 监听 Agent 状态变化，触发滑动窗口更新
 
 use async_trait::async_trait;
 use std::path::PathBuf;
 
 use crate::message::frame::FrameCodec;
+use crate::message::payloads::{CompactRequest, CompactResult};
 use crate::message::Message;
 use crate::message::Topic;
 use crate::node::{Node, NodeId, NodeType, NodeContext};
@@ -138,6 +144,30 @@ impl StateNode {
         }
     }
 
+    /// 执行上下文压缩
+    ///
+    /// TODO(fusion-migrate): 接入 ccode-compaction 实际压缩逻辑
+    async fn handle_compact(&mut self, req: CompactRequest) -> CompactResult {
+        let tokens_before: u64 = self.short_term.all_entries().iter().map(|e| e.token_count as u64).sum();
+
+        // TODO(fusion-migrate): 调用 ccode-compaction 进行实际压缩
+        // 当前仅记录请求，不执行实际压缩
+        if req.force {
+            tracing::info!("强制压缩请求：session={}", req.session_id);
+        }
+
+        let tokens_after: u64 = tokens_before; // 压缩后 token 数（当前未实际压缩）
+        let ok = true;
+
+        CompactResult {
+            session_id: req.session_id,
+            ok,
+            tokens_before,
+            tokens_after,
+            error: None,
+        }
+    }
+
     /// 从磁盘加载历史对话
     pub async fn load_session(&mut self, session_id: &str) -> anyhow::Result<()> {
         let path = self.storage_root.join(session_id).join("conversation.json");
@@ -210,6 +240,17 @@ impl Node for StateNode {
                 )?;
                 transport.send_message(&reply).await?;
             }
+            "state/compact" => {
+                let req: CompactRequest = FrameCodec::decode_payload(&msg)?;
+                let result = self.handle_compact(req).await;
+                let reply = FrameCodec::new_reply(
+                    Topic::state_response(),
+                    self.id.to_string(),
+                    &msg.header.msg_id,
+                    &result,
+                )?;
+                transport.send_message(&reply).await?;
+            }
             t if t.ends_with("/event") => {
                 // 监听 Agent 状态变化，触发记忆管理
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
@@ -236,6 +277,7 @@ impl Node for StateNode {
         vec![
             "state/persist".into(),
             "state/query".into(),
+            "state/compact".into(),
             "agent/*/event".into(),
             "sys/shutdown".into(),
         ]
