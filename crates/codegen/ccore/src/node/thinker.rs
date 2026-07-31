@@ -1,5 +1,10 @@
 //! Thinker Node — 大脑皮层（仿生架构，路线 A：感官内置）
 //!
+//! Fusion: 唯一决策 Node（不是上帝进程）。
+//! - 拥有：感知(Ear/Eye/Nose/Skin 内置)、agentic loop、doom-loop、max_turns、goal
+//! - 不拥有：工具执行、JSONL 持久化实现、LLM HTTP
+//! - 协作：sampler/request、agent/{id}/tool_call、state/persist|query|compact、agent/{id}/output
+//!
 //! ThinkerNode 是 AgentNode 的仿生架构演进版，核心改进：
 //! 1. 感官层内置：Eye/Ear/Nose/Skin 作为内部方法，不拆独立进程
 //! 2. 运动层走 ToolNode：工具调用通过 agent/{id}/tool_call 发给 ToolNode
@@ -16,6 +21,7 @@
 //! - 采样：sampler/request → SamplerNode → sampler/*/stream
 //! - 工具调用：agent/{id}/tool_call → ToolNode → agent/{id}/tool_result
 //! - 输出：agent/{id}/output → TUINode
+//! - 取消：agent/{id}/cancel ← AcpNode/TUINode
 //!
 //! 核心循环：
 //! 1. 收到 input → listen() → 构建 L0 工作记忆 → 发送 sampler/request
@@ -106,6 +112,8 @@ pub struct ThinkerNode {
     turns_executed: u32,
     /// 感官信号缓冲（最近 20 条，内置处理）
     sensory_buffer: Vec<SensorySignal>,
+    /// 取消请求标志（收到 agent/{id}/cancel 后设置）
+    cancel_requested: bool,
 }
 
 impl ThinkerNode {
@@ -129,6 +137,7 @@ impl ThinkerNode {
             tokens_used: 0,
             turns_executed: 0,
             sensory_buffer: Vec::with_capacity(SENSORY_BUFFER_CAPACITY),
+            cancel_requested: false,
         }
     }
 
@@ -636,6 +645,35 @@ impl Node for ThinkerNode {
                 }
             }
 
+            // agent/{agent_id}/cancel — 取消请求（来自 AcpNode/TUINode）
+            t if t.starts_with("agent/") && t.ends_with("/cancel") => {
+                tracing::info!("Thinker {} 收到取消请求", self.id);
+                self.cancel_requested = true;
+
+                // 如果有正在进行的采样请求，转发取消到 sampler
+                if let Some(ref req_id) = self.current_sample_request_id {
+                    let cancel_msg = FrameCodec::new_message(
+                        Topic::sampler_cancel(req_id),
+                        self.id.as_str(),
+                        &serde_json::json!({
+                            "request_id": req_id,
+                            "agent_id": self.id.to_string(),
+                        }),
+                    )?;
+                    if let Err(e) = transport.publish_data(&cancel_msg).await {
+                        tracing::debug!("数据面 PUB 发送采样取消失败，回退到控制面：{}", e);
+                        transport.send_message(&cancel_msg).await?;
+                    }
+                    tracing::info!("Thinker {} 已转发取消到 sampler: {}", self.id, req_id);
+                }
+
+                // 清理待处理的工具调用
+                self.pending_tool_calls.clear();
+                self.pending_tool_results.clear();
+                self.current_sample_request_id = None;
+                self.state = AgentState::Idle;
+            }
+
             // tool/register — 收到工具注册消息
             "tool/register" => {
                 let tools: Vec<SamplerToolDefinition> = FrameCodec::decode_payload(&msg)?;
@@ -781,6 +819,7 @@ impl Node for ThinkerNode {
         let mut subs = vec![
             format!("agent/{}/input", self.id),       // 用户输入（替代 cortex/{id}/input）
             format!("agent/{}/tool_result", self.id),  // 工具结果（替代 skin/touch）
+            format!("agent/{}/cancel", self.id),       // 取消请求（来自 AcpNode/TUINode）
             "sampler/*/stream".into(),
             "tool/register".into(),
             "sys/shutdown".into(),
