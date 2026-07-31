@@ -9,12 +9,13 @@
 //! 启动流程：
 //! Kernel 启动 → NodeLauncher spawn 各 Node → 各 Node 连接 ZMQ → 发送 sys/register → 开始工作
 //!
-//! 仿生架构（路线 A）：感官内置，5 个 Node
+//! 仿生架构（路线 A）+ ACP 融合：6 个 Node
 //! - Sampler：LLM 采样
 //! - State：对话持久化
 //! - Tool：工具执行（= Hand + Limb 运动层）
 //! - Thinker：大脑皮层（内置 Eye/Ear/Nose/Skin 感官层）
 //! - TUI：用户交互（= Ear + Mouth 交互层）
+//! - Acp：IDE/stdio ACP client 与消息总线边界
 
 use crate::config::CcodeConfig;
 use crate::kernel::KernelConfig;
@@ -27,6 +28,7 @@ use crate::node::tui::TUINode;
 use crate::node::tool::ToolNode;
 use crate::node::state::StateNode;
 use crate::node::thinker::ThinkerNode;
+use crate::node::acp::AcpNode;
 use crate::node::transport::run_node;
 use crate::agent::AgentConfig;
 use crate::agent::AgentType;
@@ -72,7 +74,7 @@ impl NodeLauncher {
         }
     }
 
-    /// spawn 初始 Node 集合（仿生架构路线 A：感官内置，5 Node）
+    /// spawn 初始 Node 集合（仿生架构路线 A + ACP 融合：6 Node）
     ///
     /// 每个 Node 在独立的 tokio task 中通过 run_node() 启动，
     /// run_node() 会自动连接消息总线、注册、进入消息循环。
@@ -83,8 +85,9 @@ impl NodeLauncher {
     /// 3. Tool（工具执行 = Hand + Limb 运动层）— Thinker 依赖
     /// 4. Thinker（大脑皮层 + 内置 Eye/Ear/Nose/Skin 感官层）— 核心
     /// 5. TUI（用户交互 = Ear + Mouth 交互层）— 用户界面
+    /// 6. Acp（IDE/stdio ACP client 边界）— 外部协议适配
     pub async fn spawn_initial_set(&mut self) -> anyhow::Result<Vec<NodeDescriptor>> {
-        // 并行 spawn 5 个 Node（构造 + tokio::spawn 均在并行块中完成）
+        // 并行 spawn 6 个 Node（构造 + tokio::spawn 均在并行块中完成）
         // tokio::join! 确保所有 spawn 完成后再继续
 
         // 1. Sampler Node
@@ -126,8 +129,15 @@ impl NodeLauncher {
         let tui_id_clone = tui_id.clone();
         let tui = TUINode::new(tui_id.clone());
 
+        // 6. Acp Node — 与 Thinker 共享同一 primary_agent_id
+        let primary_agent_id = thinker_id.as_str().to_string();
+        let acp_ctx = self.node_context();
+        let acp_id = NodeId::new();
+        let acp_id_clone = acp_id.clone();
+        let acp = AcpNode::new(acp_id.clone(), primary_agent_id);
+
         // 并行 spawn 所有 Node
-        let (sampler_handle, state_handle, tool_handle, thinker_handle, tui_handle) = tokio::join!(
+        let (sampler_handle, state_handle, tool_handle, thinker_handle, tui_handle, acp_handle) = tokio::join!(
             tokio::spawn(async move {
                 if let Err(e) = run_node(sampler, sampler_ctx).await {
                     tracing::error!("Sampler Node 异常退出：{}", e);
@@ -153,6 +163,11 @@ impl NodeLauncher {
                     tracing::error!("TUI Node 异常退出：{}", e);
                 }
             }),
+            tokio::spawn(async move {
+                if let Err(e) = run_node(acp, acp_ctx).await {
+                    tracing::error!("Acp Node 异常退出：{}", e);
+                }
+            }),
         );
 
         // 收集 handles 和描述符
@@ -161,6 +176,7 @@ impl NodeLauncher {
         self.task_handles.push(tool_handle);
         self.task_handles.push(thinker_handle);
         self.task_handles.push(tui_handle);
+        self.task_handles.push(acp_handle);
 
         self.launched_nodes.push(NodeDescriptor {
             id: sampler_id_clone,
@@ -187,8 +203,13 @@ impl NodeLauncher {
             node_type: NodeType::TUI,
             name: "tui-primary".into(),
         });
+        self.launched_nodes.push(NodeDescriptor {
+            id: acp_id_clone,
+            node_type: NodeType::Acp,
+            name: "acp-primary".into(),
+        });
 
-        tracing::info!("仿生架构（路线 A）初始 Node 集合启动完成（共 {} 个）", self.launched_nodes.len());
+        tracing::info!("仿生架构（路线 A）+ ACP 融合初始 Node 集合启动完成（共 {} 个）", self.launched_nodes.len());
         Ok(self.launched_nodes.clone())
     }
 
