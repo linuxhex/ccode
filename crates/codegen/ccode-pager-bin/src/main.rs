@@ -1764,6 +1764,10 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         set_if_unset("CCODE_DEBUG_LOG", "1");
         set_if_unset("CCODE_HOOKS_LOG", "1");
     }
+    // --kernel: 走 ccore 微内核路径（6 Node 总线架构）
+    if args.kernel_mode {
+        return run_kernel_mode(&args).await;
+    }
     if let Some(Command::Completions { shell }) = &args.command {
         ccode_pager::completions_cmd::run(*shell);
         return Ok(());
@@ -2318,6 +2322,30 @@ async fn signal_leaders_to_relaunch(installed_version: &str) {
         client.cancel();
     }
 }
+
+/// `--kernel` 模式：启动 ccore 微内核（6 Node 总线架构）。
+///
+/// 不经过 shell/SessionActor，直接拉起 Kernel → Broker → 6 Node。
+async fn run_kernel_mode(args: &PagerArgs) -> Result<()> {
+    tracing::info!("启动 ccore 微内核模式（--kernel）");
+
+    let working_dir = args
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+
+    let kernel_config = ccore::kernel::KernelConfig {
+        working_dir: working_dir.to_string_lossy().into(),
+        ..Default::default()
+    };
+
+    let mut kernel = ccore::kernel::Kernel::new(kernel_config);
+    let ccode_config = ccore::config::CcodeConfig::default();
+    kernel.set_runtime_config(ccore::kernel::KernelRuntimeConfig::from(&ccode_config));
+    kernel.run().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

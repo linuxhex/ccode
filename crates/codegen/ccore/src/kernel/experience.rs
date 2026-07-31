@@ -11,7 +11,7 @@
 //!
 //! 3. **闭环**：ProposedRule → L1_trial → L1_formal → L0，
 //!    构成从"思考"到"反射"的完整演化路径：
-//!    ```
+//!    ```text
 //!    L2（思考，需 LLM）
 //!      ↓ 经历回放提取模式
 //!    ProposedRule（提议规则）

@@ -1,8 +1,8 @@
 //! Node trait 定义 - 所有 Node 进程的统一接口
 //!
-//! 仿生架构（路线 A）+ ACP 融合：6 个活跃 Node
+//! 融合架构：6 个活跃 Node
 //! - Sampler / State / Tool / Thinker / TUI / Acp
-//! - 感官能力（Eye/Ear/Nose/Skin）内置到 ThinkerNode，不拆独立进程
+//! - 感官能力（Eye/Ear/Nose/Skin）内置到 ThinkerNode
 //! - 运动能力（Hand/Limb）由 ToolNode 统一执行
 //! - 交互能力（Ear/Mouth）由 TUINode 统一处理
 //! - AcpNode：IDE/stdio ACP client 与消息总线之间的边界
@@ -15,23 +15,6 @@ pub mod state;
 pub mod transport;
 pub mod thinker;
 pub mod acp;
-
-// 仿生器官模块（路线 A：已废弃独立进程，感官内置到 ThinkerNode）
-// 保留模块以兼容现有类型引用，但不再由 Launcher spawn
-#[deprecated(note = "路线 A：EyeNode 已内置到 ThinkerNode.observe()，不再独立 spawn")]
-pub mod eye;
-#[deprecated(note = "路线 A：EarNode 已内置到 ThinkerNode.listen()，不再独立 spawn")]
-pub mod ear;
-#[deprecated(note = "路线 A：NoseNode 已内置到 ThinkerNode.sniff()，不再独立 spawn")]
-pub mod nose;
-#[deprecated(note = "路线 A：SkinNode 已内置到 ThinkerNode.feel()，不再独立 spawn")]
-pub mod skin;
-#[deprecated(note = "路线 A：MouthNode 输出能力由 TUINode 统一处理，不再独立 spawn")]
-pub mod mouth;
-#[deprecated(note = "路线 A：HandNode 工具执行由 ToolNode 统一处理，不再独立 spawn")]
-pub mod hand;
-#[deprecated(note = "路线 A：LimbNode 命令执行由 ToolNode 统一处理，不再独立 spawn")]
-pub mod limb;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -94,11 +77,7 @@ impl AsRef<str> for NodeId {
 
 /// Node 类型
 ///
-/// 路线 A 架构（感官内置）：
-/// - 活跃：Kernel / Agent / Tool / Sampler / State / TUI / Thinker / Plugin
-/// - 废弃独立进程：Eye / Ear / Nose / Skin / Mouth / Hand / Limb
-///   （感官能力内置到 ThinkerNode，运动由 ToolNode 执行，交互由 TUINode 处理）
-///   保留枚举变体以兼容现有类型引用
+/// 融合架构：6 个活跃 Node + Agent/Plugin 扩展类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeType {
     Kernel,
@@ -109,14 +88,6 @@ pub enum NodeType {
     TUI,
     Plugin,
     Acp,
-    // 仿生器官（路线 A：已废弃独立进程，保留类型用于兼容）
-    Eye,
-    Ear,
-    Nose,
-    Skin,
-    Mouth,
-    Hand,
-    Limb,
     Thinker,
 }
 
@@ -131,13 +102,6 @@ impl NodeType {
             Self::TUI => "tui",
             Self::Plugin => "plugin",
             Self::Acp => "acp",
-            Self::Eye => "eye",
-            Self::Ear => "ear",
-            Self::Nose => "nose",
-            Self::Skin => "skin",
-            Self::Mouth => "mouth",
-            Self::Hand => "hand",
-            Self::Limb => "limb",
             Self::Thinker => "thinker",
         }
     }

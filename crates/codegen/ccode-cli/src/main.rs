@@ -107,7 +107,7 @@ fn main() -> anyhow::Result<()> {
                 ..Default::default()
             };
             let mut kernel = ccore::kernel::Kernel::new(kernel_config);
-            kernel.set_ccode_config(config);
+            kernel.set_runtime_config(ccore::kernel::KernelRuntimeConfig::from(&config));
             kernel.run().await
         })?;
     }

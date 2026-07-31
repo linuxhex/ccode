@@ -742,6 +742,10 @@ pub struct PagerArgs {
         "prompt_file"]
     )]
     pub prompt: Option<String>,
+    /// Start the ccore Kernel (microkernel + 6 Node bus architecture) instead
+    /// of the default shell-based agent runtime. Experimental.
+    #[arg(long = "kernel", hide = true)]
+    pub kernel_mode: bool,
     /// Subcommand (e.g., `agent`).
     #[command(subcommand, next_display_order = 0)]
     pub command: Option<Command>,

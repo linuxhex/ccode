@@ -8,15 +8,9 @@
 
 use std::time::Duration;
 
-/// 可压缩的工具白名单
-///
-/// 只有这些工具的输出结果才会在微压缩中被清除/摘要化，
-/// 其他工具结果（如 AgentTool 编排结果）保持不动。
-pub const COMPACTABLE_TOOLS: &[&str] = &[
-    "FileRead", "Bash", "Grep", "Glob",
-    "WebSearch", "WebFetch", "FileEdit", "FileWrite",
-    "ListDir", "ReadFile",
-];
+// 白名单与 `is_compactable` 已抽到 [`crate::compactable`]，供 budget/snip/
+// micro_compact 共享同一份分类，避免三处各自维护导致漂移。
+pub use crate::compactable::{COMPACTABLE_TOOLS, is_compactable};
 
 /// 旧工具结果的清除标记
 ///
@@ -49,13 +43,6 @@ pub struct MicroCompactResult {
     pub cleared_count: usize,
     /// 保留摘要的工具结果数量
     pub summarized_count: usize,
-}
-
-/// 判断工具是否在可压缩白名单中
-///
-/// 大小写不敏感匹配，确保不同命名风格都能命中。
-pub fn is_compactable(tool_name: &str) -> bool {
-    COMPACTABLE_TOOLS.iter().any(|t| t.eq_ignore_ascii_case(tool_name))
 }
 
 /// 对消息列表执行微压缩

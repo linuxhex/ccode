@@ -25,6 +25,9 @@ pub struct ShortTermEntry {
     pub token_count: u32,
     /// 是否为工具调用
     pub is_tool_call: bool,
+    /// 工具名称（用于 per-tool 压缩阈值）
+    #[serde(default)]
+    pub tool_name: Option<String>,
     /// 被召回次数
     pub recall_count: u32,
 }
@@ -118,6 +121,33 @@ impl ShortTermMemory {
             embedding,
             token_count,
             is_tool_call,
+            tool_name: None,
+            recall_count: 0,
+        };
+        self.entries.push(entry);
+        id
+    }
+
+    /// 存入工具调用结果（带工具名，用于 per-tool 压缩阈值）
+    pub fn store_tool(
+        &mut self,
+        role: String,
+        content: String,
+        token_count: u32,
+        tool_name: String,
+    ) -> String {
+        self.current_turn += 1;
+        let id = uuid::Uuid::new_v4().to_string();
+        let embedding = pseudo_vector_from_text(&content);
+        let entry = ShortTermEntry {
+            id: id.clone(),
+            turn: self.current_turn,
+            role,
+            content,
+            embedding,
+            token_count,
+            is_tool_call: true,
+            tool_name: Some(tool_name),
             recall_count: 0,
         };
         self.entries.push(entry);
@@ -195,6 +225,11 @@ impl ShortTermMemory {
     /// 获取所有条目
     pub fn all_entries(&self) -> &[ShortTermEntry] {
         &self.entries
+    }
+
+    /// 获取所有条目（可变引用，用于压缩等就地修改）
+    pub fn all_entries_mut(&mut self) -> &mut [ShortTermEntry] {
+        &mut self.entries
     }
 
     /// 总条目数

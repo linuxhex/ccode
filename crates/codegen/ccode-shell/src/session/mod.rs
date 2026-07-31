@@ -6,6 +6,7 @@ pub mod compaction_config;
 pub mod handle;
 pub mod memory_state;
 pub mod merge;
+pub mod micro_compact_gate;
 pub mod notifications;
 pub mod pending_interaction;
 pub mod prompt_queue;

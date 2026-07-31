@@ -37,7 +37,11 @@
 //! (active-agent-state `<system-reminder>` formatting shared by Ccode chat and
 //! ccode-build; hosts still own snapshotting and host-only sections).
 
+pub mod budget;
+pub mod cache_aware;
 pub mod code_compaction;
+pub mod compactable;
+pub mod context_collapse;
 pub mod history;
 pub mod inter_compaction;
 pub mod intra_compaction;
@@ -47,6 +51,7 @@ pub mod prompt;
 pub mod reminder;
 pub mod sampler;
 pub mod select;
+pub mod snip;
 pub mod steps;
 pub mod token;
 

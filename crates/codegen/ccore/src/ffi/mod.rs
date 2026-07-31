@@ -3,7 +3,7 @@
 //! CLI 通过 FFI 调用 libccore 动态库
 
 use crate::config::CcodeConfig;
-use crate::kernel::{Kernel, KernelConfig};
+use crate::kernel::{Kernel, KernelConfig, KernelRuntimeConfig};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::OnceLock;
@@ -44,7 +44,7 @@ pub unsafe extern "C" fn ccore_start(config_json: *const c_char) -> i32 {
     let kernel_config = KernelConfig::default();
     rt.block_on(async {
         let mut kernel = Kernel::new(kernel_config);
-        kernel.set_ccode_config(config);
+        kernel.set_runtime_config(KernelRuntimeConfig::from(&config));
         tokio::select! {
             result = kernel.run() => result.map(|_| 0).unwrap_or(-5),
             _ = shutdown_rx => 0,

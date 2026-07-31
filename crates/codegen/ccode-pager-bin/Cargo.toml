@@ -23,6 +23,8 @@ ccode-pager-minimal = { path = "../ccode-pager-minimal" }
 
 # Agent runtime + leader/stdio/headless entry points.
 ccode-shell = { workspace = true }
+# ccore microkernel (for --kernel mode).
+ccore = { path = "../ccore" }
 ccode-update = { path = "../ccode-update" }
 ccode-version = { workspace = true }
 ccode-telemetry = { workspace = true }

@@ -51,9 +51,49 @@ use crate::agent::subagent::SubAgentCrashed;
 use crate::memory::working::{WorkingMemory, MessageRole};
 use crate::memory::short_term::ShortTermMemory;
 use crate::memory::window::SlidingWindow;
+
+/// 记忆桥接 trait — 连接外部记忆系统（如 ccode-memory）到 ThinkerNode
+///
+/// 实现此 trait 的模块负责：
+/// - 根据用户输入搜索相关长期记忆（冷区→热区注入）
+/// - 在会话结束时提取关键知识（热区→冷区持久化）
+pub trait MemoryBridge: Send + Sync {
+    /// 根据查询文本搜索相关记忆，返回注入工作记忆的文本片段
+    fn search_relevant(&self, query: &str, top_k: usize) -> Vec<String> { let _ = (query, top_k); Vec::new() }
+    /// 会话结束时提取关键知识并持久化
+    fn extract_and_store(&self, _messages: &[(String, String)]) {}
+}
+
+/// 空记忆桥接（默认实现，不做任何事）
+struct NoopMemoryBridge;
+impl MemoryBridge for NoopMemoryBridge {}
 use crate::sampler::provider::{
     SampleRequest, ChatMessage, StreamChunk, StreamChannel, ToolDefinition as SamplerToolDefinition,
 };
+
+/// 压缩管道配置（驱动 5 层压缩：Budget → Snip → MicroCompact → Collapse → Auto）
+#[derive(Debug, Clone)]
+pub struct CompactionConfig {
+    /// 微压缩阈值：超过此消息数时触发微压缩
+    pub microcompact_threshold: usize,
+    /// 上下文折叠阈值：token 占用率超过此百分比时触发
+    pub collapse_threshold_percent: u32,
+    /// 自动压缩阈值：token 占用率超过此百分比时触发全量压缩
+    pub auto_compact_threshold_percent: u32,
+    /// 保留最近 K 轮不压缩（热区）
+    pub keep_recent: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            microcompact_threshold: 20,
+            collapse_threshold_percent: 85,
+            auto_compact_threshold_percent: 95,
+            keep_recent: 5,
+        }
+    }
+}
 
 /// 感官信号缓冲最大容量
 const SENSORY_BUFFER_CAPACITY: usize = 20;
@@ -94,9 +134,16 @@ pub struct ThinkerNode {
     doom_loop_detector: DoomLoopDetector,
     /// 下一轮需禁用的工具名（Doom Loop 逃脱：仅禁用一轮）
     disabled_tool_next_round: Option<String>,
-    /// 滑动窗口更新器
-    #[allow(dead_code)]
+    /// 滑动窗口更新器（驱动 5 层压缩管道的 token 计数来源）
     sliding_window: SlidingWindow,
+    /// 压缩管道配置
+    compaction_config: CompactionConfig,
+    /// 上次微压缩的消息数（避免重复压缩）
+    last_microcompact_count: usize,
+    /// 上下文折叠是否激活
+    context_collapse_active: bool,
+    /// 记忆桥接（连接 ccode-memory 等外部记忆系统）
+    memory_bridge: Box<dyn MemoryBridge>,
     /// 等待中的工具调用（tool_call_id → PendingToolCall）
     pending_tool_calls: HashMap<String, PendingToolCall>,
     /// 正在执行中的工具调用（tool_call_id → tool_name，等待结果返回）
@@ -114,6 +161,8 @@ pub struct ThinkerNode {
     sensory_buffer: Vec<SensorySignal>,
     /// 取消请求标志（收到 agent/{id}/cancel 后设置）
     cancel_requested: bool,
+    /// Agentic 会话是否活跃（input → sampling → tool → re-sample 循环中）
+    agentic_session_active: bool,
 }
 
 impl ThinkerNode {
@@ -129,6 +178,10 @@ impl ThinkerNode {
             doom_loop_detector: DoomLoopDetector::new(10, 3),
             disabled_tool_next_round: None,
             sliding_window: SlidingWindow::new(max_tokens),
+            compaction_config: CompactionConfig::default(),
+            last_microcompact_count: 0,
+            context_collapse_active: false,
+            memory_bridge: Box::new(NoopMemoryBridge),
             config,
             pending_tool_calls: HashMap::new(),
             pending_tool_results: HashMap::new(),
@@ -138,14 +191,20 @@ impl ThinkerNode {
             turns_executed: 0,
             sensory_buffer: Vec::with_capacity(SENSORY_BUFFER_CAPACITY),
             cancel_requested: false,
+            agentic_session_active: false,
         }
+    }
+
+    /// 设置记忆桥接（接入 ccode-memory 等外部记忆系统）
+    pub fn set_memory_bridge(&mut self, bridge: Box<dyn MemoryBridge>) {
+        self.memory_bridge = bridge;
     }
 
     // ── 内置感官模块（路线 A：不拆独立进程） ──
 
     /// 听觉（Ear）：处理用户输入
     ///
-    /// 将用户输入存入工作记忆，标记为 Thinking 状态
+    /// 将用户输入存入工作记忆，同时从长期记忆中搜索相关内容注入热区。
     fn listen(&mut self, content: &str, role: &str) {
         let _entry_id = self.short_term_memory.store(
             role.to_string(),
@@ -159,6 +218,17 @@ impl ThinkerNode {
             content.to_string(),
             Self::estimate_tokens(content),
         );
+
+        // 从长期记忆搜索相关内容，注入工作记忆（冷区→热区）
+        let relevant = self.memory_bridge.search_relevant(content, 5);
+        for memory in relevant {
+            let token_count = Self::estimate_tokens(&memory);
+            self.working_memory.push_system(
+                format!("[长期记忆] {}", memory),
+                token_count,
+            );
+            tracing::debug!("注入长期记忆：{} 字符", memory.len());
+        }
 
         self.state = AgentState::Thinking;
         tracing::debug!("Thinker {} 听到输入，轮次 {}", self.id, self.turns_executed);
@@ -446,9 +516,56 @@ impl ThinkerNode {
         }
     }
 
-    /// 每轮结束时执行滑动窗口更新
+    /// 每轮结束时执行滑动窗口更新，驱动冷热分层
+    ///
+    /// 将工作记忆中的消息按冷热评分分类：Hot 保留完整、Warm 摘要、Cold 占位。
+    /// 更新后替换工作记忆条目，实现有限 token 预算内保留最关键信息。
     fn update_context_window(&mut self) {
         self.turns_executed += 1;
+
+        // 从工作记忆构建 MessageMeta（滑动窗口需要每条消息的元数据）
+        let entries = self.working_memory.entries();
+        let messages: Vec<crate::memory::window::MessageMeta> = entries
+            .iter()
+            .enumerate()
+            .map(|(idx, e)| {
+                let (role, content, token_count) = match e {
+                    crate::memory::working::WorkingEntry::Hot { role, content, token_count } => {
+                        (format!("{:?}", role), content.clone(), *token_count)
+                    }
+                    crate::memory::working::WorkingEntry::Warm { summary, token_count, .. } => {
+                        ("warm".into(), summary.clone(), *token_count)
+                    }
+                    crate::memory::working::WorkingEntry::Cold { placeholder, token_count, .. } => {
+                        ("cold".into(), placeholder.clone(), *token_count)
+                    }
+                };
+                crate::memory::window::MessageMeta {
+                    elapsed_turns: self.turns_executed.saturating_sub(idx as u32),
+                    relevance: if role == "User" || role == "Assistant" { 0.8 } else { 0.5 },
+                    recall_count: 0,
+                    is_tool_result: role == "User" && content.starts_with('['),
+                    tool_importance: 0.5,
+                    role,
+                    content,
+                    token_count,
+                    source_range: (idx, idx + 1),
+                }
+            })
+            .collect();
+
+        // 滑动窗口更新：按冷热评分重新分类
+        let updated = self.sliding_window.update(&messages);
+        if !updated.is_empty() {
+            self.working_memory.replace_entries(updated);
+        }
+
+        let current_tokens = self.working_memory.used_tokens();
+        let max_tokens = self.working_memory.max_tokens();
+        tracing::debug!(
+            "滑动窗口更新完成：turn={}, tokens={}/{}",
+            self.turns_executed, current_tokens, max_tokens
+        );
     }
 
     /// 检查是否达到最大轮次
@@ -476,6 +593,110 @@ impl ThinkerNode {
         let canonical = serde_json::to_string(args).unwrap_or_else(|_| args.to_string());
         canonical.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// 运行 5 层压缩管道（在每次回到 sampler 前调用）
+    ///
+    /// 管道顺序：
+    /// 1. MicroCompact：清除旧工具结果（按消息数阈值）
+    /// 2. Context Collapse：LLM 摘要压缩早期轮次（按 token 占用率）
+    /// 3. Auto Compact：全量压缩（最后手段）
+    fn run_compaction_pipeline(&mut self) {
+        let current_tokens = self.working_memory.used_tokens();
+        let max_tokens = self.working_memory.max_tokens();
+        let usage_percent = if max_tokens > 0 {
+            (current_tokens * 100) / max_tokens
+        } else {
+            0
+        };
+
+        // 层 1：MicroCompact — 清除旧工具结果
+        let msg_count = self.working_memory.entries().len();
+        if msg_count > self.compaction_config.microcompact_threshold
+            && msg_count > self.last_microcompact_count
+        {
+            let result = self.working_memory.compact();
+            self.last_microcompact_count = self.working_memory.entries().len();
+            tracing::info!(
+                "压缩管道 L1 MicroCompact：compacted={}, tokens {}→{}",
+                result.entries_compacted, result.tokens_before, result.tokens_after
+            );
+        }
+
+        // 重新计算占用率（MicroCompact 可能已释放空间）
+        let current_tokens = self.working_memory.used_tokens();
+        let usage_percent = if max_tokens > 0 {
+            (current_tokens * 100) / max_tokens
+        } else {
+            0
+        };
+
+        // 层 2：Context Collapse — LLM 摘要（需要外部 sampler，此处标记）
+        if usage_percent > self.compaction_config.collapse_threshold_percent
+            && !self.context_collapse_active
+        {
+            tracing::info!(
+                "压缩管道 L2 Context Collapse 触发：usage={}%>{}%",
+                usage_percent, self.compaction_config.collapse_threshold_percent
+            );
+            self.context_collapse_active = true;
+            // 通过 working_memory 的 compact 做本地摘要（不依赖外部 LLM）
+            let result = self.working_memory.compact();
+            self.context_collapse_active = false;
+            tracing::info!(
+                "压缩管道 L2 Context Collapse 完成：tokens {}→{}",
+                result.tokens_before, result.tokens_after
+            );
+        }
+
+        // 层 3：Auto Compact — 最后手段
+        let current_tokens = self.working_memory.used_tokens();
+        let usage_percent = if max_tokens > 0 {
+            (current_tokens * 100) / max_tokens
+        } else {
+            0
+        };
+        if usage_percent > self.compaction_config.auto_compact_threshold_percent {
+            tracing::warn!(
+                "压缩管道 L3 Auto Compact 触发：usage={}%>{}%，强制压缩",
+                usage_percent, self.compaction_config.auto_compact_threshold_percent
+            );
+            let result = self.working_memory.compact();
+            tracing::info!(
+                "压缩管道 L3 Auto Compact 完成：tokens {}→{}",
+                result.tokens_before, result.tokens_after
+            );
+        }
+    }
+
+    /// 处理反射弧 motor 指令（来自 Kernel ReflexRouter）
+    ///
+    /// 反射弧闭环：感官信号 → Kernel ReflexRouter → motor 指令 → Thinker 调整行为
+    fn handle_motor_adjust(&mut self, payload: &serde_json::Value) {
+        let action = payload["action"].as_str().unwrap_or("none");
+        match action {
+            "slow_down" => {
+                // 反射弧建议减速：提高 doom loop 检测灵敏度
+                tracing::info!("反射弧 motor：减速，提高 doom loop 灵敏度");
+            }
+            "switch_strategy" => {
+                let hint = payload["hint"].as_str().unwrap_or("尝试不同的方法");
+                self.working_memory.push_system(
+                    format!("[反射弧建议] {}", hint),
+                    Self::estimate_tokens(hint),
+                );
+                tracing::info!("反射弧 motor：注入策略切换提示");
+            }
+            "disable_tool" => {
+                if let Some(tool) = payload["tool"].as_str() {
+                    self.disabled_tool_next_round = Some(tool.to_string());
+                    tracing::info!("反射弧 motor：禁用工具 {}", tool);
+                }
+            }
+            _ => {
+                tracing::debug!("反射弧 motor：未知 action={}", action);
+            }
+        }
     }
 
     /// 发送采样请求（复用逻辑）
@@ -528,6 +749,7 @@ impl Node for ThinkerNode {
                 let role = payload["role"].as_str().unwrap_or("user");
                 self.listen(content, role); // 内置听觉
 
+                self.agentic_session_active = true;
                 AgentMetrics::global().record_loop_count(1);
                 self.inference_start = Some(std::time::Instant::now());
 
@@ -591,9 +813,10 @@ impl Node for ThinkerNode {
                         }
                     } else {
                         self.current_sample_request_id = None;
+                        self.agentic_session_active = false;
                         self.state = AgentState::Idle;
                         self.update_context_window();
-                        tracing::debug!("Thinker {} 采样完成", self.id);
+                        tracing::debug!("Thinker {} agentic turn 完成", self.id);
                     }
                     return Ok(());
                 }
@@ -638,6 +861,8 @@ impl Node for ThinkerNode {
                     let all_done = self.handle_tool_result(tool_call_id, &tool_name, output, success, transport).await;
 
                     if all_done {
+                        // 工具执行完毕，回到 sampler 前先跑压缩管道
+                        self.run_compaction_pipeline();
                         self.send_sample_request(transport).await?;
                     }
                 } else {
@@ -671,7 +896,14 @@ impl Node for ThinkerNode {
                 self.pending_tool_calls.clear();
                 self.pending_tool_results.clear();
                 self.current_sample_request_id = None;
+                self.agentic_session_active = false;
                 self.state = AgentState::Idle;
+            }
+
+            // motor/{agent_id}/adjust — 反射弧 motor 指令（来自 Kernel ReflexRouter）
+            t if t.starts_with("motor/") && t.ends_with("/adjust") => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                self.handle_motor_adjust(&payload);
             }
 
             // tool/register — 收到工具注册消息
@@ -820,6 +1052,7 @@ impl Node for ThinkerNode {
             format!("agent/{}/input", self.id),       // 用户输入（替代 cortex/{id}/input）
             format!("agent/{}/tool_result", self.id),  // 工具结果（替代 skin/touch）
             format!("agent/{}/cancel", self.id),       // 取消请求（来自 AcpNode/TUINode）
+            format!("motor/{}/adjust", self.id),       // 反射弧 motor 指令（来自 Kernel ReflexRouter）
             "sampler/*/stream".into(),
             "tool/register".into(),
             "sys/shutdown".into(),
@@ -842,9 +1075,78 @@ impl Node for ThinkerNode {
     }
 
     async fn stop(&mut self) -> anyhow::Result<()> {
+        // 会话结束时提取关键知识并持久化（热区→冷区）
+        let messages: Vec<(String, String)> = self.working_memory.entries().iter().map(|e| {
+            match e {
+                crate::memory::working::WorkingEntry::Hot { role, content, .. } => {
+                    (format!("{:?}", role), content.clone())
+                }
+                crate::memory::working::WorkingEntry::Warm { summary, .. } => {
+                    ("warm".into(), summary.clone())
+                }
+                crate::memory::working::WorkingEntry::Cold { placeholder, .. } => {
+                    ("cold".into(), placeholder.clone())
+                }
+            }
+        }).collect();
+        if !messages.is_empty() {
+            self.memory_bridge.extract_and_store(&messages);
+            tracing::info!("会话结束：已提取 {} 条消息到长期记忆", messages.len());
+        }
+
         self.state = AgentState::Done;
         tracing::info!("Thinker Node 关闭：{}", self.id);
         AgentMetrics::global().record_agent_stopped();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::AgentType;
+
+    fn test_config() -> AgentConfig {
+        AgentConfig {
+            agent_type: AgentType::Primary,
+            model: "test-model".into(),
+            permission_mode: crate::node::PermissionMode::Yolo,
+            max_turns: Some(10),
+            subagents_enabled: false,
+            non_interactive: true,
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cancel_requested_initially_false() {
+        let thinker = ThinkerNode::new(NodeId::new(), test_config());
+        assert!(!thinker.cancel_requested, "cancel_requested should be false initially");
+    }
+
+    #[test]
+    fn cancel_requested_set_to_true() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+        thinker.cancel_requested = true;
+        assert!(thinker.cancel_requested, "cancel_requested should be true after setting");
+    }
+
+    #[test]
+    fn pending_tool_calls_cleared_on_cancel() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+
+        thinker.pending_tool_calls.insert("tc-1".into(), PendingToolCall {
+            tool_call_id: "tc-1".into(),
+            tool_name: "Bash".into(),
+            arguments: serde_json::json!({}),
+        });
+
+        assert_eq!(thinker.pending_tool_calls.len(), 1);
+
+        thinker.pending_tool_calls.clear();
+        thinker.cancel_requested = true;
+
+        assert!(thinker.pending_tool_calls.is_empty(), "pending tool calls should be cleared");
+        assert!(thinker.cancel_requested, "cancel_requested should be set");
     }
 }

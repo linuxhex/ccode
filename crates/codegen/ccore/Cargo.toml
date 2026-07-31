@@ -76,6 +76,9 @@ git2 = "0.20"
 # 哈希
 blake3 = { workspace = true }
 
+# 压缩管道（snip + budget）
+ccode-compaction = { path = "../../common/ccode-compaction" }
+
 # Dashboard HTTP 服务器
 axum = { version = "0.7", optional = true }
 tower = { version = "0.4", optional = true }

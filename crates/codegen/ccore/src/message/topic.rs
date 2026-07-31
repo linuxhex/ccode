@@ -385,4 +385,46 @@ mod tests {
         assert!(pattern.matches(&Topic::agent_input("abc")));
         assert!(pattern.matches(&Topic::agent_output("abc")));
     }
+
+    // ── Fusion topic factory tests ──
+
+    #[test]
+    fn fusion_topic_agent_permission() {
+        let t = Topic::agent_permission("agent-1");
+        assert_eq!(t.as_str(), "agent/agent-1/permission");
+    }
+
+    #[test]
+    fn fusion_topic_agent_cancel() {
+        let t = Topic::agent_cancel("agent-1");
+        assert_eq!(t.as_str(), "agent/agent-1/cancel");
+    }
+
+    #[test]
+    fn fusion_topic_sampler_cancel() {
+        let t = Topic::sampler_cancel("req-42");
+        assert_eq!(t.as_str(), "sampler/req-42/cancel");
+    }
+
+    #[test]
+    fn fusion_topic_state_compact() {
+        let t = Topic::state_compact();
+        assert_eq!(t.as_str(), "state/compact");
+    }
+
+    #[test]
+    fn fusion_pattern_all_agent_permissions() {
+        let p = TopicPattern::all_agent_permissions();
+        assert!(p.matches(&Topic::agent_permission("abc")));
+        assert!(p.matches(&Topic::agent_permission("xyz")));
+        assert!(!p.matches(&Topic::agent_cancel("abc")));
+    }
+
+    #[test]
+    fn fusion_pattern_all_agent_cancels() {
+        let p = TopicPattern::all_agent_cancels();
+        assert!(p.matches(&Topic::agent_cancel("abc")));
+        assert!(p.matches(&Topic::agent_cancel("xyz")));
+        assert!(!p.matches(&Topic::agent_permission("abc")));
+    }
 }

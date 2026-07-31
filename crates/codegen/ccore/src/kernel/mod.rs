@@ -10,7 +10,7 @@
 //! 7. 自主神经调节：心跳监控 + 并发限流 + 内存池（无意识自调节）
 //!
 //! 事件循环：
-//! ```
+//! ```text
 //! Kernel 启动
 //!   ├─ 创建 KernelTransport（绑定 ROUTER + PUB socket）
 //!   ├─ 创建 NodeLauncher
@@ -46,7 +46,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::CcodeConfig;
-use crate::config::reloader::ConfigReloader;
+use crate::config::provider::ProviderConfig;
 use crate::config::watcher::ConfigWatcher;
 use crate::kernel::self_healing::SelfHealingManager;
 use crate::kernel::autonomic::AutonomicNervousSystem;
@@ -103,6 +103,30 @@ impl Default for KernelConfig {
     }
 }
 
+/// Kernel 运行时配置 — 从产品配置提取的纯 ccore 概念子集。
+///
+/// Kernel 和 NodeLauncher 只依赖这 3 个字段，
+/// 产品层（ccode-pager-bin / ccode-shell）负责从 CcodeConfig 提取。
+#[derive(Debug, Clone)]
+pub struct KernelRuntimeConfig {
+    /// LLM Provider 配置列表
+    pub providers: Vec<ProviderConfig>,
+    /// 默认模型名称
+    pub default_model: String,
+    /// 权限模式
+    pub permission_mode: crate::node::PermissionMode,
+}
+
+impl From<&CcodeConfig> for KernelRuntimeConfig {
+    fn from(c: &CcodeConfig) -> Self {
+        Self {
+            providers: c.providers.clone(),
+            default_model: c.default_model.clone(),
+            permission_mode: c.permission_mode,
+        }
+    }
+}
+
 /// Kernel 主结构
 ///
 /// ROS 1 风格：Kernel 只做控制面（发现/注册/心跳/参数），不转发业务数据。
@@ -114,7 +138,7 @@ impl Default for KernelConfig {
 /// - `backpressure`: 背压控制器
 /// - `monitoring`: 监控服务
 /// - `param_server`: ROS 风格的参数服务器
-/// - `ccode_config`: ccode 全局配置（与 ConfigReloader 共享，支持热更新）
+/// - `runtime_config`: Kernel 运行时配置（providers/model/permission，从产品配置提取）
 /// - `reflex_router`: 反射路由器（脊髓反射弧：感官信号 → 运动指令）
 /// - `autonomic`: 自主神经系统（心跳监控 + 并发限流 + 内存池，已接管 self_healing 职责）
 /// - `experience_log`: 经历日志（闭环学习：记录反射弧执行结果，提取可学习模式）
@@ -129,7 +153,7 @@ pub struct Kernel {
     monitoring: MonitoringService,
     param_server: ParamServer,
     running: bool,
-    ccode_config: Option<Arc<RwLock<CcodeConfig>>>,
+    runtime_config: Option<Arc<RwLock<KernelRuntimeConfig>>>,
     /// 反射路由器（脊髓反射弧：感官信号 → 模式匹配 → 运动指令）
     reflex_router: ReflexRouter,
     /// 自主神经系统（心跳监控 + 并发限流 + 内存池）
@@ -144,21 +168,17 @@ pub struct Kernel {
     config_watcher: Option<ConfigWatcher>,
     /// 配置变更事件接收端（由 ConfigWatcher 创建，在 run() 中消费）
     config_event_rx: Option<mpsc::Receiver<crate::config::watcher::ConfigChangeEvent>>,
-    /// 情景记忆存储（Zettelkasten知识网络）— 懒初始化
-    /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.episodic 访问
-    #[allow(dead_code)]
+    /// 情景记忆存储（Zettelkasten 知识网络）— 懒初始化
+    /// 在感官信号处理时自动记录关键事件，供 ThinkerNode 检索
     episodic_memory: std::sync::OnceLock<EpisodicMemoryStore>,
     /// 经验反思学习引擎（ERL/MAR）— 懒初始化
-    /// 保留供 standalone ccore 模式使用；shell 模式不直接使用此字段
-    #[allow(dead_code)]
+    /// 在反射弧执行后记录经验，提取可学习模式
     erl: std::sync::OnceLock<ExperientialReflectiveLearner>,
-    /// 去中心化DAG协调器（AgentNet/Symphony）— 懒初始化
-    /// 保留供 standalone ccore 模式使用；shell 模式不直接使用此字段
-    #[allow(dead_code)]
+    /// 去中心化 DAG 协调器（AgentNet/Symphony）— 懒初始化
+    /// 在多 Agent 场景下协调任务分配和依赖管理
     coordinator: std::sync::OnceLock<DecentralizedCoordinator>,
     /// 元认知控制器（MAP/LAF）— 懒初始化
-    /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.meta_cognitive 访问
-    #[allow(dead_code)]
+    /// 监控 Agent 推理质量，检测逻辑不一致和策略偏差
     meta_cognitive: std::sync::OnceLock<MetaCognitiveController>,
     /// Token 预算管理器（借鉴 Claude Code tokenBudget.ts）
     token_budget: Arc<std::sync::Mutex<TokenBudgetManager>>,
@@ -216,7 +236,7 @@ impl Kernel {
             monitoring: MonitoringService::new(HealthCheckConfig::default()),
             param_server: ParamServer::new(),
             running: false,
-            ccode_config: None,
+            runtime_config: None,
             reflex_router,
             autonomic,
             experience_log,
@@ -233,52 +253,43 @@ impl Kernel {
         }
     }
 
-    /// 设置 ccode 全局配置
+    /// 设置 Kernel 运行时配置。
     ///
-    /// 内部包装为 Arc<RwLock<CcodeConfig>>，以便与 ConfigReloader 共享，
-    /// 配置热更新后 Kernel 也能读到最新配置。
-    pub fn set_ccode_config(&mut self, config: CcodeConfig) {
-        self.ccode_config = Some(Arc::new(RwLock::new(config)));
+    /// 产品层从 CcodeConfig 提取 KernelRuntimeConfig 后调用此方法。
+    pub fn set_runtime_config(&mut self, config: KernelRuntimeConfig) {
+        self.runtime_config = Some(Arc::new(RwLock::new(config)));
     }
 
     /// 获取情景记忆存储（懒初始化）
-    /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.episodic 访问
-    #[allow(dead_code)]
+    /// 在感官信号处理时自动记录关键事件，供 ThinkerNode 检索
     pub fn episodic_memory(&self) -> &EpisodicMemoryStore {
         self.episodic_memory.get_or_init(|| EpisodicMemoryStore::new())
     }
 
     /// 获取经验反思学习引擎（懒初始化）
-    /// 保留供 standalone ccore 模式使用；shell 模式不直接调用此方法
-    #[allow(dead_code)]
+    /// 在反射弧执行后记录经验，提取可学习模式
     pub fn erl(&self) -> &ExperientialReflectiveLearner {
         self.erl.get_or_init(|| ExperientialReflectiveLearner::new(100))
     }
 
-    /// 获取去中心化DAG协调器（懒初始化）
-    /// 保留供 standalone ccore 模式使用；shell 模式不直接调用此方法
-    #[allow(dead_code)]
+    /// 获取去中心化 DAG 协调器（懒初始化）
+    /// 在多 Agent 场景下协调任务分配和依赖管理
     pub fn coordinator(&self) -> &DecentralizedCoordinator {
         self.coordinator.get_or_init(|| DecentralizedCoordinator::new(50))
     }
 
     /// 获取元认知控制器（懒初始化）
-    /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.meta_cognitive 访问
-    #[allow(dead_code)]
+    /// 监控 Agent 推理质量，检测逻辑不一致和策略偏差
     pub fn meta_cognitive(&self) -> &MetaCognitiveController {
         self.meta_cognitive.get_or_init(|| MetaCognitiveController::new())
     }
 
     /// 获取 Token 预算管理器
-    /// 保留供 standalone ccore 模式使用；shell 模式通过 CcoreSessionState.token_budget 访问
-    #[allow(dead_code)]
     pub fn token_budget(&self) -> &Arc<std::sync::Mutex<TokenBudgetManager>> {
         &self.token_budget
     }
 
     /// 获取熔断器
-    /// 保留供 standalone ccore 模式使用；shell 模式不直接调用此方法
-    #[allow(dead_code)]
     pub fn circuit_breaker(&self) -> &Arc<CircuitBreaker> {
         &self.circuit_breaker
     }
@@ -327,9 +338,9 @@ impl Kernel {
         tracing::info!("AutonomicNervousSystem 自主循环已启动（间隔 10 秒）");
 
         // 3. 启动初始 Node 集合（从共享配置读取）
-        if let Some(ccfg_arc) = self.ccode_config.clone() {
-            let ccfg = ccfg_arc.read().await.clone();
-            let mut launcher = launcher::NodeLauncher::new(self.config.clone(), ccfg);
+        if let Some(rtcfg_arc) = self.runtime_config.clone() {
+            let rtcfg = rtcfg_arc.read().await.clone();
+            let mut launcher = launcher::NodeLauncher::new(self.config.clone(), rtcfg);
             match launcher.spawn_initial_set().await {
                 Ok(nodes) => {
                     let start_time = std::time::Instant::now();
@@ -425,24 +436,13 @@ impl Kernel {
                 }
             }
         } else {
-            tracing::warn!("未设置 ccode_config，跳过初始 Node 集合启动");
+            tracing::warn!("未设置 runtime_config，跳过初始 Node 集合启动");
         }
 
-        // 4. 启动配置热更新：创建 ConfigReloader 并 spawn 消费 task
-        //    ConfigReloader 重载配置后通过 notify_tx 通知主循环，由主循环广播到所有 Node
-        let (config_notify_tx, notify_rx) = mpsc::channel::<String>(32);
+        // 4. 配置热更新由产品层负责（Kernel 只持有 KernelRuntimeConfig 快照）
+
         let mut config_notify_rx: Option<mpsc::Receiver<String>> = None;
         let mut config_monitoring_active = false;
-        if let (Some(event_rx), Some(config)) = (self.config_event_rx.take(), self.ccode_config.clone()) {
-            let config_path = PathBuf::from(&self.config.working_dir).join("config.toml");
-            let reloader = ConfigReloader::new(config, config_path, config_notify_tx);
-            tokio::spawn(async move {
-                reloader.run(event_rx).await;
-            });
-            config_notify_rx = Some(notify_rx);
-            config_monitoring_active = true;
-            tracing::info!("ConfigReloader 已启动，配置变更将自动重载并广播");
-        }
 
         // 5. 主事件循环
         let health_interval = Duration::from_secs(self.config.health_check_interval_secs);
@@ -493,9 +493,9 @@ impl Kernel {
                                 "收到心跳超时事件，执行 Agent 重启"
                             );
                             // 实际重启逻辑：通过 NodeLauncher 重新 spawn 该 Agent
-                            if let Some(ccfg_arc) = self.ccode_config.clone() {
-                                let ccfg = ccfg_arc.read().await.clone();
-                                let mut launcher = launcher::NodeLauncher::new(self.config.clone(), ccfg);
+                            if let Some(rtcfg_arc) = self.runtime_config.clone() {
+                                let rtcfg = rtcfg_arc.read().await.clone();
+                                let mut launcher = launcher::NodeLauncher::new(self.config.clone(), rtcfg);
                                 let agent_type = crate::agent::AgentType::Primary;
                                 let descriptor = launcher.spawn_subagent(
                                     agent_type,
@@ -997,12 +997,24 @@ impl Kernel {
                         timestamp: chrono::Utc::now(),
                         signal: payload_str.chars().take(200).collect(),
                         signal_topic: topic.to_string(),
-                        level: ReflexLevel::L0, // 初始记录为 L0，后续根据反射结果更新
+                        level: ReflexLevel::L0,
                         action: "sensory_received".to_string(),
                         result: true,
                         context: serde_json::json!({"source": "thinker"}),
                     });
                 }
+
+                // 记录到情景记忆（Zettelkasten 知识网络）
+                self.episodic_memory().record(
+                    topic.to_string(),
+                    payload_str.chars().take(500).collect(),
+                );
+
+                // 记录到经验反思学习引擎（ERL/MAR）
+                self.erl().observe(
+                    &payload_str.chars().take(300).collect::<String>(),
+                    topic,
+                );
 
                 // 通过 ReflexRouter 匹配反射规则
                 match self.reflex_router.route(topic, &payload_str) {
@@ -1310,7 +1322,7 @@ impl Kernel {
 
         // 构造 AgentConfig（子代理默认非交互、不可再 spawn 子代理）
         // 从共享配置读取 default_model 和 permission_mode（支持热更新）
-        let (default_model, permission_mode) = if let Some(c) = &self.ccode_config {
+        let (default_model, permission_mode) = if let Some(c) = &self.runtime_config {
             let guard = c.read().await;
             (guard.default_model.clone(), guard.permission_mode)
         } else {
@@ -1514,14 +1526,7 @@ fn parse_node_type(s: &str) -> NodeType {
         "state" => NodeType::State,
         "tui" => NodeType::TUI,
         "plugin" => NodeType::Plugin,
-        // 仿生器官
-        "eye" => NodeType::Eye,
-        "ear" => NodeType::Ear,
-        "nose" => NodeType::Nose,
-        "skin" => NodeType::Skin,
-        "mouth" => NodeType::Mouth,
-        "hand" => NodeType::Hand,
-        "limb" => NodeType::Limb,
+        "acp" => NodeType::Acp,
         "thinker" => NodeType::Thinker,
         _ => NodeType::Plugin,
     }

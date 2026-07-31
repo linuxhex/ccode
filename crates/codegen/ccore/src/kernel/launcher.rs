@@ -17,8 +17,7 @@
 //! - TUI：用户交互（= Ear + Mouth 交互层）
 //! - Acp：IDE/stdio ACP client 与消息总线边界
 
-use crate::config::CcodeConfig;
-use crate::kernel::KernelConfig;
+use crate::kernel::{KernelConfig, KernelRuntimeConfig};
 use crate::node::{
     NodeId, NodeType, NodeContext,
 };
@@ -32,6 +31,7 @@ use crate::node::acp::AcpNode;
 use crate::node::transport::run_node;
 use crate::agent::AgentConfig;
 use crate::agent::AgentType;
+use crate::agent::subagent::{SubAgentNode, SubAgentDefinition};
 
 /// Node 进程描述
 #[derive(Debug, Clone)]
@@ -45,8 +45,8 @@ pub struct NodeDescriptor {
 pub struct NodeLauncher {
     /// Kernel 配置
     kernel_config: KernelConfig,
-    /// ccode 配置
-    ccode_config: CcodeConfig,
+    /// 运行时配置（providers/model/permission）
+    runtime_config: KernelRuntimeConfig,
     /// 已启动的 Node 描述
     launched_nodes: Vec<NodeDescriptor>,
     /// 已启动的 Node 任务 JoinHandle（用于优雅关闭）
@@ -54,10 +54,10 @@ pub struct NodeLauncher {
 }
 
 impl NodeLauncher {
-    pub fn new(kernel_config: KernelConfig, ccode_config: CcodeConfig) -> Self {
+    pub fn new(kernel_config: KernelConfig, runtime_config: KernelRuntimeConfig) -> Self {
         Self {
             kernel_config,
-            ccode_config,
+            runtime_config,
             launched_nodes: Vec::new(),
             task_handles: Vec::new(),
         }
@@ -94,7 +94,7 @@ impl NodeLauncher {
         let sampler_ctx = self.node_context();
         let sampler_id = NodeId::new();
         let sampler_id_clone = sampler_id.clone();
-        let sampler = SamplerNode::with_configs(sampler_id.clone(), &self.ccode_config.providers);
+        let sampler = SamplerNode::with_configs(sampler_id.clone(), &self.runtime_config.providers);
 
         // 2. State Node
         let state_ctx = self.node_context();
@@ -114,8 +114,8 @@ impl NodeLauncher {
         let thinker_id_clone = thinker_id.clone();
         let thinker_config = AgentConfig {
             agent_type: AgentType::Primary,
-            model: self.ccode_config.default_model.clone(),
-            permission_mode: self.ccode_config.permission_mode,
+            model: self.runtime_config.default_model.clone(),
+            permission_mode: self.runtime_config.permission_mode,
             max_turns: None,
             subagents_enabled: true,
             non_interactive: false,
@@ -136,39 +136,37 @@ impl NodeLauncher {
         let acp_id_clone = acp_id.clone();
         let acp = AcpNode::new(acp_id.clone(), primary_agent_id);
 
-        // 并行 spawn 所有 Node
-        let (sampler_handle, state_handle, tool_handle, thinker_handle, tui_handle, acp_handle) = tokio::join!(
-            tokio::spawn(async move {
-                if let Err(e) = run_node(sampler, sampler_ctx).await {
-                    tracing::error!("Sampler Node 异常退出：{}", e);
-                }
-            }),
-            tokio::spawn(async move {
-                if let Err(e) = run_node(state, state_ctx).await {
-                    tracing::error!("State Node 异常退出：{}", e);
-                }
-            }),
-            tokio::spawn(async move {
-                if let Err(e) = run_node(tool, tool_ctx).await {
-                    tracing::error!("Tool Node 异常退出：{}", e);
-                }
-            }),
-            tokio::spawn(async move {
-                if let Err(e) = run_node(thinker, thinker_ctx).await {
-                    tracing::error!("Thinker Node 异常退出：{}", e);
-                }
-            }),
-            tokio::spawn(async move {
-                if let Err(e) = crate::node::tui::run_tui_node(tui, tui_ctx).await {
-                    tracing::error!("TUI Node 异常退出：{}", e);
-                }
-            }),
-            tokio::spawn(async move {
-                if let Err(e) = run_node(acp, acp_ctx).await {
-                    tracing::error!("Acp Node 异常退出：{}", e);
-                }
-            }),
-        );
+        // 并行 spawn 所有 Node（收集 JoinHandle，不立即 await）
+        let sampler_handle = tokio::spawn(async move {
+            if let Err(e) = run_node(sampler, sampler_ctx).await {
+                tracing::error!("Sampler Node 异常退出：{}", e);
+            }
+        });
+        let state_handle = tokio::spawn(async move {
+            if let Err(e) = run_node(state, state_ctx).await {
+                tracing::error!("State Node 异常退出：{}", e);
+            }
+        });
+        let tool_handle = tokio::spawn(async move {
+            if let Err(e) = run_node(tool, tool_ctx).await {
+                tracing::error!("Tool Node 异常退出：{}", e);
+            }
+        });
+        let thinker_handle = tokio::spawn(async move {
+            if let Err(e) = run_node(thinker, thinker_ctx).await {
+                tracing::error!("Thinker Node 异常退出：{}", e);
+            }
+        });
+        let tui_handle = tokio::spawn(async move {
+            if let Err(e) = crate::node::tui::run_tui_node(tui, tui_ctx).await {
+                tracing::error!("TUI Node 异常退出：{}", e);
+            }
+        });
+        let acp_handle = tokio::spawn(async move {
+            if let Err(e) = run_node(acp, acp_ctx).await {
+                tracing::error!("Acp Node 异常退出：{}", e);
+            }
+        });
 
         // 收集 handles 和描述符
         self.task_handles.push(sampler_handle);
@@ -213,29 +211,40 @@ impl NodeLauncher {
         Ok(self.launched_nodes.clone())
     }
 
-    /// spawn 子 Agent
+    /// spawn 子 Agent（使用 SubAgentNode 获得工具隔离 + 资源限制）
     pub fn spawn_subagent(
         &mut self,
         agent_type: AgentType,
         model: Option<String>,
-        _task_description: String,
+        task_description: String,
     ) -> NodeDescriptor {
         let ctx = self.node_context();
         let id = NodeId::new();
+        let parent_id = self.launched_nodes
+            .iter()
+            .find(|n| n.node_type == NodeType::Thinker)
+            .map(|n| n.id.clone())
+            .unwrap_or_else(NodeId::new);
         let agent_config = AgentConfig {
             agent_type,
-            model: model.unwrap_or_else(|| self.ccode_config.default_model.clone()),
-            permission_mode: self.ccode_config.permission_mode,
-            max_turns: Some(20), // 子 agent 默认 20 轮上限
+            model: model.unwrap_or_else(|| self.runtime_config.default_model.clone()),
+            permission_mode: self.runtime_config.permission_mode,
+            max_turns: Some(20),
             subagents_enabled: false,
             non_interactive: true,
             tools: Vec::new(),
         };
-        let agent = AgentNode::new(id.clone(), agent_config);
-        let agent_ctx = ctx;
+        let definition = SubAgentDefinition {
+            agent_type,
+            model: None,
+            task_description: task_description.clone(),
+            max_turns: 20,
+            allowed_tools: Vec::new(),
+        };
+        let agent = SubAgentNode::new(id.clone(), parent_id, agent_config, definition);
         let sub_id = id.clone();
         let agent_handle = tokio::spawn(async move {
-            if let Err(e) = run_node(agent, agent_ctx).await {
+            if let Err(e) = run_node(agent, ctx).await {
                 tracing::error!("子 Agent {} 异常退出：{}", sub_id, e);
             }
         });
