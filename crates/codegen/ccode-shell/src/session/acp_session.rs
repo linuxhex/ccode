@@ -1022,11 +1022,6 @@ pub(crate) struct SessionActor {
     /// tests and other constructor sites use `SamplerHandle::noop()`.
     /// All inference flows through this handle.
     pub(crate) sampler_handle: ccode_sampler::SamplerHandle,
-    /// 消息总线桥接器（始终存在，分布式模式下始终通过消息总线路由）。
-    ///
-    /// 持有 ccore 的 `NodeTransport` 连接，提供 LLM 请求和工具调用的消息总线路径。
-    /// 通过 `MessageBusBridge::connect()` 创建，生命周期与 SessionActor 一致。
-    pub(crate) message_bus_bridge: std::cell::RefCell<Option<Arc<crate::session::message_bus_bridge::MessageBusBridge>>>,
     /// Cached recipe for constructing this session's [`ccode_agent::Agent`].
     ///
     /// Populated once at session spawn and then reused by

@@ -5,7 +5,6 @@ pub mod commands;
 pub mod compaction_config;
 pub mod handle;
 pub mod memory_state;
-pub mod message_bus_bridge;
 pub mod merge;
 pub mod notifications;
 pub mod pending_interaction;

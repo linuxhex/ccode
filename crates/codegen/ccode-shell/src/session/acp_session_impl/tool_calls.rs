@@ -285,15 +285,7 @@ impl SessionActor {
         &self,
         tool_calls: Vec<crate::sampling::types::ToolCallResponse>,
     ) -> Result<ToolLoop, acp::Error> {
-        // 消息总线路径：始终尝试通过 MessageBusBridge 路由到消息总线上的 ToolNode。
-        // 如果 bridge 不可用，回退到本地工具调用路径以确保工具执行不中断。
-        if !self.message_bus_bridge.borrow().is_none() {
-            return self.execute_tool_calls_via_message_bus(tool_calls).await;
-        } else {
-            tracing::warn!(
-                "message_bus_bridge 未初始化，回退到本地工具调用路径"
-            );
-        }
+        // Fusion: 直接走本地工具执行路径（消息总线路径已废弃）
         if let Some(cfg) = self.chat_state_handle.get_sampling_config().await {
             tracing::Span::current().record("model_id", cfg.model.as_str());
         }
@@ -899,95 +891,6 @@ impl SessionActor {
         Ok(ToolLoop::Continue)
     }
 
-    /// 消息总线路径：通过 MessageBusBridge 将工具调用路由到消息总线上的 ToolNode。
-    ///
-    /// 当消息总线可用时，`execute_tool_calls` 委托到此方法。
-    /// 流程：
-    /// 1. 对每个 ToolCallResponse，解析参数并通过 `MessageBusBridge::send_tool_call` 发送
-    /// 2. 等待 ToolNode 通过消息总线返回执行结果
-    /// 3. 将结果推入 chat_state 作为 tool_result
-    /// 4. 全部完成后返回 `ToolLoop::Continue` 以驱动下一轮采样
-    ///
-    /// 错误处理：
-    /// - 桥接器缺失或发送失败 → 回退到直接调用路径（`execute_tool_calls` 的非消息总线分支）
-    /// - 单个工具执行失败 → 记录错误并以失败内容作为 tool_result，不中断后续工具
-    /// - 桥接器返回 Err → 视为工具执行失败
-    async fn execute_tool_calls_via_message_bus(
-        &self,
-        tool_calls: Vec<crate::sampling::types::ToolCallResponse>,
-    ) -> Result<ToolLoop, acp::Error> {
-        let bridge = match self.message_bus_bridge.borrow().as_ref() {
-            Some(b) => b.clone(),
-            None => {
-                tracing::warn!(
-                    "message_bus_bridge 未初始化，工具调用走消息总线路径失败"
-                );
-                return Ok(ToolLoop::Continue);
-            }
-        };
-
-        for call in tool_calls {
-            let tool_call_id = call.id.clone();
-            let tool_name = call.function.name.clone();
-
-            // 解析工具参数：优先解析为 JSON Value，失败则用原始字符串包装
-            let arguments: serde_json::Value =
-                serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| {
-                    serde_json::json!({ "raw": call.function.arguments.clone() })
-                });
-
-            tracing::debug!(
-                tool_call_id = %tool_call_id,
-                tool_name = %tool_name,
-                "通过消息总线发送工具调用"
-            );
-
-            // 通过桥接器发送工具调用并等待结果
-            let result = bridge
-                .send_tool_call(tool_call_id.clone(), tool_name.clone(), arguments)
-                .await;
-
-            let tool_result_content = match result {
-                Ok(Ok(output)) => {
-                    tracing::debug!(
-                        tool_call_id = %tool_call_id,
-                        tool_name = %tool_name,
-                        output_len = output.len(),
-                        "消息总线工具调用成功"
-                    );
-                    output
-                }
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        tool_call_id = %tool_call_id,
-                        tool_name = %tool_name,
-                        error = %err,
-                        "消息总线工具调用返回错误"
-                    );
-                    format!("Tool '{}' failed: {}", tool_name, err)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        tool_call_id = %tool_call_id,
-                        tool_name = %tool_name,
-                        error = %e,
-                        "消息总线工具调用发送失败"
-                    );
-                    format!("Tool '{}' delivery failed: {}", tool_name, e)
-                }
-            };
-
-            // 将工具结果推入对话状态
-            self.chat_state_handle.push_tool_result(
-                ccode_sampling_types::ConversationItem::tool_result(
-                    tool_call_id,
-                    tool_result_content,
-                ),
-            );
-        }
-
-        Ok(ToolLoop::Continue)
-    }
     /// Phase 1: pre-flight (MCP, args, hooks, permission, ExitPlanMode).
     pub(crate) async fn prepare_tool_call(
         &self,
@@ -2612,6 +2515,13 @@ impl SessionActor {
                 inline_images,
             )
         };
+        // P0 阶段A：对可压缩工具的输出先做 Snip + Budget 截断再入历史，
+        // 避免单次超大输出（如万行文件、长 bash 日志）在压缩触发前就
+        // 撑爆上下文。编排类工具（Agent/Task/…）不进白名单，原样保留。
+        let tool_chat = crate::session::micro_compact_gate::snip_and_budget_tool_result(
+            tool_chat,
+            requested_tool_name,
+        );
         self.chat_state_handle.push_tool_result(tool_chat);
         let mut deferred_followups = Vec::new();
         if !extracted_images.is_empty() {

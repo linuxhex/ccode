@@ -920,21 +920,6 @@ impl SessionActor {
                     }
                 }
 
-                // 状态变迁广播到消息总线：使 TUI/监控可观测循环阶段
-                // 桥接器可用时发送，失败不阻塞主循环
-                if let Some(bridge) = self.message_bus_bridge.borrow().as_ref() {
-                    let state_name = format!("{:?}", loop_sm.state());
-                    let metadata = serde_json::json!({
-                        "turn_count": loop_sm.turn_count(),
-                        "tokens_used": loop_sm.tokens_used(),
-                        "consecutive_failures": loop_sm.consecutive_failures(),
-                        "elapsed_secs": loop_sm.elapsed().as_secs(),
-                    });
-                    if let Err(e) = bridge.broadcast_state(state_name, metadata).await {
-                        tracing::debug!(error = %e, "状态变迁广播失败，不阻塞主循环");
-                    }
-                }
-
                 // 检查状态机是否已经结束
                 if let ccode_agent::loop_state::LoopState::Done { reason } = loop_sm.state() {
                     tracing::info!(
