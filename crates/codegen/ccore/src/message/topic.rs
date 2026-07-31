@@ -104,6 +104,16 @@ impl Topic {
         Self::new(format!("agent/{agent_id}/event"))
     }
 
+    /// Agent 权限请求（ToolNode → Acp/TUI）
+    pub fn agent_permission(agent_id: &str) -> Self {
+        Self::new(format!("agent/{agent_id}/permission"))
+    }
+
+    /// Agent 取消（Acp/TUI → Thinker/Sampler/Tool）
+    pub fn agent_cancel(agent_id: &str) -> Self {
+        Self::new(format!("agent/{agent_id}/cancel"))
+    }
+
     // ---- SubAgent Topic ----
 
     /// 向指定子 Agent 派发任务
@@ -148,6 +158,11 @@ impl Topic {
         Self::new(format!("sampler/{request_id}/stream"))
     }
 
+    /// 取消进行中的采样
+    pub fn sampler_cancel(request_id: &str) -> Self {
+        Self::new(format!("sampler/{request_id}/cancel"))
+    }
+
     // ---- State Topic ----
 
     /// 查询对话状态
@@ -163,6 +178,11 @@ impl Topic {
     /// 持久化对话
     pub fn state_persist() -> Self {
         Self::new("state/persist")
+    }
+
+    /// 请求压缩会话上下文
+    pub fn state_compact() -> Self {
+        Self::new("state/compact")
     }
 
     // ---- Tool Topic ----
@@ -282,6 +302,16 @@ impl TopicPattern {
     /// 匹配所有 sampler 流式返回
     pub fn all_sampler_streams() -> Self {
         Self::new("sampler/*/stream")
+    }
+
+    /// 匹配所有 agent 权限请求
+    pub fn all_agent_permissions() -> Self {
+        Self::new("agent/*/permission")
+    }
+
+    /// 匹配所有 agent 取消
+    pub fn all_agent_cancels() -> Self {
+        Self::new("agent/*/cancel")
     }
 
     /// 判断 topic 是否匹配此模式

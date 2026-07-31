@@ -11,6 +11,7 @@ pub mod sequence;
 pub mod ack;
 pub mod service;
 pub mod param;
+pub mod payloads;
 
 pub use topic::{Topic, TopicPattern};
 pub use frame::{Message, MessageHeader, FrameCodec};
@@ -18,3 +19,6 @@ pub use sequence::{SequenceManager, SequenceChecker, SequenceCheckResult, Sequen
 pub use ack::{AckManager, AckConfig, PendingAck, create_ack_message};
 pub use service::{ServiceClient, ServiceRequestId};
 pub use param::{ParamServer, ParamValue, ParamChangeNotification, ParamChangeType};
+pub use payloads::{
+    CancelRequest, CompactRequest, CompactResult, PermissionRequest, PermissionResponse,
+};
