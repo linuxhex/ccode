@@ -118,32 +118,32 @@ impl Topic {
 
     /// 向指定子 Agent 派发任务
     pub fn subagent_task(subagent_id: &str) -> Self {
-        Self::new(format!("subagent/{subagent_id}/task"))
+        Self::new(format!("agent/{subagent_id}/task"))
     }
 
-    /// 子 Agent 的输出流
+    /// 子 Agent 的输出流（复用 agent output 命名空间）
     pub fn subagent_output(subagent_id: &str) -> Self {
-        Self::new(format!("subagent/{subagent_id}/output"))
+        Self::agent_output(subagent_id)
     }
 
-    /// 子 Agent 请求执行工具
+    /// 子 Agent 请求执行工具（复用 agent tool_call 命名空间）
     pub fn subagent_tool_call(subagent_id: &str) -> Self {
-        Self::new(format!("subagent/{subagent_id}/tool_call"))
+        Self::agent_tool_call(subagent_id)
     }
 
-    /// 工具执行结果返回给子 Agent
+    /// 工具执行结果返回给子 Agent（复用 agent tool_result 命名空间）
     pub fn subagent_tool_result(subagent_id: &str) -> Self {
-        Self::new(format!("subagent/{subagent_id}/tool_result"))
+        Self::agent_tool_result(subagent_id)
     }
 
-    /// 子 Agent 完成事件（携带最终输出）
+    /// 子 Agent 完成事件（映射到 agent event 命名空间）
     pub fn subagent_completed(subagent_id: &str) -> Self {
-        Self::new(format!("subagent/{subagent_id}/completed"))
+        Self::agent_event(subagent_id)
     }
 
-    /// 子 Agent 崩溃事件（携带错误信息）
+    /// 子 Agent 崩溃事件（映射到 agent event 命名空间）
     pub fn subagent_crashed(subagent_id: &str) -> Self {
-        Self::new(format!("subagent/{subagent_id}/crashed"))
+        Self::agent_event(subagent_id)
     }
 
     // ---- Sampler Topic ----

@@ -104,27 +104,36 @@ impl EmbeddingIndex {
 
     /// 相似度搜索（返回 top-k）
     ///
-    /// 返回格式：Vec<(向量索引, 相似度分数)>
+    /// 使用最小堆维护 top-k 结果，避免全量排序。
+    /// 复杂度：O(n log k) 替代 O(n log n)
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(usize, f32)> {
-        if query.len() != self.dimension || self.vectors.is_empty() {
+        if query.len() != self.dimension || self.vectors.is_empty() || k == 0 {
             return Vec::new();
         }
 
-        let mut scores: Vec<_> = self
-            .vectors
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (i, Self::cosine_similarity(query, &v.data)))
-            .collect();
+        // 最小堆：堆顶是当前 top-k 中最小的分数，新分数大于堆顶则替换
+        let mut top_k: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
 
-        // 按相似度降序排序
-        scores.sort_by(|a, b| {
-            b.1
-                .partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        for (i, v) in self.vectors.iter().enumerate() {
+            let score = Self::cosine_similarity(query, &v.data);
+            if !score.is_finite() || score <= 0.0 {
+                continue;
+            }
+            top_k.push((score, i));
+            if top_k.len() > k {
+                // 找到最小分数并移除
+                if let Some(min_idx) = top_k.iter().enumerate()
+                    .min_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(idx, _)| idx)
+                {
+                    top_k.swap_remove(min_idx);
+                }
+            }
+        }
 
-        scores.into_iter().take(k).collect()
+        // 按分数降序排列
+        top_k.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        top_k.into_iter().map(|(score, idx)| (idx, score)).collect()
     }
 
     /// 搜索并返回 entry_id

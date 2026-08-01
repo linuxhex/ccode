@@ -1,10 +1,10 @@
 //! 子 Agent 定义、生命周期与 Node 实现
 //!
 //! SubAgentNode 是子代理在消息总线上的运行时载体：
-//! - 订阅 `subagent/{id}/task` 接收父 Agent 派发的任务
+//! - 订阅 `agent/{id}/task` 接收父 Agent 派发的任务
 //! - 通过 `sampler/request` 请求 LLM 采样（与主 Agent 共用 SamplerNode）
-//! - 通过 `subagent/{id}/tool_call` 请求工具执行（与主 Agent 共用 ToolNode）
-//! - 任务完成后发布 `subagent/{id}/completed`，异常时发布 `subagent/{id}/crashed`
+//! - 通过 `agent/{id}/tool_call` 请求工具执行（与主 Agent 共用 ToolNode）
+//! - 任务完成后发布 `agent/{id}/event`（type=completed），异常时发布 `agent/{id}/event`（type=crashed）
 //!
 //! 与 AgentNode 的关键差异：
 //! - 任务导向：收到 task 后开始工作，LLM 返回纯文本即视为完成
@@ -558,8 +558,8 @@ impl Node for SubAgentNode {
 
     fn subscriptions(&self) -> Vec<String> {
         vec![
-            format!("subagent/{}/task", self.id),
-            format!("subagent/{}/tool_result", self.id),
+            format!("agent/{}/task", self.id),
+            format!("agent/{}/tool_result", self.id),
             "sampler/*/stream".into(),
             "tool/register".into(),
             "sys/shutdown".into(),
@@ -568,10 +568,9 @@ impl Node for SubAgentNode {
 
     fn published_topics(&self) -> Vec<String> {
         vec![
-            format!("subagent/{}/output", self.id),
-            format!("subagent/{}/tool_call", self.id),
-            format!("subagent/{}/completed", self.id),
-            format!("subagent/{}/crashed", self.id),
+            format!("agent/{}/output", self.id),
+            format!("agent/{}/tool_call", self.id),
+            format!("agent/{}/event", self.id),
         ]
     }
 

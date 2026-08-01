@@ -117,8 +117,7 @@ pub async fn dispatch_pre_tool_use(
             "hook.run",
             hook_name = %spec.name,
             hook_event = %HookEventName::PreToolUse,
-        )
-        .entered();
+        );
 
         let (result, elapsed, http_info, rewrite_info) =
             runner::run_hook(spec, envelope, ctx, GateKind::Tool).await;
@@ -365,8 +364,7 @@ pub async fn dispatch_stop(
             "hook.run",
             hook_name = %spec.name,
             hook_event = %event,
-        )
-        .entered();
+        );
 
         let (result, elapsed, http_info, _) =
             runner::run_hook(spec, envelope, ctx, GateKind::Stop).await;
@@ -468,8 +466,7 @@ pub async fn dispatch_non_blocking(
             "hook.run",
             hook_name = %spec.name,
             hook_event = %event,
-        )
-        .entered();
+        );
 
         let (result, elapsed, http_info, _) =
             runner::run_hook(spec, envelope, ctx, GateKind::Observe).await;

@@ -62,6 +62,11 @@ impl DoomLoopDetector {
         }
     }
 
+    /// 调整重复阈值（保留历史计数，不重建实例）
+    pub fn set_repeat_threshold(&mut self, threshold: usize) {
+        self.repeat_threshold = threshold;
+    }
+
     /// 记录一次工具调用
     pub fn record(&mut self, tool_name: String, args_hash: u64) {
         self.history.push_back(ToolCallSignature { tool_name, args_hash });

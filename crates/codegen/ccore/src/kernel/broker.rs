@@ -162,20 +162,66 @@ impl Broker {
     }
 
     /// 查找发布指定 topic 的所有 Publisher
+    ///
+    /// 同时匹配精确 topic 和通配符 pattern：
+    /// - 精确匹配：topic_publishers[key=topic]
+    /// - 通配符匹配：遍历 topic_publishers 中含 * 的 key，用 topic_matches 反向匹配
+    ///
+    /// 这样 ToolNode 注册 `agent/*/tool_result` 后，
+    /// 查找 `agent/abc/tool_result` 也能找到它。
     pub fn find_publishers(&self, topic: &str) -> Vec<&PublisherInfo> {
-        self.topic_publishers
-            .get(topic)
-            .map(|ids| ids.iter().filter_map(|id| self.publishers.get(id)).collect())
-            .unwrap_or_default()
+        let mut result = Vec::new();
+
+        // 精确匹配
+        if let Some(publisher_ids) = self.topic_publishers.get(topic) {
+            for id in publisher_ids {
+                if let Some(info) = self.publishers.get(id) {
+                    result.push(info);
+                }
+            }
+        }
+
+        // 通配符匹配：publisher 注册了含 * 的 pattern，检查 topic 是否匹配
+        for (pattern, publisher_ids) in &self.topic_publishers {
+            if pattern.contains('*') && topic_matches(pattern, topic) {
+                for id in publisher_ids {
+                    if let Some(info) = self.publishers.get(id) {
+                        // 去重
+                        if !result.iter().any(|r| r.node_id == info.node_id) {
+                            result.push(info);
+                        }
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// 查找新 Node 订阅的 topic 对应的所有 publisher
+    ///
+    /// 优化：直接使用 topic_publishers 索引查找，避免双重遍历。
+    /// 对于通配符订阅（含 * 的 pattern），仍需遍历匹配。
     pub fn find_publishers_for_subscriptions(&self, subscriptions: &[String]) -> Vec<(String, Vec<PublisherInfo>)> {
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(subscriptions.len());
+
         for pattern in subscriptions {
             let mut matching_publishers = Vec::new();
-            for (topic, publisher_ids) in &self.topic_publishers {
-                if topic_matches(pattern, topic) {
+
+            if pattern.contains('*') {
+                // 通配符订阅：需要遍历所有 topic 匹配
+                for (topic, publisher_ids) in &self.topic_publishers {
+                    if topic_matches(pattern, topic) {
+                        for id in publisher_ids {
+                            if let Some(info) = self.publishers.get(id) {
+                                matching_publishers.push(info.clone());
+                            }
+                        }
+                    }
+                }
+            } else {
+                // 精确订阅：直接查索引 O(1)
+                if let Some(publisher_ids) = self.topic_publishers.get(pattern) {
                     for id in publisher_ids {
                         if let Some(info) = self.publishers.get(id) {
                             matching_publishers.push(info.clone());
@@ -183,6 +229,7 @@ impl Broker {
                     }
                 }
             }
+
             if !matching_publishers.is_empty() {
                 matching_publishers.sort_by(|a, b| a.node_id.to_string().cmp(&b.node_id.to_string()));
                 matching_publishers.dedup_by(|a, b| a.node_id == b.node_id);

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::sync::RwLock;
 
 /// 系统指标
 #[derive(Debug, Clone, Default)]
@@ -67,10 +68,13 @@ pub struct MetricsCollector {
     connection_failures: AtomicU64,
     
     // ---- 延迟记录 ----
-    latencies: Arc<std::sync::Mutex<Vec<f64>>>,
+    /// 使用 RwLock 替代 Mutex：写入互斥但读取可并发，减少热路径锁竞争。
+    /// record_success 写入频率高但持锁时间短（push 一次 f64），
+    /// collect 读取频率低但持锁时间长（遍历 + 排序），RwLock 更适合这种模式。
+    latencies: Arc<RwLock<Vec<f64>>>,
     
     // ---- 时间窗口 ----
-    window_start: std::sync::Mutex<Instant>,
+    window_start: RwLock<Instant>,
 }
 
 impl Default for MetricsCollector {
@@ -91,8 +95,8 @@ impl MetricsCollector {
             decode_errors: AtomicU64::new(0),
             routing_errors: AtomicU64::new(0),
             connection_failures: AtomicU64::new(0),
-            latencies: Arc::new(std::sync::Mutex::new(Vec::new())),
-            window_start: std::sync::Mutex::new(Instant::now()),
+            latencies: Arc::new(RwLock::new(Vec::new())),
+            window_start: RwLock::new(Instant::now()),
         }
     }
 
@@ -109,7 +113,7 @@ impl MetricsCollector {
     /// 记录成功消息
     pub fn record_success(&self, latency_ms: f64) {
         self.messages_success.fetch_add(1, Ordering::Relaxed);
-        let mut latencies = self.latencies.lock().unwrap_or_else(|e| e.into_inner());
+        let mut latencies = self.latencies.write().unwrap_or_else(|e| e.into_inner());
         latencies.push(latency_ms);
         // 限制延迟记录数量，防止无界增长导致 OOM
         const MAX_LATENCIES: usize = 10000;
@@ -151,7 +155,7 @@ impl MetricsCollector {
 
     /// 收集当前指标
     pub fn collect(&self, active_nodes: u64) -> SystemMetrics {
-        let latencies = self.latencies.lock().unwrap_or_else(|e| e.into_inner());
+        let latencies = self.latencies.read().unwrap_or_else(|e| e.into_inner());
         
         let avg_latency = if !latencies.is_empty() {
             latencies.iter().sum::<f64>() / latencies.len() as f64
@@ -201,8 +205,8 @@ impl MetricsCollector {
         self.decode_errors.store(0, Ordering::Relaxed);
         self.routing_errors.store(0, Ordering::Relaxed);
         self.connection_failures.store(0, Ordering::Relaxed);
-        self.latencies.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        *self.window_start.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.latencies.write().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.window_start.write().unwrap_or_else(|e| e.into_inner()) = Instant::now();
     }
 }
 
@@ -245,22 +249,24 @@ pub enum HealthStatus {
 pub struct HealthChecker {
     config: HealthCheckConfig,
     /// Node 心跳时间
-    node_heartbeats: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// 使用 RwLock 替代 Mutex：record_heartbeat 是高频写入（短持锁），
+    /// check/get_dead_nodes 是低频读取（长持锁），RwLock 允许并发读取。
+    node_heartbeats: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl HealthChecker {
     pub fn new(config: HealthCheckConfig) -> Self {
         Self {
             config,
-            node_heartbeats: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            node_heartbeats: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// 记录 Node 心跳
     pub fn record_heartbeat(&self, node_id: &str) {
         self.node_heartbeats
-            .lock()
-            .expect("node_heartbeats Mutex 不应中毒")
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(node_id.to_string(), Instant::now());
     }
 
@@ -292,7 +298,7 @@ impl HealthChecker {
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         let mut dead_nodes = Vec::new();
         
-        for (node_id, last_heartbeat) in self.node_heartbeats.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for (node_id, last_heartbeat) in self.node_heartbeats.read().unwrap_or_else(|e| e.into_inner()).iter() {
             if now.duration_since(*last_heartbeat) > timeout {
                 dead_nodes.push(node_id.clone());
             }
@@ -322,8 +328,8 @@ impl HealthChecker {
         let timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
         
         self.node_heartbeats
-            .lock()
-            .expect("node_heartbeats Mutex 不应中毒")
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|(_, last)| now.duration_since(**last) > timeout)
             .map(|(id, _)| id.clone())

@@ -55,7 +55,7 @@ use crate::kernel::experience::{ExperienceLog, ExperienceEntry};
 use crate::kernel::transport::{IncomingMessage, KernelTransport};
 use crate::kernel::backpressure::{BackpressureController, BackpressureConfig};
 use crate::kernel::metrics::{MonitoringService, HealthCheckConfig};
-use crate::memory::episodic::EpisodicMemoryStore;
+use crate::memory::episodic::{EpisodicMemoryStore, MemoryType, MemorySource};
 use crate::agent::experiential::ExperientialReflectiveLearner;
 use crate::agent::decentralized::DecentralizedCoordinator;
 use crate::agent::meta_cognitive::MetaCognitiveController;
@@ -168,9 +168,9 @@ pub struct Kernel {
     config_watcher: Option<ConfigWatcher>,
     /// 配置变更事件接收端（由 ConfigWatcher 创建，在 run() 中消费）
     config_event_rx: Option<mpsc::Receiver<crate::config::watcher::ConfigChangeEvent>>,
-    /// 情景记忆存储（Zettelkasten 知识网络）— 懒初始化
+    /// 情景记忆存储（Zettelkasten 知识网络）— 与 ThinkerNode 共享
     /// 在感官信号处理时自动记录关键事件，供 ThinkerNode 检索
-    episodic_memory: std::sync::OnceLock<EpisodicMemoryStore>,
+    episodic_memory: Arc<EpisodicMemoryStore>,
     /// 经验反思学习引擎（ERL/MAR）— 懒初始化
     /// 在反射弧执行后记录经验，提取可学习模式
     erl: std::sync::OnceLock<ExperientialReflectiveLearner>,
@@ -243,7 +243,7 @@ impl Kernel {
             self_healing: None, // 向后兼容保留，已由 autonomic 接管
             config_watcher,
             config_event_rx,
-            episodic_memory: std::sync::OnceLock::new(),
+            episodic_memory: Arc::new(EpisodicMemoryStore::new()),
             erl: std::sync::OnceLock::new(),
             coordinator: std::sync::OnceLock::new(),
             meta_cognitive: std::sync::OnceLock::new(),
@@ -260,10 +260,15 @@ impl Kernel {
         self.runtime_config = Some(Arc::new(RwLock::new(config)));
     }
 
-    /// 获取情景记忆存储（懒初始化）
+    /// 获取情景记忆存储
     /// 在感官信号处理时自动记录关键事件，供 ThinkerNode 检索
     pub fn episodic_memory(&self) -> &EpisodicMemoryStore {
-        self.episodic_memory.get_or_init(|| EpisodicMemoryStore::new())
+        &self.episodic_memory
+    }
+
+    /// 获取情景记忆存储的 Arc 引用（用于与 NodeLauncher/ThinkerNode 共享）
+    pub fn episodic_memory_arc(&self) -> Arc<EpisodicMemoryStore> {
+        self.episodic_memory.clone()
     }
 
     /// 获取经验反思学习引擎（懒初始化）
@@ -340,7 +345,11 @@ impl Kernel {
         // 3. 启动初始 Node 集合（从共享配置读取）
         if let Some(rtcfg_arc) = self.runtime_config.clone() {
             let rtcfg = rtcfg_arc.read().await.clone();
-            let mut launcher = launcher::NodeLauncher::new(self.config.clone(), rtcfg);
+            let mut launcher = launcher::NodeLauncher::new(
+                self.config.clone(),
+                rtcfg,
+                self.episodic_memory.clone(),
+            );
             match launcher.spawn_initial_set().await {
                 Ok(nodes) => {
                     let start_time = std::time::Instant::now();
@@ -495,7 +504,11 @@ impl Kernel {
                             // 实际重启逻辑：通过 NodeLauncher 重新 spawn 该 Agent
                             if let Some(rtcfg_arc) = self.runtime_config.clone() {
                                 let rtcfg = rtcfg_arc.read().await.clone();
-                                let mut launcher = launcher::NodeLauncher::new(self.config.clone(), rtcfg);
+                                let mut launcher = launcher::NodeLauncher::new(
+                                    self.config.clone(),
+                                    rtcfg,
+                                    self.episodic_memory.clone(),
+                                );
                                 let agent_type = crate::agent::AgentType::Primary;
                                 let descriptor = launcher.spawn_subagent(
                                     agent_type,
@@ -1005,41 +1018,58 @@ impl Kernel {
                 }
 
                 // 记录到情景记忆（Zettelkasten 知识网络）
-                self.episodic_memory().record(
-                    topic.to_string(),
-                    payload_str.chars().take(500).collect(),
-                );
+                {
+                    let keywords: Vec<String> = topic.split('/').map(|s| s.to_string()).collect();
+                    self.episodic_memory().encode(
+                        MemoryType::Episodic,
+                        &payload_str.chars().take(500).collect::<String>(),
+                        topic,
+                        keywords,
+                        MemorySource {
+                            session_id: String::new(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                            message_index: None,
+                            confidence: 0.8,
+                        },
+                    );
+                }
 
-                // 记录到经验反思学习引擎（ERL/MAR）
-                self.erl().observe(
-                    &payload_str.chars().take(300).collect::<String>(),
-                    topic,
-                );
+                // 感官信号由 ReflexRouter 处理，ERL 在任务完成后通过 extract_heuristics 批量提取
+                tracing::trace!(topic = %topic, "感官信号已记录到 ExperienceLog + EpisodicMemory");
 
                 // 通过 ReflexRouter 匹配反射规则
                 match self.reflex_router.route(topic, &payload_str) {
                     Some(reflex_action) => {
                         match reflex_action {
                             ReflexAction::Direct { action, params } => {
-                                // L0：直接构造 motor 消息发送
-                                tracing::info!(
-                                    topic = %topic,
-                                    action = %action,
-                                    "反射弧 L0：感官信号 → 直接运动指令"
-                                );
-                                if let Ok(motor_msg) = FrameCodec::new_message(
-                                    Topic::new(&action),
-                                    "kernel",
-                                    &params,
-                                ) {
-                                    let targets = self.broker.find_targets(&motor_msg);
-                                    if !targets.is_empty() {
-                                        let frames: Vec<Bytes> = FrameCodec::encode(&motor_msg)?
-                                            .into_iter()
-                                            .map(Bytes::from)
-                                            .collect();
-                                        for (identity, _node_id) in targets {
-                                            transport.send_to(Bytes::from(identity), frames.clone()).await?;
+                                if action == "kernel/log" {
+                                    // 内核级日志：直接记录，不发布消息
+                                    tracing::info!(
+                                        topic = %topic,
+                                        signal = %payload_str.chars().take(100).collect::<String>(),
+                                        "反射弧 L0：感官信号日志"
+                                    );
+                                } else {
+                                    // L0：直接构造 motor 消息发送
+                                    tracing::info!(
+                                        topic = %topic,
+                                        action = %action,
+                                        "反射弧 L0：感官信号 → 直接运动指令"
+                                    );
+                                    if let Ok(motor_msg) = FrameCodec::new_message(
+                                        Topic::new(&action),
+                                        "kernel",
+                                        &params,
+                                    ) {
+                                        let targets = self.broker.find_targets(&motor_msg);
+                                        if !targets.is_empty() {
+                                            let frames: Vec<Bytes> = FrameCodec::encode(&motor_msg)?
+                                                .into_iter()
+                                                .map(Bytes::from)
+                                                .collect();
+                                            for (identity, _node_id) in targets {
+                                                transport.send_to(Bytes::from(identity), frames.clone()).await?;
+                                            }
                                         }
                                     }
                                 }
@@ -1286,8 +1316,8 @@ impl Kernel {
     /// 请求 spawn 子 Agent
     ///
     /// 创建 SubAgentNode 并在独立 tokio task 中启动。
-    /// SubAgentNode 启动后会自动连接消息总线、注册、订阅 subagent/{id}/task。
-    /// 父 Agent 收到返回的 new_id 后，向 subagent/{new_id}/task 发送任务即可。
+    /// SubAgentNode 启动后会自动连接消息总线、注册、订阅 agent/{id}/task。
+    /// 父 Agent 收到返回的 new_id 后，向 agent/{new_id}/task 发送任务即可。
     async fn request_spawn_subagent(
         &mut self,
         transport: &mut KernelTransport,

@@ -16,6 +16,54 @@ use serde::{Deserialize, Serialize};
 use super::embedding::{EmbeddingIndex, EmbeddingVector};
 use super::mmr::mmr_select;
 
+/// LLM 摘要客户端 trait
+///
+/// 抽象 LLM 调用能力，使 WorkingMemory 不直接依赖消息总线。
+/// 实现者可以通过消息总线（SamplerNode）或直接 API 调用来完成摘要。
+#[async_trait::async_trait]
+pub trait LlmSummarizer: Send + Sync {
+    /// 调用 LLM 生成摘要
+    ///
+    /// # Arguments
+    /// * `prompt` - 摘要提示词
+    /// * `content` - 需要摘要的内容
+    ///
+    /// # Returns
+    /// 摘要后的文本
+    async fn summarize(&self, prompt: &str, content: &str) -> Result<String, anyhow::Error>;
+}
+
+/// 基于截断的后备摘要器（无需 LLM）
+pub struct TruncatingSummarizer {
+    /// 截断保留的字符数
+    max_chars: usize,
+}
+
+impl TruncatingSummarizer {
+    pub fn new(max_chars: usize) -> Self {
+        Self { max_chars }
+    }
+}
+
+impl Default for TruncatingSummarizer {
+    fn default() -> Self {
+        Self { max_chars: 200 }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmSummarizer for TruncatingSummarizer {
+    async fn summarize(&self, _prompt: &str, content: &str) -> Result<String, anyhow::Error> {
+        if content.len() <= self.max_chars {
+            return Ok(content.to_string());
+        }
+        Ok(format!(
+            "[摘要] {}...",
+            content.chars().take(self.max_chars).collect::<String>()
+        ))
+    }
+}
+
 /// 消息角色（标准 LLM API 格式）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -152,10 +200,15 @@ pub struct WorkingMemory {
     entries: Vec<WorkingEntry>,
     /// 最大 token 预算
     max_tokens: u32,
+    /// 已使用 token 数（增量计数器，O(1) 读取）
+    /// 每次 push_hot / compact / replace_entries 时同步更新
+    used_tokens_cached: u32,
     /// 压缩策略
     compaction_policy: CompactionPolicy,
     /// Embedding 索引（用于相似度检索）
     embedding_index: EmbeddingIndex,
+    /// LLM 摘要器（None 时回退到截断）
+    summarizer: Option<std::sync::Arc<dyn LlmSummarizer>>,
 }
 
 impl WorkingMemory {
@@ -163,19 +216,47 @@ impl WorkingMemory {
         Self {
             entries: Vec::new(),
             max_tokens,
+            used_tokens_cached: 0,
             compaction_policy: CompactionPolicy::default(),
             embedding_index: EmbeddingIndex::new(),
+            summarizer: None,
         }
     }
 
-    /// 当前已用 token 数
+    /// 设置 LLM 摘要器
+    pub fn set_summarizer(&mut self, summarizer: std::sync::Arc<dyn LlmSummarizer>) {
+        self.summarizer = Some(summarizer);
+    }
+
+    /// 使用 LLM 摘要器或截断回退
+    pub async fn summarize_content(&self, content: &str) -> Result<String, anyhow::Error> {
+        let prompt = "请将以下对话历史压缩为简洁摘要，保留关键信息：\n";
+        if let Some(ref summarizer) = self.summarizer {
+            match summarizer.summarize(prompt, content).await {
+                Ok(summary) => return Ok(summary),
+                Err(e) => {
+                    tracing::warn!("LLM 摘要失败，回退到截断：{}", e);
+                }
+            }
+        }
+        // 回退到截断
+        let fallback = TruncatingSummarizer::default();
+        fallback.summarize(prompt, content).await
+    }
+
+    /// 当前已用 token 数（O(1)，增量计数器）
     pub fn used_tokens(&self) -> u32 {
-        self.entries.iter().map(|e| e.token_count()).sum()
+        self.used_tokens_cached
+    }
+
+    /// 重新计算 token 总数（仅在 replace_entries 等批量操作后调用）
+    fn recalc_used_tokens(&mut self) {
+        self.used_tokens_cached = self.entries.iter().map(|e| e.token_count()).sum();
     }
 
     /// 剩余可用 token 数
     pub fn available_tokens(&self) -> u32 {
-        self.max_tokens.saturating_sub(self.used_tokens())
+        self.max_tokens.saturating_sub(self.used_tokens_cached)
     }
 
     /// 获取最大 token 预算
@@ -185,6 +266,7 @@ impl WorkingMemory {
 
     /// 添加热消息（显式角色）
     pub fn push_hot(&mut self, role: MessageRole, content: String, token_count: u32) {
+        self.used_tokens_cached += token_count;
         self.entries.push(WorkingEntry::Hot {
             role,
             content,
@@ -239,9 +321,32 @@ impl WorkingMemory {
             .collect()
     }
 
+    /// 直接构建 ChatMessage 列表，避免中间 Vec<(String, String)> 转换
+    ///
+    /// 性能优化：跳过 `to_chat_messages()` 的中间分配，
+    /// 直接输出最终格式，减少一次 Vec 分配和所有元组的分配。
+    /// 对于大上下文窗口（数百条消息），可节省显著的开销。
+    pub fn to_chat_messages_direct<M>(&self, make_msg: impl Fn(String, String) -> M) -> Vec<M> {
+        self.entries
+            .iter()
+            .map(|entry| match entry {
+                WorkingEntry::Hot { role, content, .. } => {
+                    make_msg(role.to_string(), content.clone())
+                }
+                WorkingEntry::Warm { summary, .. } => {
+                    make_msg("system".into(), format!("[上下文摘要] {}", summary))
+                }
+                WorkingEntry::Cold { placeholder, .. } => {
+                    make_msg("system".into(), placeholder.clone())
+                }
+            })
+            .collect()
+    }
+
     /// 用滑动窗口结果替换所有条目
     pub fn replace_entries(&mut self, entries: Vec<WorkingEntry>) {
         self.entries = entries;
+        self.recalc_used_tokens();
     }
 
     /// 设置压缩策略
@@ -254,7 +359,7 @@ impl WorkingMemory {
         if self.max_tokens == 0 {
             return false;
         }
-        let usage_percent = (self.used_tokens() as u64 * 100) / self.max_tokens as u64;
+        let usage_percent = (self.used_tokens_cached as u64 * 100) / self.max_tokens as u64;
         usage_percent >= self.compaction_policy.auto_compact_threshold_percent as u64
     }
 
@@ -289,7 +394,7 @@ impl WorkingMemory {
     /// 2. 将这些 Hot→Warm（截断内容至约 50% 并加 `[已压缩]` 前缀）
     /// 3. 将已有的 Warm→Cold（占位符替换）
     pub fn compact_with_policy(&mut self, _policy: &CompactionPolicy) -> CompactionResult {
-        let tokens_before = self.used_tokens();
+        let tokens_before = self.used_tokens_cached;
         let total = self.entries.len();
 
         // 保持最近的条目为 Hot 的安全边界
@@ -329,18 +434,23 @@ impl WorkingMemory {
         let mut entries_compacted = 0usize;
 
         for i in 0..hot_cutoff {
+            // 使用 take 避免 clone：直接替换 entry，取走 content 所有权
+            let entry = std::mem::replace(&mut self.entries[i], WorkingEntry::Cold {
+                placeholder: String::new(),
+                source_range: (i, i),
+                token_count: 0,
+            });
+
             if let WorkingEntry::Hot {
                 content,
                 token_count,
                 ..
-            } = &self.entries[i]
+            } = entry
             {
-                let content = content.clone();
-                let token_count = *token_count;
-
                 // 截断内容至约 50% 并加 [已压缩] 前缀
+                // 使用 chars() 处理 UTF-8 边界，避免截断到多字节字符中间
                 let truncate_len = (content.len() / 2).max(1);
-                let summary = format!("[已压缩] {}...", &content[..truncate_len]);
+                let summary = format!("[已压缩] {}...", &content[..content.floor_char_boundary(truncate_len)]);
                 let warm_tokens = (token_count / 2).max(1);
 
                 self.entries[i] = WorkingEntry::Warm {
@@ -352,14 +462,17 @@ impl WorkingMemory {
                 compacted_start = compacted_start.min(i);
                 compacted_end = compacted_end.max(i);
                 entries_compacted += 1;
+            } else {
+                // 非 Hot 条目放回
+                self.entries[i] = entry;
             }
         }
 
-        let tokens_after = self.used_tokens();
+        self.recalc_used_tokens();
 
         CompactionResult {
             tokens_before,
-            tokens_after,
+            tokens_after: self.used_tokens_cached,
             entries_compacted,
             compacted_range: (compacted_start, compacted_end),
         }
@@ -388,7 +501,7 @@ impl WorkingMemory {
         F: Fn(&str) -> Fut,
         Fut: std::future::Future<Output = Result<String, anyhow::Error>>,
     {
-        let tokens_before = self.used_tokens();
+        let tokens_before = self.used_tokens_cached;
         let total = self.entries.len();
 
         // 保持最近的条目为 Hot 的安全边界
@@ -467,11 +580,11 @@ impl WorkingMemory {
             }
         }
 
-        let tokens_after = self.used_tokens();
+        self.recalc_used_tokens();
 
         CompactionResult {
             tokens_before,
-            tokens_after,
+            tokens_after: self.used_tokens_cached,
             entries_compacted,
             compacted_range: (compacted_start, compacted_end),
         }
@@ -506,27 +619,9 @@ impl WorkingMemory {
     ///
     /// # Returns
     /// 摘要后的内容字符串，或截断后备方案
-    #[allow(dead_code)]  // 保留为 API，待集成 SamplerNode 后启用
+    /// 使用 LLM 生成摘要（如已注入摘要器），否则截断回退
     async fn summarize_with_llm(&self, content: &str) -> Result<String, anyhow::Error> {
-        // Build a summarization prompt
-        let _prompt = format!(
-            "请将以下对话历史压缩为简洁摘要，保留关键信息：\n\n{}\n\n摘要：",
-            content
-        );
-
-        // This would normally send to Sampler Node
-        // For now, return a placeholder that indicates LLM summarization was requested
-        // The actual LLM call would be done by ThinkerNode via message bus
-
-        // Future integration point:
-        // let summary = self.send_to_sampler_node(&_prompt).await?;
-        // Ok(summary)
-
-        // Placeholder: take first 100 chars to indicate LLM summarization was attempted
-        Ok(format!(
-            "[LLM摘要] {}...",
-            content.chars().take(100).collect::<String>()
-        ))
+        self.summarize_content(content).await
     }
 
     /// 压缩对话历史（保留工具调用配对）
@@ -608,7 +703,7 @@ impl WorkingMemory {
     ///
     /// 只压缩旧消息，保留最近N轮对话完整
     pub fn partial_compact(&mut self, keep_recent_turns: usize) -> CompactionResult {
-        let tokens_before = self.used_tokens();
+        let tokens_before = self.used_tokens_cached;
         let turns = self.group_by_turns();
         let total_turns = turns.len();
 
@@ -669,11 +764,11 @@ impl WorkingMemory {
             });
         }
 
-        let tokens_after = self.used_tokens();
+        self.recalc_used_tokens();
 
         CompactionResult {
             tokens_before,
-            tokens_after,
+            tokens_after: self.used_tokens_cached,
             entries_compacted,
             compacted_range: (compacted_start, compacted_end),
         }

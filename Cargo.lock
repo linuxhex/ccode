@@ -3390,6 +3390,7 @@ dependencies = [
  "blake3",
  "bytes",
  "ccode-compaction",
+ "ccode-hooks",
  "chrono",
  "crossbeam-queue",
  "crossterm",

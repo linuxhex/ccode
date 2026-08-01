@@ -26,7 +26,7 @@ use crate::node::sampler::SamplerNode;
 use crate::node::tui::TUINode;
 use crate::node::tool::ToolNode;
 use crate::node::state::StateNode;
-use crate::node::thinker::ThinkerNode;
+use crate::node::thinker::{ThinkerNode, EpisodicMemoryBridge};
 use crate::node::acp::AcpNode;
 use crate::node::transport::run_node;
 use crate::agent::AgentConfig;
@@ -47,6 +47,8 @@ pub struct NodeLauncher {
     kernel_config: KernelConfig,
     /// 运行时配置（providers/model/permission）
     runtime_config: KernelRuntimeConfig,
+    /// 情景记忆存储（与 Kernel 共享同一实例）
+    episodic_memory: std::sync::Arc<crate::memory::episodic::EpisodicMemoryStore>,
     /// 已启动的 Node 描述
     launched_nodes: Vec<NodeDescriptor>,
     /// 已启动的 Node 任务 JoinHandle（用于优雅关闭）
@@ -54,10 +56,15 @@ pub struct NodeLauncher {
 }
 
 impl NodeLauncher {
-    pub fn new(kernel_config: KernelConfig, runtime_config: KernelRuntimeConfig) -> Self {
+    pub fn new(
+        kernel_config: KernelConfig,
+        runtime_config: KernelRuntimeConfig,
+        episodic_memory: std::sync::Arc<crate::memory::episodic::EpisodicMemoryStore>,
+    ) -> Self {
         Self {
             kernel_config,
             runtime_config,
+            episodic_memory,
             launched_nodes: Vec::new(),
             task_handles: Vec::new(),
         }
@@ -121,7 +128,10 @@ impl NodeLauncher {
             non_interactive: false,
             tools: Vec::new(),
         };
-        let thinker = ThinkerNode::new(thinker_id.clone(), thinker_config);
+        let mut thinker = ThinkerNode::new(thinker_id.clone(), thinker_config);
+
+        // 连接情景记忆桥接（ThinkerNode ↔ EpisodicMemoryStore，与 Kernel 共享同一实例）
+        thinker.set_memory_bridge(Box::new(EpisodicMemoryBridge::new(self.episodic_memory.clone())));
 
         // 5. TUI Node
         let tui_ctx = self.node_context();

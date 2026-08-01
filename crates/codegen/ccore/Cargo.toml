@@ -79,6 +79,9 @@ blake3 = { workspace = true }
 # 压缩管道（snip + budget）
 ccode-compaction = { path = "../../common/ccode-compaction" }
 
+# Hook 系统（权限链 + 输入改写）
+ccode-hooks = { path = "../ccode-hooks" }
+
 # Dashboard HTTP 服务器
 axum = { version = "0.7", optional = true }
 tower = { version = "0.4", optional = true }

@@ -74,13 +74,14 @@ impl AcpNode {
         }
 
         let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<serde_json::Value>();
-        self.stdout_tx = Some(stdout_tx);
+        self.stdout_tx = Some(stdout_tx.clone());
 
         let primary_agent_id = self.primary_agent_id.clone();
         let node_id_str = self.id.as_str().to_string();
         let transport = transport.clone();
+        let stdin_stdout_tx = stdout_tx;
 
-        // stdin reader: 读 JSON-RPC → 发布到总线
+        // stdin reader: 读 JSON-RPC → 发布到总线 / 写响应到 stdout
         tokio::spawn(async move {
             let stdin = tokio::io::stdin();
             let mut reader = BufReader::new(stdin);
@@ -104,6 +105,7 @@ impl AcpNode {
                                 &primary_agent_id,
                                 &node_id_str,
                                 &transport,
+                                &stdin_stdout_tx,
                             )
                             .await;
                         } else {
@@ -146,6 +148,7 @@ impl AcpNode {
         primary_agent_id: &str,
         node_id_str: &str,
         transport: &NodeTransportHandle,
+        stdout_tx: &mpsc::UnboundedSender<serde_json::Value>,
     ) {
         match req.method.as_str() {
             "initialize" => {
@@ -164,7 +167,7 @@ impl AcpNode {
                             }
                         }),
                     };
-                    Self::write_stdout(transport, &serde_json::to_value(response).unwrap_or_default());
+                    let _ = stdout_tx.send(serde_json::to_value(response).unwrap_or_default());
                 }
             }
             "session/prompt" => {
@@ -210,18 +213,10 @@ impl AcpNode {
                         id: id.clone(),
                         result: serde_json::json!({"error": "method not found"}),
                     };
-                    Self::write_stdout(transport, &serde_json::to_value(response).unwrap_or_default());
+                    let _ = stdout_tx.send(serde_json::to_value(response).unwrap_or_default());
                 }
             }
         }
-    }
-
-    fn write_stdout(transport: &NodeTransportHandle, _value: &serde_json::Value) {
-        // stdout 写入通过 stdout_tx channel，但此方法在 stdin reader task 中调用
-        // 这里用 transport 发回给自己让 handle_message 转发
-        // 简化：直接通过全局 stdout（由 stdout_writer task 消费）
-        // 由于我们在 stdin task 中没有 stdout_tx，通过 transport 发 control 消息
-        let _ = transport;
     }
 }
 

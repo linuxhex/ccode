@@ -461,6 +461,47 @@ impl SessionActor {
                 )
                 .await;
 
+                // ── 技能模型切换：如果技能指定了 model/effort，自动切换 ──
+                if let Some(first_skill) = parsed_skills.first() {
+                    if let Some(skill_info) = slash_skills.iter().find(|s| s.name == first_skill.name) {
+                        if let Some(ref model_override) = skill_info.model {
+                            tracing::info!(
+                                skill_name = %first_skill.name,
+                                model = %model_override,
+                                effort = ?skill_info.effort,
+                                "技能指定模型，触发自动切换"
+                            );
+                            if let Ok(sampler_config) = self.reconstruct_sampler_config_for_model(
+                                model_override,
+                                skill_info.effort.as_deref(),
+                            ).await {
+                                match self.handle_set_session_model(
+                                    sampler_config,
+                                    true,   // use_concise
+                                    true,   // apply_prompt_override
+                                    false,  // skip_prompt_rewrite
+                                    85,     // auto_compact_threshold_percent
+                                ).await {
+                                    Ok(new_model_id) => {
+                                        tracing::info!(
+                                            skill_name = %first_skill.name,
+                                            new_model = %new_model_id,
+                                            "技能模型切换成功"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            skill_name = %first_skill.name,
+                                            error = %e,
+                                            "技能模型切换失败，继续使用当前模型"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 original_blocks
             }
         };
@@ -835,7 +876,7 @@ impl SessionActor {
         let doom_event_model = turn_model_id.clone();
         let turn_timer = std::time::Instant::now();
 
-        // Agent 主循环状态机：追踪循环阶段，使状态变迁可观测、可中断
+        // Agent 主循环状态机：驱动循环决策
         let mut loop_sm = ccode_agent::loop_state::LoopStateMachine::new();
 
         let result = {
@@ -869,66 +910,84 @@ impl SessionActor {
                     .await;
 
                 // 根据采样轮结果驱动状态机转换
-                if let Ok(TurnOutcome::Completed { refusal, .. }) = &round {
+                let loop_action = if let Ok(TurnOutcome::Completed { refusal, .. }) = &round {
                     if refusal.is_some() {
                         // 模型拒绝：状态机转换到 Done
-                        let action = loop_sm.transition(
+                        loop_sm.transition(
                             ccode_agent::loop_state::LoopEvent::LLMResponse {
                                 stop_reason: "end_turn".to_string(),
                                 token_used: 0,
                                 tool_calls: vec![],
                             },
-                        );
-                        tracing::info!(
-                            loop_action = ?action,
-                            loop_state = ?loop_sm.state(),
-                            "agent loop: model refusal, state machine transitioned to Done"
-                        );
-                        self.auto_pause_goal_if_active_with_message(
-                            crate::session::goal_tracker::GoalPauseReason::Infra,
-                            "The model provider refused this goal round. Use /goal resume to retry."
-                                .to_string(),
                         )
-                        .await;
                     } else {
-                        // 正常完成：状态机转换到 CallingLLM（准备下一轮）或 Done
-                        // 检查连续失败熔断
+                        // 正常完成：检查连续失败熔断
                         if loop_sm.consecutive_failures() >= 3 {
-                            let action = loop_sm.transition(
+                            loop_sm.transition(
                                 ccode_agent::loop_state::LoopEvent::ConsecutiveFailures {
                                     count: loop_sm.consecutive_failures(),
                                 },
-                            );
-                            tracing::warn!(
-                                loop_action = ?action,
-                                "agent loop: consecutive failures circuit-break triggered by state machine"
-                            );
+                            )
                         } else {
-                            // 正常完成一轮，状态机记录 token 使用并回到 CallingLLM
-                            let action = loop_sm.transition(
+                            // 正常完成一轮，状态机记录并回到 CallingLLM
+                            loop_sm.transition(
                                 ccode_agent::loop_state::LoopEvent::LLMResponse {
                                     stop_reason: "tool_use".to_string(),
                                     token_used: 0,
                                     tool_calls: vec![],
                                 },
-                            );
-                            tracing::debug!(
-                                loop_action = ?action,
-                                "agent loop: round completed, state machine ready for next round"
-                            );
+                            )
                         }
+                    }
+                } else {
+                    // 非正常完成（错误等），让状态机处理
+                    loop_sm.transition(
+                        ccode_agent::loop_state::LoopEvent::LLMResponse {
+                            stop_reason: "end_turn".to_string(),
+                            token_used: 0,
+                            tool_calls: vec![],
+                        },
+                    )
+                };
+
+                tracing::info!(
+                    loop_action = ?loop_action,
+                    loop_state = ?loop_sm.state(),
+                    "agent loop: state machine transitioned"
+                );
+
+                // ── 状态机驱动决策：根据 LoopAction 决定下一步 ──
+                match loop_action {
+                    ccode_agent::loop_state::LoopAction::EndTurn { reason } => {
+                        tracing::info!(
+                            done_reason = ?reason,
+                            "agent loop: state machine decided to end turn"
+                        );
+                        if matches!(reason, ccode_agent::loop_state::DoneReason::ModelRefusal) {
+                            self.auto_pause_goal_if_active_with_message(
+                                crate::session::goal_tracker::GoalPauseReason::Infra,
+                                "The model provider refused this goal round. Use /goal resume to retry."
+                                    .to_string(),
+                            )
+                            .await;
+                        }
+                        break round;
+                    }
+                    ccode_agent::loop_state::LoopAction::CallLLM => {
+                        // 继续循环，调用 LLM
+                    }
+                    ccode_agent::loop_state::LoopAction::ExecuteTool { .. } => {
+                        // 继续循环，执行工具
+                    }
+                    ccode_agent::loop_state::LoopAction::WaitForPermission { .. } => {
+                        // 继续循环，等待权限
+                    }
+                    ccode_agent::loop_state::LoopAction::ContinueLoop => {
+                        // 继续循环
                     }
                 }
 
-                // 检查状态机是否已经结束
-                if let ccode_agent::loop_state::LoopState::Done { reason } = loop_sm.state() {
-                    tracing::info!(
-                        done_reason = ?reason,
-                        "agent loop: state machine reached Done state, ending turn"
-                    );
-                    break round;
-                }
-
+                // 非 Completed 结果直接结束
                 if !matches!(round, Ok(TurnOutcome::Completed { .. })) {
                     break round;
                 }

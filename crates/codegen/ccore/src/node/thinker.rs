@@ -67,6 +67,50 @@ pub trait MemoryBridge: Send + Sync {
 /// 空记忆桥接（默认实现，不做任何事）
 struct NoopMemoryBridge;
 impl MemoryBridge for NoopMemoryBridge {}
+
+/// 情景记忆桥接 — 连接 EpisodicMemoryStore 到 ThinkerNode
+pub struct EpisodicMemoryBridge {
+    store: std::sync::Arc<crate::memory::episodic::EpisodicMemoryStore>,
+}
+
+impl EpisodicMemoryBridge {
+    pub fn new(store: std::sync::Arc<crate::memory::episodic::EpisodicMemoryStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl MemoryBridge for EpisodicMemoryBridge {
+    fn search_relevant(&self, query: &str, top_k: usize) -> Vec<String> {
+        let context = self.store.reconstruct_context(query, top_k);
+        if context.is_empty() {
+            Vec::new()
+        } else {
+            vec![context]
+        }
+    }
+
+    fn extract_and_store(&self, messages: &[(String, String)]) {
+        use crate::memory::episodic::{MemoryType, MemorySource};
+        for (i, (role, content)) in messages.iter().enumerate() {
+            if content.len() < 50 {
+                continue;
+            }
+            let keywords: Vec<String> = content.split_whitespace().take(8).map(|s| s.to_string()).collect();
+            self.store.encode(
+                if role == "assistant" { MemoryType::Episodic } else { MemoryType::Semantic },
+                &content.chars().take(500).collect::<String>(),
+                role,
+                keywords,
+                MemorySource {
+                    session_id: String::new(),
+                    timestamp: chrono::Utc::now().timestamp(),
+                    message_index: Some(i),
+                    confidence: 0.7,
+                },
+            );
+        }
+    }
+}
 use crate::sampler::provider::{
     SampleRequest, ChatMessage, StreamChunk, StreamChannel, ToolDefinition as SamplerToolDefinition,
 };
@@ -676,8 +720,9 @@ impl ThinkerNode {
         let action = payload["action"].as_str().unwrap_or("none");
         match action {
             "slow_down" => {
-                // 反射弧建议减速：提高 doom loop 检测灵敏度
-                tracing::info!("反射弧 motor：减速，提高 doom loop 灵敏度");
+                // 反射弧建议减速：提高 doom loop 检测灵敏度（降低重复阈值，保留历史计数）
+                self.doom_loop_detector.set_repeat_threshold(2);
+                tracing::info!("反射弧 motor：减速，doom loop 阈值降至 2");
             }
             "switch_strategy" => {
                 let hint = payload["hint"].as_str().unwrap_or("尝试不同的方法");
@@ -696,6 +741,68 @@ impl ThinkerNode {
             _ => {
                 tracing::debug!("反射弧 motor：未知 action={}", action);
             }
+        }
+    }
+
+    /// 持久化工作记忆到 StateNode（turn 结束时调用）
+    ///
+    /// 限制：
+    /// - 排除 Cold 条目（仅占位符，无信息量）
+    /// - 最多保留 50 条 Hot/Warm 条目
+    /// - 总 token 上限 4000（超出则从最旧条目截断）
+    async fn persist_to_state(&self, transport: &NodeTransportHandle) {
+        const MAX_PERSIST_ENTRIES: usize = 50;
+        const MAX_PERSIST_TOKENS: u32 = 4000;
+
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        let mut total_tokens: u32 = 0;
+
+        for e in self.working_memory.entries() {
+            let (role, content) = match e {
+                crate::memory::working::WorkingEntry::Hot { role, content, .. } => {
+                    (format!("{:?}", role), content.chars().take(200).collect::<String>())
+                }
+                crate::memory::working::WorkingEntry::Warm { summary, .. } => {
+                    ("Warm".to_string(), summary.chars().take(200).collect::<String>())
+                }
+                crate::memory::working::WorkingEntry::Cold { .. } => continue,
+            };
+
+            let tokens = e.token_count();
+            if total_tokens + tokens > MAX_PERSIST_TOKENS {
+                break;
+            }
+            if entries.len() >= MAX_PERSIST_ENTRIES {
+                break;
+            }
+
+            total_tokens += tokens;
+            entries.push(serde_json::json!({
+                "role": role,
+                "content": content,
+                "tokens": tokens,
+            }));
+        }
+
+        if entries.is_empty() {
+            return;
+        }
+
+        let persist_payload = serde_json::json!({
+            "agent_id": self.id.as_str(),
+            "entries": entries,
+            "total_tokens": total_tokens,
+        });
+        if let Ok(msg) = FrameCodec::new_message(
+            Topic::new("state/persist"),
+            self.id.as_str(),
+            &persist_payload,
+        ) {
+            let _ = transport.send_message(&msg).await;
+            tracing::debug!(
+                "Thinker {} turn 结束持久化：{} 条记录，{} tokens",
+                self.id, entries.len(), total_tokens
+            );
         }
     }
 
@@ -816,6 +923,10 @@ impl Node for ThinkerNode {
                         self.agentic_session_active = false;
                         self.state = AgentState::Idle;
                         self.update_context_window();
+
+                        // turn 结束：持久化工作记忆到 StateNode
+                        self.persist_to_state(transport).await;
+
                         tracing::debug!("Thinker {} agentic turn 完成", self.id);
                     }
                     return Ok(());
@@ -863,6 +974,7 @@ impl Node for ThinkerNode {
                     if all_done {
                         // 工具执行完毕，回到 sampler 前先跑压缩管道
                         self.run_compaction_pipeline();
+
                         self.send_sample_request(transport).await?;
                     }
                 } else {
@@ -904,6 +1016,16 @@ impl Node for ThinkerNode {
             t if t.starts_with("motor/") && t.ends_with("/adjust") => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
                 self.handle_motor_adjust(&payload);
+            }
+
+            // cortex/sensory — L1 本能反射通知（来自 Kernel ReflexRouter）
+            "cortex/sensory" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                let signal_topic = payload["signal_topic"].as_str().unwrap_or("");
+                let action = payload["action"].as_str().unwrap_or("");
+                let summary = format!("[反射弧L1] 信号={} 动作={}", signal_topic, action);
+                self.working_memory.push_system(&summary, summary.len() as u32 / 3);
+                tracing::info!(signal_topic, action, "Thinker 收到 L1 本能反射通知");
             }
 
             // tool/register — 收到工具注册消息
@@ -1053,6 +1175,7 @@ impl Node for ThinkerNode {
             format!("agent/{}/tool_result", self.id),  // 工具结果（替代 skin/touch）
             format!("agent/{}/cancel", self.id),       // 取消请求（来自 AcpNode/TUINode）
             format!("motor/{}/adjust", self.id),       // 反射弧 motor 指令（来自 Kernel ReflexRouter）
+            "cortex/sensory".into(),                   // L1 本能反射通知（来自 Kernel ReflexRouter）
             "sampler/*/stream".into(),
             "tool/register".into(),
             "sys/shutdown".into(),

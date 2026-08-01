@@ -1,7 +1,25 @@
 use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use ccode_chat::conversation_util::replace_or_insert_system_head;
+
 impl SessionActor {
+    /// 根据模型名称和可选的 effort 重建 SamplerConfig
+    ///
+    /// 复用当前 SamplerConfig 的 auth/headers 等配置，只替换 model 和 reasoning_effort。
+    /// 用于技能指定模型时的自动切换。
+    pub(super) async fn reconstruct_sampler_config_for_model(
+        &self,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<ccode_sampler::SamplerConfig, anyhow::Error> {
+        let mut config = self.reconstruct_full_config().await;
+        config.model = model.to_string();
+        if let Some(e) = effort {
+            config.reasoning_effort = e.parse().ok();
+        }
+        Ok(config)
+    }
+
     pub(super) async fn handle_set_session_model(
         &self,
         sampling_config: ccode_sampler::SamplerConfig,

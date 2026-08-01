@@ -144,6 +144,58 @@ pub fn pre_filter(tool_name: &str, input: &serde_json::Value) -> Option<Permissi
     None
 }
 
+/// 根据 deny 的工具和输入，生成替代方案建议
+///
+/// 借鉴 Claude Code 的 deny-recovery 设计：拒绝后不仅告知原因，
+/// 还提供替代方案让 Agent 可以调整策略。
+fn generate_deny_alternatives(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    _reason: &str,
+) -> Vec<String> {
+    let mut alternatives = Vec::new();
+
+    match tool_name {
+        "Bash" | "Shell" => {
+            if let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
+                if cmd.contains("rm ") {
+                    alternatives.push("使用 Edit 删除文件内容替代 rm 命令".to_string());
+                    alternatives.push("使用 git rm 替代 rm（保留版本历史）".to_string());
+                }
+                if cmd.contains("chmod") || cmd.contains("chown") {
+                    alternatives.push("检查当前权限是否已满足需求".to_string());
+                }
+                if cmd.contains("curl") || cmd.contains("wget") {
+                    alternatives.push("使用 WebFetch 工具获取网页内容".to_string());
+                }
+                if cmd.contains("apt") || cmd.contains("yum") || cmd.contains("brew") {
+                    alternatives.push("确认包安装是否必要，考虑使用 Docker 替代".to_string());
+                }
+            }
+            if alternatives.is_empty() {
+                alternatives.push("尝试拆分命令为更小的操作步骤".to_string());
+                alternatives.push("使用 --dry-run 或 --confirm 参数预览操作".to_string());
+            }
+        }
+        "Write" | "FileWrite" => {
+            alternatives.push("先使用 Read 工具确认当前文件内容".to_string());
+            alternatives.push("使用 Edit 工具进行增量修改而非全量覆写".to_string());
+        }
+        "Edit" | "FileEdit" => {
+            alternatives.push("确认修改范围是否正确（使用 Read 先查看）".to_string());
+            alternatives.push("缩小修改范围到最小必要变更".to_string());
+        }
+        _ => {
+            alternatives.push(format!(
+                "检查 {} 的参数是否符合权限策略", tool_name
+            ));
+            alternatives.push("在 .ccode/permissions.json 中添加对应的 allow 规则".to_string());
+        }
+    }
+
+    alternatives
+}
+
 /// 执行完整权限决策链
 ///
 /// 按优先级依次检查：
@@ -164,14 +216,15 @@ pub fn evaluate_permission_chain(
     }
 
     // 2. Hook 拦截：用户自定义 hook 的 deny 决策
-    if let Some(HookDecision::Deny { reason, .. }) = hook_decision {
+    if let Some(HookDecision::Deny { reason, hook_name }) = hook_decision {
+        let alternatives = generate_deny_alternatives(tool_name, tool_input, &reason);
         return PermissionChainResult {
             decision: PermissionDecision::Deny { reason },
             source: DecisionSource::Hook {
-                hook_name: String::new(),
+                hook_name,
             },
-            alternatives: Vec::new(),
-            retryable: false,
+            alternatives,
+            retryable: true,
         };
     }
 
@@ -179,10 +232,11 @@ pub fn evaluate_permission_chain(
     let rule_decision = rules.evaluate(tool_name, tool_input);
     match rule_decision {
         PermissionDecision::Deny { reason } => {
+            let alternatives = generate_deny_alternatives(tool_name, tool_input, &reason);
             return PermissionChainResult {
                 decision: PermissionDecision::Deny { reason },
                 source: DecisionSource::RuleEngine,
-                alternatives: Vec::new(),
+                alternatives,
                 retryable: true,
             };
         }

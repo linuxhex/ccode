@@ -5,7 +5,6 @@
 //! 追踪"当前处于循环的哪个阶段"。
 
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 
 /// 主循环状态
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,7 +137,7 @@ pub enum LoopAction {
 }
 
 /// 主循环状态机
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LoopStateMachine {
     /// 当前状态
     state: LoopState,
@@ -148,8 +147,11 @@ pub struct LoopStateMachine {
     tokens_used: u64,
     /// 连续工具失败次数
     consecutive_failures: usize,
-    /// 创建时间
-    created_at: Instant,
+    /// 创建时间（Unix 时间戳，可持久化）
+    created_at_secs: i64,
+    /// 运行时长（创建时为 0，恢复时保留已用时间）
+    #[serde(skip)]
+    restored_elapsed: Option<std::time::Duration>,
 }
 
 impl LoopStateMachine {
@@ -160,7 +162,8 @@ impl LoopStateMachine {
             turn_count: 0,
             tokens_used: 0,
             consecutive_failures: 0,
-            created_at: Instant::now(),
+            created_at_secs: chrono::Utc::now().timestamp(),
+            restored_elapsed: None,
         }
     }
 
@@ -186,7 +189,10 @@ impl LoopStateMachine {
 
     /// 获取运行时长
     pub fn elapsed(&self) -> std::time::Duration {
-        self.created_at.elapsed()
+        let now_secs = chrono::Utc::now().timestamp();
+        let elapsed_secs = now_secs.saturating_sub(self.created_at_secs) as u64;
+        let base = std::time::Duration::from_secs(elapsed_secs);
+        self.restored_elapsed.unwrap_or(base)
     }
 
     /// 处理事件，转换状态，返回下一步动作
@@ -347,7 +353,47 @@ impl LoopStateMachine {
         self.turn_count = 0;
         self.tokens_used = 0;
         self.consecutive_failures = 0;
-        self.created_at = Instant::now();
+        self.created_at_secs = chrono::Utc::now().timestamp();
+        self.restored_elapsed = None;
+    }
+
+    /// 序列化到 JSON 字符串
+    pub fn serialize_state(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// 从 JSON 字符串恢复
+    pub fn deserialize_state(json: &str) -> Result<Self, serde_json::Error> {
+        let mut sm: Self = serde_json::from_str(json)?;
+        sm.restored_elapsed = Some(sm.elapsed());
+        Ok(sm)
+    }
+
+    /// 持久化到文件
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), anyhow::Error> {
+        let json = self.serialize_state()?;
+        std::fs::write(path, json)?;
+        tracing::debug!(
+            path = %path.display(),
+            state = ?self.state,
+            turn_count = self.turn_count,
+            "状态机已持久化到文件"
+        );
+        Ok(())
+    }
+
+    /// 从文件恢复
+    pub fn load_from_file(path: &std::path::Path) -> Result<Self, anyhow::Error> {
+        let json = std::fs::read_to_string(path)?;
+        let sm = Self::deserialize_state(&json)?;
+        tracing::info!(
+            path = %path.display(),
+            state = ?sm.state,
+            turn_count = sm.turn_count,
+            tokens_used = sm.tokens_used,
+            "状态机从文件恢复"
+        );
+        Ok(sm)
     }
 }
 
@@ -478,5 +524,23 @@ mod tests {
         assert_eq!(*sm.state(), LoopState::Idle);
         assert_eq!(sm.turn_count(), 0);
         assert_eq!(sm.tokens_used(), 0);
+    }
+
+    #[test]
+    fn test_serialize_deserialize() {
+        let mut sm = LoopStateMachine::new();
+        sm.transition(LoopEvent::LLMResponse {
+            stop_reason: "tool_use".to_string(),
+            token_used: 500,
+            tool_calls: vec![("id1".to_string(), "Bash".to_string(), serde_json::json!({}))],
+        });
+        assert_eq!(sm.turn_count(), 1);
+        assert_eq!(sm.tokens_used(), 500);
+
+        let json = sm.serialize_state().expect("serialize should work");
+        let restored = LoopStateMachine::deserialize_state(&json).expect("deserialize should work");
+        assert_eq!(*restored.state(), LoopState::ExecutingTools);
+        assert_eq!(restored.turn_count(), 1);
+        assert_eq!(restored.tokens_used(), 500);
     }
 }

@@ -27,6 +27,7 @@ use crate::agent::orchestrator::Orchestrator;
 use crate::agent::subagent::SubAgentCrashed;
 use crate::memory::working::WorkingMemory;
 use crate::memory::short_term::ShortTermMemory;
+use crate::memory::episodic::EpisodicMemoryStore;
 use crate::memory::window::SlidingWindow;
 use crate::sampler::provider::{
     SampleRequest, ChatMessage, StreamChunk, StreamChannel, ToolDefinition as SamplerToolDefinition,
@@ -38,6 +39,63 @@ pub struct PendingToolCall {
     pub tool_call_id: String,
     pub tool_name: String,
     pub arguments: serde_json::Value,
+}
+
+/// 用户输入消息载荷（一次反序列化，替代 Value + 手动取字段）
+#[derive(Debug, Deserialize)]
+struct InputPayload {
+    #[serde(default)]
+    content: String,
+    #[serde(default = "default_role")]
+    role: String,
+}
+
+fn default_role() -> String { "user".into() }
+
+/// 工具结果消息载荷（一次反序列化）
+#[derive(Debug, Deserialize)]
+struct ToolResultPayload {
+    #[serde(default)]
+    tool_call_id: String,
+    #[serde(default)]
+    output: String,
+    #[serde(default = "default_true")]
+    success: bool,
+    #[serde(default)]
+    duration_ms: u64,
+}
+
+fn default_true() -> bool { true }
+
+/// 子 Agent 事件载荷（一次反序列化）
+#[derive(Debug, Deserialize)]
+struct EventPayload {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+/// Sampler stream 消息类型（统一枚举，一次反序列化替代先 decode Value 再判断）
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum SamplerStreamMsg {
+    #[serde(rename = "done")]
+    Done {
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    #[serde(rename = "error")]
+    Error {
+        #[serde(default)]
+        error: Option<serde_json::Value>,
+    },
+    #[serde(untagged)]
+    Chunk(StreamChunk),
 }
 
 /// Agent Node 实现
@@ -52,6 +110,8 @@ pub struct AgentNode {
     working_memory: WorkingMemory,
     /// L1 短期记忆
     short_term_memory: ShortTermMemory,
+    /// L2 情景记忆（跨会话持久化）
+    episodic_memory: EpisodicMemoryStore,
     /// 子 Agent 编排器
     orchestrator: Orchestrator,
     /// Doom Loop 检测器
@@ -86,6 +146,7 @@ impl AgentNode {
             state: AgentState::Idle,
             working_memory: WorkingMemory::new(max_tokens),
             short_term_memory: ShortTermMemory::new(),
+            episodic_memory: EpisodicMemoryStore::new(),
             orchestrator: Orchestrator::new(10),
             doom_loop_detector: DoomLoopDetector::new(10, 3),
             disabled_tool_next_round: None,
@@ -110,6 +171,16 @@ impl AgentNode {
             false,
         );
 
+        // ── L2 情景记忆：检索相关历史经验并注入上下文 ──
+        let episodic_context = self.episodic_memory.reconstruct_context(content, 2);
+        if !episodic_context.is_empty() {
+            // 注入到 L0 工作记忆的 system 消息中
+            self.working_memory.push_system(
+                format!("[相关历史经验]\n{}", episodic_context),
+                Self::estimate_tokens(&episodic_context),
+            );
+        }
+
         // 将输入推入 L0 工作记忆
         let msg_role = crate::memory::working::MessageRole::try_from(role)
             .unwrap_or(crate::memory::working::MessageRole::User);
@@ -125,11 +196,9 @@ impl AgentNode {
 
     /// 构建采样请求，发送到 Sampler Node
     fn build_sample_request(&mut self) -> SampleRequest {
+        // 使用 to_chat_messages_direct 直接构建 ChatMessage，避免中间 Vec<(String,String)> 转换
         let messages: Vec<ChatMessage> = self.working_memory
-            .to_chat_messages()
-            .into_iter()
-            .map(|(role, content)| ChatMessage { role, content })
-            .collect();
+            .to_chat_messages_direct(|role, content| ChatMessage { role, content });
 
         // Doom Loop 逃脱：若上一轮检测到循环，本轮过滤掉被禁用的工具（仅禁用一轮）
         let mut tools = self.config.tools.clone();
@@ -234,9 +303,53 @@ impl AgentNode {
         }
     }
 
-    /// 每轮结束时执行滑动窗口更新
+    /// 每轮结束时执行滑动窗口更新 + 情景记忆编码
     fn update_context_window(&mut self) {
         self.turns_executed += 1;
+
+        // ── L2 情景记忆：将本轮对话编码到长期记忆 ──
+        let summary = self.working_memory.compact_conversation(2);
+        if !summary.is_empty() {
+            let content_str: String = summary.iter()
+                .map(|e| match e {
+                    crate::memory::working::WorkingEntry::Hot { content, .. } => content.as_str(),
+                    crate::memory::working::WorkingEntry::Warm { summary, .. } => summary.as_str(),
+                    crate::memory::working::WorkingEntry::Cold { placeholder, .. } => placeholder.as_str(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !content_str.is_empty() {
+                let keywords = Self::extract_keywords(&content_str);
+                self.episodic_memory.encode(
+                    crate::memory::episodic::MemoryType::Episodic,
+                    &content_str,
+                    &format!("turn_{}", self.turns_executed),
+                    keywords,
+                    crate::memory::episodic::MemorySource {
+                        session_id: self.id.to_string(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                        message_index: Some(self.turns_executed as usize),
+                        confidence: 0.8,
+                    },
+                );
+            }
+        }
+    }
+
+    /// 简单关键词提取（取高频非停用词）
+    fn extract_keywords(text: &str) -> Vec<String> {
+        let stop_words = ["the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "for", "of", "with", "and", "or", "not", "but", "this", "that", "it", "的", "了", "是", "在", "和", "不", "有", "我", "他", "她"];
+        let mut word_count: HashMap<String, u32> = HashMap::new();
+        for word in text.split_whitespace() {
+            let w = word.to_lowercase()
+                .chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+            if w.len() > 2 && !stop_words.contains(&w.as_str()) {
+                *word_count.entry(w).or_insert(0) += 1;
+            }
+        }
+        let mut sorted: Vec<_> = word_count.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.into_iter().take(5).map(|(w, _)| w).collect()
     }
 
     /// 检查是否达到最大轮次
@@ -297,10 +410,8 @@ impl Node for AgentNode {
         match topic {
             // 收到用户输入或父 Agent 指令
             t if t.ends_with("/input") => {
-                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
-                let content = payload["content"].as_str().unwrap_or("");
-                let role = payload["role"].as_str().unwrap_or("user");
-                self.handle_input(content, role);
+                let payload: InputPayload = FrameCodec::decode_payload(&msg)?;
+                self.handle_input(&payload.content, &payload.role);
 
                 // 记录新一轮循环开始 + 推理起始时间（用于计算 inference latency）
                 AgentMetrics::global().record_loop_count(1);
@@ -322,94 +433,85 @@ impl Node for AgentNode {
 
             // 收到 LLM 流式返回
             t if t.starts_with("sampler/") && t.ends_with("/stream") => {
-                // 先尝试解码为 JSON 检查消息类型
-                let raw_value: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                // 一次反序列化，替代先 decode Value 再判断 type
+                let stream_msg: SamplerStreamMsg = FrameCodec::decode_payload(&msg)?;
 
-                // 检查是否为 done 消息
-                if raw_value.get("type").and_then(|v| v.as_str()) == Some("done") {
-                    // 只处理自己发起的采样请求
-                    if let Some(req_id) = raw_value.get("request_id").and_then(|v| v.as_str()) {
-                        if Some(req_id) != self.current_sample_request_id.as_deref() {
+                match stream_msg {
+                    SamplerStreamMsg::Done { request_id } => {
+                        // 只处理自己发起的采样请求
+                        if let Some(req_id) = request_id {
+                            if Some(req_id.as_str()) != self.current_sample_request_id.as_deref() {
+                                return Ok(());
+                            }
+                        }
+
+                        // 采样完成，记录推理延迟（从请求发起到 done 响应的耗时）
+                        if let Some(start) = self.inference_start.take() {
+                            AgentMetrics::global()
+                                .record_inference_latency(start.elapsed().as_millis() as f64);
+                        }
+
+                        // 采样完成，检查是否有待执行的工具调用
+                        if !self.pending_tool_calls.is_empty() {
+                            self.state = AgentState::ToolCalling;
+                            let tool_calls: Vec<(String, PendingToolCall)> =
+                                self.pending_tool_calls.drain().collect();
+                            for (tool_call_id, pending) in tool_calls {
+                                self.pending_tool_results
+                                    .insert(tool_call_id.clone(), pending.tool_name.clone());
+
+                                let tool_call_msg = FrameCodec::new_message(
+                                    Topic::agent_tool_call(self.id.as_str()),
+                                    self.id.as_str(),
+                                    &serde_json::json!({
+                                        "tool_call_id": tool_call_id,
+                                        "tool_name": pending.tool_name,
+                                        "arguments": pending.arguments,
+                                        "agent_id": self.id.to_string(),
+                                    }),
+                                )?;
+                                if let Err(e) = transport.publish_data(&tool_call_msg).await {
+                                    tracing::debug!("数据面 PUB 发送 tool_call 失败，回退到控制面：{}", e);
+                                    transport.send_message(&tool_call_msg).await?;
+                                }
+                                tracing::debug!(
+                                    "Agent {} 发送工具调用：{} ({})",
+                                    self.id, pending.tool_name, tool_call_id
+                                );
+                            }
+                        } else {
+                            self.current_sample_request_id = None;
+                            self.state = AgentState::Idle;
+                            self.update_context_window();
+                            tracing::debug!("Agent {} 采样完成", self.id);
+                        }
+                    }
+                    SamplerStreamMsg::Error { error } => {
+                        tracing::error!(
+                            "Agent {} 收到采样错误：{:?}",
+                            self.id, error
+                        );
+                        self.inference_start = None;
+                        AgentMetrics::global().record_error("sampler_error");
+                        self.current_sample_request_id = None;
+                        self.state = AgentState::Error;
+                    }
+                    SamplerStreamMsg::Chunk(chunk) => {
+                        if Some(&chunk.request_id) != self.current_sample_request_id.as_ref() {
                             return Ok(());
                         }
+                        self.handle_stream_chunk(&chunk, transport).await?;
                     }
-
-                    // 采样完成，记录推理延迟（从请求发起到 done 响应的耗时）
-                if let Some(start) = self.inference_start.take() {
-                    AgentMetrics::global()
-                        .record_inference_latency(start.elapsed().as_millis() as f64);
                 }
-
-                // 采样完成，检查是否有待执行的工具调用
-                if !self.pending_tool_calls.is_empty() {
-                    self.state = AgentState::ToolCalling;
-                    // 将所有 pending tool calls 先收集出来，避免 drain 跨 await 借用冲突
-                    let tool_calls: Vec<(String, PendingToolCall)> =
-                        self.pending_tool_calls.drain().collect();
-                    for (tool_call_id, pending) in tool_calls {
-                        // 记录到 pending_tool_results（含工具名，便于结果返回时记录执行耗时）
-                        self.pending_tool_results
-                            .insert(tool_call_id.clone(), pending.tool_name.clone());
-
-                            let tool_call_msg = FrameCodec::new_message(
-                                Topic::agent_tool_call(self.id.as_str()),
-                                self.id.as_str(),
-                                &serde_json::json!({
-                                    "tool_call_id": tool_call_id,
-                                    "tool_name": pending.tool_name,
-                                    "arguments": pending.arguments,
-                                    "agent_id": self.id.to_string(),
-                                }),
-                            )?;
-                            // 优先使用数据面 PUB 直连（如果可用），否则走控制面
-                            if let Err(e) = transport.publish_data(&tool_call_msg).await {
-                                tracing::debug!("数据面 PUB 发送 tool_call 失败，回退到控制面：{}", e);
-                                transport.send_message(&tool_call_msg).await?;
-                            }
-                            tracing::debug!(
-                                "Agent {} 发送工具调用：{} ({})",
-                                self.id, pending.tool_name, tool_call_id
-                            );
-                        }
-                    } else {
-                        // 没有工具调用，采样完成，重置状态
-                        self.current_sample_request_id = None;
-                        self.state = AgentState::Idle;
-                        self.update_context_window();
-                        tracing::debug!("Agent {} 采样完成", self.id);
-                    }
-                    return Ok(());
-                }
-
-                // 检查是否为错误消息
-                if raw_value.get("error").is_some() {
-                    tracing::error!(
-                        "Agent {} 收到采样错误：{:?}",
-                        self.id,
-                        raw_value.get("error")
-                    );
-                    self.inference_start = None;
-                    AgentMetrics::global().record_error("sampler_error");
-                    self.current_sample_request_id = None;
-                    self.state = AgentState::Error;
-                    return Ok(());
-                }
-
-                // 正常 StreamChunk
-                let chunk: StreamChunk = FrameCodec::decode_payload(&msg)?;
-                if Some(&chunk.request_id) != self.current_sample_request_id.as_ref() {
-                    return Ok(());
-                }
-                self.handle_stream_chunk(&chunk, transport).await?;
             }
 
             // 收到工具执行结果
             t if t.ends_with("/tool_result") => {
-                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
-                let tool_call_id = payload["tool_call_id"].as_str().unwrap_or("");
-                let output = payload["output"].as_str().unwrap_or("");
-                let success = payload["success"].as_bool().unwrap_or(true);
-                let duration_ms = payload["duration_ms"].as_u64().unwrap_or(0);
+                let payload: ToolResultPayload = FrameCodec::decode_payload(&msg)?;
+                let tool_call_id = payload.tool_call_id.as_str();
+                let output = payload.output.as_str();
+                let success = payload.success;
+                let duration_ms = payload.duration_ms;
 
                 // 在 handle_tool_result 移除条目前先取出工具名，用于记录执行耗时
                 // metrics 埋点失败不影响主流程
@@ -445,26 +547,22 @@ impl Node for AgentNode {
 
             // 收到子 Agent 事件（崩溃/完成）
             t if t.ends_with("/event") => {
-                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
-                if let Some(error) = payload.get("error") {
+                let payload: EventPayload = FrameCodec::decode_payload(&msg)?;
+                if let Some(error) = payload.error {
                     let crashed = SubAgentCrashed {
-                        node_id: payload["node_id"].as_str().unwrap_or("").into(),
-                        error: error.as_str().unwrap_or("unknown").into(),
+                        node_id: payload.node_id.clone().into(),
+                        error: error,
                     };
                     tracing::warn!("子 Agent 崩溃：{} - {}", crashed.node_id, crashed.error);
                     AgentMetrics::global().record_error("subagent_crashed");
-                    // 从编排器中移除（NodeId 需要类型转换）
                     let node_id: NodeId = crashed.node_id.clone().into();
                     self.orchestrator.remove_subagent(&node_id);
-                } else if payload.get("type").and_then(|v| v.as_str()) == Some("completed") {
-                    // 子 Agent 正常完成
-                    let subagent_id = payload["node_id"].as_str().unwrap_or("");
-                    let output = payload["output"].as_str().unwrap_or("");
+                } else if payload.r#type.as_deref() == Some("completed") {
+                    let subagent_id = payload.node_id.as_str();
+                    let output = payload.output.as_deref().unwrap_or("");
                     tracing::info!("子 Agent 完成：{}, 输出长度={}", subagent_id, output.len());
-                    // 将子 Agent 结果存入工作记忆
                     let token_count = Self::estimate_tokens(output);
                     self.working_memory.push_user(output.to_string(), token_count);
-                    // 从编排器中移除（NodeId 需要类型转换）
                     let node_id: NodeId = subagent_id.to_string().into();
                     self.orchestrator.remove_subagent(&node_id);
                 }

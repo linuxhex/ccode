@@ -405,13 +405,27 @@ impl NodeTransport {
         // 2. 创建 SUB socket 并连接到 Kernel PUB（控制面广播）
         let mut subscriber = SubSocket::new();
         subscriber.connect(&info.pub_addr).await?;
-        // 订阅空字符串前缀（接收所有广播消息）
-        subscriber.subscribe("").await?;
-        // 额外订阅 Node 感兴趣的 topic 前缀
+        // 精确前缀订阅：将通配符模式转为前缀，避免接收不属于自己的消息
+        // ZMQ SUB 只支持前缀匹配，因此 sampler/*/stream → sampler/
+        // 同时订阅系统消息前缀（sys/）
+        let mut sub_prefixes: Vec<String> = Vec::new();
+        sub_prefixes.push("sys/".to_string()); // 系统消息必须接收
         for sub in &info.subscriptions {
-            subscriber.subscribe(sub.as_str()).await?;
+            let prefix = if sub.contains('*') {
+                // 通配符：取 * 之前的部分作为前缀（含斜杠）
+                sub.split('*').next().unwrap_or(sub).to_string()
+            } else {
+                sub.clone()
+            };
+            // 去重
+            if !sub_prefixes.contains(&prefix) {
+                sub_prefixes.push(prefix);
+            }
         }
-        tracing::info!("SUB socket 已连接：{} (订阅 {} 个 topic)", info.pub_addr, info.subscriptions.len());
+        for prefix in &sub_prefixes {
+            subscriber.subscribe(prefix.as_str()).await?;
+        }
+        tracing::info!("SUB socket 已连接：{} (订阅 {} 个前缀)", info.pub_addr, sub_prefixes.len());
 
         // 3. 创建数据面 PUB socket（如果配置了 data_pub_addr）
         let has_pub_socket = !info.data_pub_addr.is_empty();

@@ -148,17 +148,15 @@ impl ToolNode {
         // ── 阶段 1：PreToolUse Hook + 权限规则引擎 ──
         let mut effective_input = request.arguments.clone();
         if let Some(ref registry) = self.hook_registry {
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             let envelope = ccode_hooks::event::HookEventEnvelope {
                 hook_event_name: ccode_hooks::event::HookEventName::PreToolUse,
                 session_id: request.agent_id.clone(),
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into(),
-                workspace_root: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into(),
+                cwd: cwd.clone(),
+                workspace_root: cwd.clone(),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 transcript_path: None,
                 client_identifier: None,
@@ -166,15 +164,15 @@ impl ToolNode {
                 permission_mode: Some(format!("{:?}", self.permission_mode).to_lowercase()),
                 payload: ccode_hooks::event::HookPayload::PreToolUse {
                     tool_name: request.tool_name.clone(),
+                    tool_use_id: request.tool_call_id.clone(),
                     tool_input: request.arguments.clone(),
+                    tool_input_truncated: false,
+                    subagent_type: None,
                 },
             };
             let ctx = ccode_hooks::runner::RunContext {
                 session_id: &request.agent_id,
-                cwd: &std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                env_overrides: None,
+                workspace_root: &cwd,
             };
             let pre_result = ccode_hooks::dispatcher::dispatch_pre_tool_use(
                 registry,
@@ -195,7 +193,7 @@ impl ToolNode {
 
             // Hook 决策：deny 则不执行
             match pre_result.decision {
-                ccode_hooks::result::HookDecision::Deny { reason } => {
+                ccode_hooks::result::HookDecision::Deny { reason, hook_name: _ } => {
                     tracing::info!(
                         "PreToolUse Hook 拒绝工具执行：tool={}, reason={}",
                         request.tool_name, reason
@@ -216,9 +214,6 @@ impl ToolNode {
                     return Ok(());
                 }
                 ccode_hooks::result::HookDecision::Allow => {}
-                ccode_hooks::result::HookDecision::Ask => {
-                    // Hook 建议询问，降级到简单权限模式
-                }
             }
 
             // 权限链结果（如果规则引擎给出了决策）
@@ -321,6 +316,32 @@ impl ToolNode {
 
         // ── 阶段 4：PostToolUse Hook ──
         if let Some(ref registry) = self.hook_registry {
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let payload = if result.success {
+                ccode_hooks::event::HookPayload::PostToolUse {
+                    tool_name: effective_request.tool_name.clone(),
+                    tool_use_id: effective_request.tool_call_id.clone(),
+                    tool_input: effective_request.arguments.clone(),
+                    tool_result: serde_json::Value::String(result.output.clone()),
+                    tool_input_truncated: false,
+                    tool_result_truncated: false,
+                    duration_ms: Some(result.duration_ms),
+                    is_backgrounded: false,
+                    subagent_type: None,
+                }
+            } else {
+                ccode_hooks::event::HookPayload::PostToolUseFailure {
+                    tool_name: effective_request.tool_name.clone(),
+                    tool_use_id: effective_request.tool_call_id.clone(),
+                    tool_input: effective_request.arguments.clone(),
+                    tool_input_truncated: false,
+                    error: result.output.clone(),
+                    subagent_type: None,
+                }
+            };
             let envelope = ccode_hooks::event::HookEventEnvelope {
                 hook_event_name: if result.success {
                     ccode_hooks::event::HookEventName::PostToolUse
@@ -328,33 +349,18 @@ impl ToolNode {
                     ccode_hooks::event::HookEventName::PostToolUseFailure
                 },
                 session_id: effective_request.agent_id.clone(),
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into(),
-                workspace_root: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into(),
+                cwd: cwd.clone(),
+                workspace_root: cwd.clone(),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 transcript_path: None,
                 client_identifier: None,
                 prompt_id: None,
                 permission_mode: Some(format!("{:?}", self.permission_mode).to_lowercase()),
-                payload: ccode_hooks::event::HookPayload::PostToolUse {
-                    tool_name: effective_request.tool_name.clone(),
-                    tool_input: effective_request.arguments.clone(),
-                    tool_output: result.output.clone(),
-                    success: result.success,
-                    duration_ms: result.duration_ms,
-                },
+                payload,
             };
             let ctx = ccode_hooks::runner::RunContext {
                 session_id: &effective_request.agent_id,
-                cwd: &std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                env_overrides: None,
+                workspace_root: &cwd,
             };
             let post_event = if result.success {
                 ccode_hooks::event::HookEventName::PostToolUse
