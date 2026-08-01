@@ -827,6 +827,13 @@ path="tests"
                     .map(|e| !e.read_only)
                     .unwrap_or(true)
             }
+            PermissionMode::ReadOnly => {
+                // 只读模式：写操作直接拒绝（不需要确认）
+                self.entries
+                    .get(tool_name)
+                    .map(|e| !e.read_only)
+                    .unwrap_or(true)
+            }
         }
     }
 

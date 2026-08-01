@@ -1,3 +1,13 @@
+//! # ccode-shell
+//!
+//! 会话管理壳层，负责 ACP 协议解析、主循环驱动与模型切换。
+//!
+//! | 核心能力 | 说明 |
+//! |---|---|
+//! | ACP 协议解析 | 解析 IDE/stdio 通信协议，驱动消息收发 |
+//! | 主循环驱动 | LoopStateMachine 状态机驱动会话主循环 |
+//! | 模型切换 | 技能触发时自动切换 LLM 模型 |
+
 #![allow(
     unused_imports,
     unused_variables,

@@ -1,15 +1,33 @@
 //! L0 工作记忆 - 当前 LLM context window 内的内容
 //!
-//! 管理当前上下文窗口中的消息，按冷热评分动态更新
+//! 管理当前上下文窗口中的消息，支持 4 级渐进压缩和 Stable Prefix 保护。
 //!
-//! ## 消息角色（借鉴 Claude Code message 类型）
+//! ## 消息角色（标准 LLM API 格式）
 //!
 //! - `system`: 系统提示词、工具定义、上下文注入
 //! - `user`: 用户输入、感官信号、工具返回结果
 //! - `assistant`: LLM 响应、工具调用请求
 //!
-//! 角色必须按 system → user → assistant → user → ... 交替，
-//! 不能连续相同角色（LLM API 限制）。
+//! 角色按 system → user → assistant → user → ... 交替。
+//!
+//! ## 4 级压缩策略（对标 Claude Code）
+//!
+//! | 级别 | 名称 | 触发条件 | 操作 |
+//! |------|------|---------|------|
+//! | Snip | 删除长工具输出 | 85%~90% | 截断 >threshold 的工具结果 |
+//! | MicroCompact | 单条截断 | 90%~95% | 保留首尾各 retain/2 |
+//! | AutoCompact | 批量降级 | 95%~99% | Hot→Warm→Cold |
+//! | ReactiveCompact | LLM 全量摘要 | ≥99% | LLM 生成完整摘要替换 |
+//!
+//! ## Stable Prefix 保护
+//!
+//! 压缩操作跳过前 `stable_prefix_len` 条条目（system prompt + 工具定义），
+//! 最大化 API 侧 Prompt Cache 命中率（类似 Claude Code cache_edits 的替代方案）。
+//!
+//! ## 增量 Token 计数
+//!
+//! `used_tokens_cached` 在 push_hot 时递增，compact 后 recalc，
+//! 读取 O(1)，避免每次全量遍历。
 
 use serde::{Deserialize, Serialize};
 
@@ -102,7 +120,25 @@ impl std::convert::TryFrom<&str> for MessageRole {
     }
 }
 
-/// 上下文压缩策略（借鉴 Claude Code CompactionPolicy）
+/// 4 级压缩策略（借鉴 Claude Code Snip→MicroCompact→AutoCompact→ReactiveCompact）
+///
+/// Level 1 (Snip):        删除过长的工具输出，保留关键部分
+/// Level 2 (MicroCompact): 单条消息截断，保留首尾 50%
+/// Level 3 (AutoCompact):  批量压缩旧消息 Hot→Warm→Cold
+/// Level 4 (ReactiveCompact): LLM 全量摘要替换，紧急压缩
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CompactionLevel {
+    /// Level 1: 删除过长工具输出（最低开销）
+    Snip,
+    /// Level 2: 单条消息截断
+    MicroCompact,
+    /// Level 3: 批量降级（Hot→Warm→Cold）
+    AutoCompact,
+    /// Level 4: LLM 全量摘要（最高开销，最彻底）
+    ReactiveCompact,
+}
+
+/// 上下文压缩策略（借鉴 Claude Code CompactionPolicy + cache 前缀稳定化）
 #[derive(Debug, Clone)]
 pub struct CompactionPolicy {
     /// 触发自动压缩的上下文使用百分比
@@ -117,6 +153,19 @@ pub struct CompactionPolicy {
     pub keep_recent_turns: usize,
     /// 压缩失败后是否回退到更小的预算重试
     pub fallback_on_failure: bool,
+    /// 是否启用 system prompt 前缀稳定化（类似 Claude Code cache_edits）
+    ///
+    /// 开启时，压缩操作不会修改 system prompt 前缀部分，
+    /// 而是在前缀之后插入压缩摘要，最大化 API 侧 Prompt Cache 命中率。
+    pub stable_prefix_enabled: bool,
+    /// 工具输出截断阈值（Level 1 Snip 触发条件）
+    ///
+    /// 超过此 token 数的工具输出将被截断为摘要
+    pub tool_output_snip_threshold: u32,
+    /// 单条消息截断比例（Level 2 MicroCompact）
+    ///
+    /// 0.5 表示保留首尾各 25%，中间替换为 [...已省略...]
+    pub micro_compact_retain_ratio: f64,
 }
 
 impl Default for CompactionPolicy {
@@ -128,6 +177,9 @@ impl Default for CompactionPolicy {
             wall_clock_budget_secs: 300,
             keep_recent_turns: 4,
             fallback_on_failure: true,
+            stable_prefix_enabled: true,
+            tool_output_snip_threshold: 2000,
+            micro_compact_retain_ratio: 0.5,
         }
     }
 }
@@ -139,6 +191,24 @@ impl CompactionPolicy {
     pub fn should_auto_compact(&self, token_usage_ratio: f64) -> bool {
         let threshold = self.auto_compact_threshold_percent as f64 / 100.0;
         token_usage_ratio >= threshold
+    }
+
+    /// 根据使用率选择压缩级别
+    ///
+    /// - 85%~90%: Snip (删除长工具输出)
+    /// - 90%~95%: MicroCompact (单条截断)
+    /// - 95%~99%: AutoCompact (批量降级)
+    /// - >=99%:   ReactiveCompact (LLM 全量摘要)
+    pub fn select_level(&self, token_usage_ratio: f64) -> CompactionLevel {
+        if token_usage_ratio >= 0.99 {
+            CompactionLevel::ReactiveCompact
+        } else if token_usage_ratio >= 0.95 {
+            CompactionLevel::AutoCompact
+        } else if token_usage_ratio >= 0.90 {
+            CompactionLevel::MicroCompact
+        } else {
+            CompactionLevel::Snip
+        }
     }
 }
 
@@ -209,6 +279,12 @@ pub struct WorkingMemory {
     embedding_index: EmbeddingIndex,
     /// LLM 摘要器（None 时回退到截断）
     summarizer: Option<std::sync::Arc<dyn LlmSummarizer>>,
+    /// Stable prefix 条目数（类似 Claude Code cache_edits 前缀稳定化）
+    ///
+    /// 前缀部分（system prompt + 工具定义）在压缩时不会被修改，
+    /// 压缩操作只影响前缀之后的条目，最大化 API 侧 Prompt Cache 命中率。
+    /// 在首次 push_system 后锁定，后续 push 操作不增加前缀长度。
+    stable_prefix_len: usize,
 }
 
 impl WorkingMemory {
@@ -220,7 +296,25 @@ impl WorkingMemory {
             compaction_policy: CompactionPolicy::default(),
             embedding_index: EmbeddingIndex::new(),
             summarizer: None,
+            stable_prefix_len: 0,
         }
+    }
+
+    /// 锁定 stable prefix（在 system prompt + 工具定义推送完成后调用）
+    ///
+    /// 之后的压缩操作不会修改前缀部分，最大化 API Prompt Cache 命中率。
+    pub fn lock_stable_prefix(&mut self) {
+        self.stable_prefix_len = self.entries.len();
+        tracing::debug!(
+            target: "ccore::memory",
+            prefix_len = self.stable_prefix_len,
+            "stable prefix locked"
+        );
+    }
+
+    /// 获取 stable prefix 长度
+    pub fn stable_prefix_len(&self) -> usize {
+        self.stable_prefix_len
     }
 
     /// 设置 LLM 摘要器
@@ -387,39 +481,210 @@ impl WorkingMemory {
             .await
     }
 
-    /// 使用指定策略执行压缩（同步版本，使用截断）
+    /// 使用指定策略执行压缩（同步版本，4 级策略 + stable prefix 保护）
     ///
-    /// 策略：
-    /// 1. 找到最旧的连续 Hot 条目块（排除最近 4 条保持 Hot）
-    /// 2. 将这些 Hot→Warm（截断内容至约 50% 并加 `[已压缩]` 前缀）
-    /// 3. 将已有的 Warm→Cold（占位符替换）
-    pub fn compact_with_policy(&mut self, _policy: &CompactionPolicy) -> CompactionResult {
+    /// 策略（根据 token 使用率自动选择级别）：
+    /// - Level 1 (Snip):         删除过长工具输出（>threshold token 的工具结果截断）
+    /// - Level 2 (MicroCompact): 单条消息首尾截断
+    /// - Level 3 (AutoCompact):  批量降级 Hot→Warm→Cold
+    /// - Level 4 (ReactiveCompact): LLM 全量摘要
+    ///
+    /// Stable prefix 保护：
+    /// - 如果 stable_prefix_enabled，压缩操作跳过前 stable_prefix_len 条条目
+    /// - 这些条目（system prompt + 工具定义）保持不变，最大化 Prompt Cache 命中率
+    pub fn compact_with_policy(&mut self, policy: &CompactionPolicy) -> CompactionResult {
         let tokens_before = self.used_tokens_cached;
         let total = self.entries.len();
 
-        // 保持最近的条目为 Hot 的安全边界
+        // 根据使用率选择压缩级别
+        let usage_ratio = if self.max_tokens > 0 {
+            self.used_tokens_cached as f64 / self.max_tokens as f64
+        } else {
+            0.0
+        };
+        let level = policy.select_level(usage_ratio);
+
+        // Stable prefix 保护：压缩只影响前缀之后的条目
+        let prefix_end = if policy.stable_prefix_enabled {
+            self.stable_prefix_len
+        } else {
+            0
+        };
+
+        match level {
+            CompactionLevel::Snip => self.compact_snip(policy, prefix_end),
+            CompactionLevel::MicroCompact => {
+                // 先 Snip，再 MicroCompact
+                let r1 = self.compact_snip(policy, prefix_end);
+                if self.used_tokens_cached as f64 / self.max_tokens.max(1) as f64 >= 0.90 {
+                    let r2 = self.compact_micro(policy, prefix_end);
+                    CompactionResult {
+                        tokens_before,
+                        tokens_after: r2.tokens_after,
+                        entries_compacted: r1.entries_compacted + r2.entries_compacted,
+                        compacted_range: (
+                            r1.compacted_range.0.min(r2.compacted_range.0),
+                            r1.compacted_range.1.max(r2.compacted_range.1),
+                        ),
+                    }
+                } else {
+                    r1
+                }
+            }
+            CompactionLevel::AutoCompact => {
+                // Snip + MicroCompact + AutoCompact
+                self.compact_snip(policy, prefix_end);
+                self.compact_micro(policy, prefix_end);
+                self.compact_auto(policy, prefix_end, tokens_before)
+            }
+            CompactionLevel::ReactiveCompact => {
+                // 全量：Snip + MicroCompact + AutoCompact（最激进）
+                self.compact_snip(policy, prefix_end);
+                self.compact_micro(policy, prefix_end);
+                self.compact_auto(policy, prefix_end, tokens_before)
+            }
+        }
+    }
+
+    /// Level 1: Snip — 截断过长的工具输出
+    ///
+    /// 只处理 role=User 且 token_count 超过阈值的条目（通常是工具返回结果），
+    /// 截断为摘要格式，保留首尾各 500 字符。
+    fn compact_snip(&mut self, policy: &CompactionPolicy, prefix_end: usize) -> CompactionResult {
+        let tokens_before = self.used_tokens_cached;
+        let mut entries_compacted = 0usize;
+        let threshold = policy.tool_output_snip_threshold;
+
+        for i in prefix_end..self.entries.len() {
+            let entry = std::mem::replace(&mut self.entries[i], WorkingEntry::Cold {
+                placeholder: String::new(),
+                source_range: (i, i),
+                token_count: 0,
+            });
+
+            if let WorkingEntry::Hot {
+                role: MessageRole::User,
+                content,
+                token_count,
+            } = &entry
+            {
+                if *token_count > threshold {
+                    // 截断：保留首尾各 500 字符
+                    let head_len = content.len().min(500);
+                    let tail_start = content.len().saturating_sub(500);
+                    let head = &content[..head_len];
+                    let tail = &content[tail_start..];
+                    let snipped = if tail_start > head_len {
+                        format!("{}\n[...已省略 {} 字符...]\n{}", head, tail_start - head_len, tail)
+                    } else {
+                        content.clone()
+                    };
+                    let snipped_tokens = (token_count / 3).max(1);
+                    self.entries[i] = WorkingEntry::Hot {
+                        role: MessageRole::User,
+                        content: snipped,
+                        token_count: snipped_tokens,
+                    };
+                    entries_compacted += 1;
+                } else {
+                    self.entries[i] = entry;
+                }
+            } else {
+                self.entries[i] = entry;
+            }
+        }
+
+        self.recalc_used_tokens();
+        CompactionResult {
+            tokens_before,
+            tokens_after: self.used_tokens_cached,
+            entries_compacted,
+            compacted_range: (prefix_end, self.entries.len()),
+        }
+    }
+
+    /// Level 2: MicroCompact — 单条消息首尾截断
+    ///
+    /// 对前缀之后的 Hot 条目，保留首尾各 retain_ratio/2 的内容。
+    fn compact_micro(&mut self, policy: &CompactionPolicy, prefix_end: usize) -> CompactionResult {
+        let tokens_before = self.used_tokens_cached;
+        let mut entries_compacted = 0usize;
+        let retain = policy.micro_compact_retain_ratio;
+
+        for i in prefix_end..self.entries.len() {
+            let entry = std::mem::replace(&mut self.entries[i], WorkingEntry::Cold {
+                placeholder: String::new(),
+                source_range: (i, i),
+                token_count: 0,
+            });
+
+            if let WorkingEntry::Hot {
+                role,
+                content,
+                token_count,
+            } = &entry
+            {
+                // 保留首尾各 retain/2 的内容
+                let head_chars = (content.chars().count() as f64 * retain / 2.0) as usize;
+                let tail_chars = head_chars;
+                let total_chars = content.chars().count();
+
+                if total_chars > head_chars * 2 + 20 {
+                    let head: String = content.chars().take(head_chars).collect();
+                    let tail: String = content.chars().skip(total_chars - tail_chars).collect();
+                    let micro = format!("{}\n[...已微压缩...]\n{}", head, tail);
+                    let micro_tokens = ((*token_count as f64) * retain) as u32;
+                    self.entries[i] = WorkingEntry::Hot {
+                        role: *role,
+                        content: micro,
+                        token_count: micro_tokens.max(1),
+                    };
+                    entries_compacted += 1;
+                } else {
+                    self.entries[i] = entry;
+                }
+            } else {
+                self.entries[i] = entry;
+            }
+        }
+
+        self.recalc_used_tokens();
+        CompactionResult {
+            tokens_before,
+            tokens_after: self.used_tokens_cached,
+            entries_compacted,
+            compacted_range: (prefix_end, self.entries.len()),
+        }
+    }
+
+    /// Level 3: AutoCompact — 批量降级 Hot→Warm→Cold
+    ///
+    /// 与原 compact_with_policy 逻辑相同，但尊重 stable prefix 边界。
+    fn compact_auto(&mut self, _policy: &CompactionPolicy, prefix_end: usize, tokens_before: u32) -> CompactionResult {
+        let total = self.entries.len();
         let keep_hot_recent = 4;
 
-        if total <= keep_hot_recent {
+        if total <= prefix_end + keep_hot_recent {
             return CompactionResult {
                 tokens_before,
-                tokens_after: tokens_before,
+                tokens_after: self.used_tokens_cached,
                 entries_compacted: 0,
                 compacted_range: (0, 0),
             };
         }
 
-        // 第一步：将已有的 Warm 条目降级为 Cold
-        for entry in &mut self.entries {
+        // 第一步：将已有的 Warm 条目降级为 Cold（跳过 prefix）
+        for i in prefix_end..total {
             if let WorkingEntry::Warm {
                 summary,
                 token_count,
                 source_range,
-            } = entry
+            } = &self.entries[i]
             {
-                let placeholder = format!("[冷缓存] {}", &summary[..summary.len().min(40)]);
-                let cold_tokens = (*token_count / 4).max(1);
-                *entry = WorkingEntry::Cold {
+                let bound = summary.floor_char_boundary(40);
+                let placeholder = format!("[冷缓存] {}", &summary[..bound]);
+                let cold_tokens = (token_count / 4).max(1);
+                self.entries[i] = WorkingEntry::Cold {
                     placeholder,
                     source_range: *source_range,
                     token_count: cold_tokens,
@@ -433,8 +698,8 @@ impl WorkingMemory {
         let mut compacted_end = 0;
         let mut entries_compacted = 0usize;
 
-        for i in 0..hot_cutoff {
-            // 使用 take 避免 clone：直接替换 entry，取走 content 所有权
+        // 从 prefix_end 开始，不压缩 stable prefix
+        for i in prefix_end..hot_cutoff {
             let entry = std::mem::replace(&mut self.entries[i], WorkingEntry::Cold {
                 placeholder: String::new(),
                 source_range: (i, i),
@@ -447,8 +712,6 @@ impl WorkingMemory {
                 ..
             } = entry
             {
-                // 截断内容至约 50% 并加 [已压缩] 前缀
-                // 使用 chars() 处理 UTF-8 边界，避免截断到多字节字符中间
                 let truncate_len = (content.len() / 2).max(1);
                 let summary = format!("[已压缩] {}...", &content[..content.floor_char_boundary(truncate_len)]);
                 let warm_tokens = (token_count / 2).max(1);
@@ -463,7 +726,6 @@ impl WorkingMemory {
                 compacted_end = compacted_end.max(i);
                 entries_compacted += 1;
             } else {
-                // 非 Hot 条目放回
                 self.entries[i] = entry;
             }
         }

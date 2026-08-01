@@ -1,15 +1,30 @@
-//! Tool Node - 接收工具调用请求，执行并返回结果
+//! ToolNode - 工具执行 + 权限链 + Shell 安全
 //!
-//! Fusion: ToolNode 以生产 ccode-tools 能力为准。
-//! Ask 模式：发布 agent/{id}/permission，等待 PermissionResponse 再执行。
+//! ## 工作流
 //!
-//! Tool Node 的完整工作流：
-//! 1. 订阅 agent/*/tool_call topic
-//! 2. 收到 ToolCallRequest → 权限检查 → 并发限流 → 执行工具 → 返回 ToolCallResult
-//! 3. 结果通过消息总线发送到 agent/{src}/tool_result
+//! 1. 订阅 `agent/*/tool_call` topic
+//! 2. 收到 ToolCallRequest → 权限检查（5 阶段链式）→ 并发限流 → 执行 → 返回结果
+//! 3. 结果通过 `agent/{src}/tool_result` 发送
 //!
-//! 并发控制：内置 Semaphore（默认 20 并发），防止工具执行过载。
-//! 对应 ANS 的 tool_semaphore，但运行在 ToolNode 本地（独立进程无法共享 ANS）。
+//! ## 权限模式
+//!
+//! | 模式 | 行为 |
+//! |------|------|
+//! | Yolo | 自动允许 |
+//! | Trust | 只读自动，写操作需确认 |
+//! | Ask | 每次确认 |
+//! | ReadOnly | 写操作直接拒绝 |
+//!
+//! ## 并发控制
+//!
+//! Semaphore(20) 限制并发工具执行数，防止过载。
+//! 安全工具（read/grep/glob）可并发，写操作串行执行。
+//!
+//! ## Shell 安全检查
+//!
+//! 对 bash 工具执行 14 项安全检查，包括：
+//! 命令替换注入、环境变量注入、路径穿越、管道到危险命令、
+//! 重定向到敏感文件、解释器黑名单（python/perl/ruby/node 等）等。
 
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -297,6 +312,25 @@ impl ToolNode {
                     );
                 }
                 PermissionMode::Yolo => {}
+                PermissionMode::ReadOnly => {
+                    // 只读模式：写操作已被 needs_confirmation 标记为需要确认，
+                    // 但 ReadOnly 模式下直接拒绝，不弹确认框
+                    AgentMetrics::global().record_error("tool_permission_denied");
+                    let result_msg = FrameCodec::new_message(
+                        Topic::agent_tool_result(&request.agent_id),
+                        self.id.as_str(),
+                        &serde_json::json!({
+                            "tool_call_id": request.tool_call_id,
+                            "output": format!("工具 {} 在只读模式下被拒绝", request.tool_name),
+                            "success": false,
+                            "duration_ms": 0,
+                        }),
+                    )?;
+                    if let Err(_) = transport.publish_data(&result_msg).await {
+                        transport.send_message(&result_msg).await?;
+                    }
+                    return Ok(());
+                }
             }
         }
 

@@ -1,9 +1,13 @@
-//! Agent builder, definition parsing, and system prompt assembly.
+//! # ccode-agent
 //!
-//! This crate extracts a first-class `Agent` type from `ccode-shell`.
-//! An `Agent` bundles tools, system prompt, system-reminder policy,
-//! compaction policy, and model configuration into a single, portable
-//! object that any host can consume.
+//! Agent 策略层，涵盖 Prompt 构建、Doom Loop 检测、Skill 系统与经验学习。
+//!
+//! | 核心能力 | 说明 |
+//! |---|---|
+//! | Prompt 构建 | 系统提示词组装与压缩策略 |
+//! | Doom Loop 检测 | 循环状态检测与自动打断 |
+//! | Skill 系统 | 技能发现、加载与调度 |
+//! | 经验学习 | 历史经验积累与复用 |
 
 pub mod agent;
 pub mod builder;

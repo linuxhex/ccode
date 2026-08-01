@@ -1,10 +1,21 @@
 //! Embedding 向量存储和相似度检索
 //!
-//! 提供基于向量的内存检索功能，支持余弦相似度搜索
+//! 基于 O(n log k) TopK 堆实现的向量检索，支持余弦相似度和 MMR 多样性排序。
+//!
+//! ## 性能
+//!
+//! | 操作 | 复杂度 | 说明 |
+//! |------|--------|------|
+//! | add | O(1) | Vec push |
+//! | search | O(n log k) | 最小堆 TopK，避免全量排序 |
+//! | cosine_similarity | O(d) | d=维度，通常 1536 |
 
 use serde::{Deserialize, Serialize};
 
-/// Embedding 向量（借鉴 Claude Code 的 embedding 模块）
+/// Embedding 向量
+///
+/// 存储单个代码块/消息的嵌入向量，关联 entry_id 和文本预览。
+/// 默认维度 1536（OpenAI text-embedding-ada-002），可通过 with_dimension 自定义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingVector {
     /// 向量数据（通常 1536 维，对应 text-embedding-ada-002）

@@ -1,20 +1,13 @@
-//! ccode-sampler - Actor-based sampling layer for ccode ccode.
+//! # ccode-sampler
 //!
-//! This crate extracts the HTTP streaming + retry logic out of
-//! `ccode-shell`'s session actor into a standalone, reusable
-//! component built on the same actor pattern as `ccode-hunk`.
+//! LLM 采样层，支持多 Provider、流式响应与模型切换。
 //!
-//! ## Layered API
-//!
-//! - **Layer 1**: [`client::SamplingClient`] returns raw chunk streams.
-//! - **Layer 2**: [`stream`] transforms raw streams into [`SamplingEvent`]s.
-//! - **Layer 3**: [`SamplerHandle`] manages concurrent requests with retry,
-//!   cancellation, and event-based coordination via the actor.
-//!
-//! The type skeleton, the pure retry / metrics / client logic, the
-//! Layer-2 stream transforms ([`stream_chat_completions`],
-//! [`stream_responses`], [`stream_messages`], [`collect_response`]),
-//! and the actor with its per-request task tie these layers together.
+//! | 核心能力 | 说明 |
+//! |---|---|
+//! | 多 Provider | OpenAI / Anthropic / Ollama 统一适配 |
+//! | 流式响应 | SSE 流式 chunk 解析与事件转换 |
+//! | 模型切换 | 运行时动态切换 LLM 模型 |
+//! | 重试与取消 | 请求级重试、取消与指标采集 |
 
 pub mod actor;
 pub mod attribution;

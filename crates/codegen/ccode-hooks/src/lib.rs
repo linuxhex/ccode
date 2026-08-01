@@ -1,40 +1,14 @@
 //! # ccode-hooks
 //!
-//! Runtime hook system for Ccode — file-based discovery, command execution,
-//! and policy enforcement.
+//! 权限决策链，5 阶段过滤与执行。
 //!
-//! ## Overview
-//!
-//! This crate provides a minimal hooks system for Ccode. Hooks are discovered
-//! from dedicated directories (`~/.ccode/hooks/` and `<git-worktree-root>/.ccode/hooks/`),
-//! defined in JSON files (compatible settings format), and executed as child processes.
-//!
-//! ## v0 scope
-//!
-//! - Four event types: `session_start`, `pre_tool_use`, `post_tool_use`, `session_end`
-//! - Command-backed hooks only
-//! - `pre_tool_use` hooks can deny/allow (blocking); all others are non-blocking
-//! - Fail-open by default: hook failures do not block normal operation
-//!
-//! ## Quick start
-//!
-//! ```rust,no_run
-//! use std::path::Path;
-//! use ccode_hooks::discovery::load_hooks;
-//! use ccode_hooks::event::HookEventName;
-//!
-//! let (registry, errors) = load_hooks(
-//!     Some(Path::new("/home/user/.ccode/hooks")),
-//!     Some(Path::new("/project/.ccode/hooks")),
-//! );
-//!
-//! for err in &errors {
-//!     eprintln!("hook load warning: {err}");
-//! }
-//!
-//! let pre_hooks = registry.hooks_for(HookEventName::PreToolUse);
-//! println!("loaded {} pre_tool_use hooks", pre_hooks.len());
-//! ```
+//! | 阶段 | 说明 |
+//! |---|---|
+//! | pre-filter | 工具调用前预过滤 |
+//! | hook | 运行时 Hook 发现与执行 |
+//! | rule | 权限规则匹配与判定 |
+//! | handler | 命名处理器分发 |
+//! | deny-recovery | 拒绝后恢复策略 |
 
 pub mod config;
 pub mod discovery;

@@ -1,18 +1,28 @@
 //! Node 端 ZMQ 传输层（ROS 1 风格双面架构）
 //!
-//! ROS 1 风格双面通信：
-//! - 控制面：DEALER → Kernel ROUTER（注册、发现、心跳、参数）
-//! - 数据面：PUB → 其他 Node SUB（业务数据点对点传输）
-//! - 控制面广播：SUB → Kernel PUB（系统消息广播）
+//! ## 双面通信
 //!
-//! 注册流程（ROS 1 风格）：
+//! - **控制面**：DEALER → Kernel ROUTER（注册、发现、心跳）
+//! - **数据面**：PUB → 其他 Node SUB（业务数据点对点传输，不经 Kernel 转发）
+//! - **控制面广播**：SUB → Kernel PUB（系统消息广播）
+//!
+//! ## 注册流程
+//!
 //! 1. Node 创建 DEALER + SUB socket 连接 Kernel
 //! 2. 发送 sys/register 消息（含 pub_addr、published_topics）
 //! 3. Kernel 返回 publisher_discovery 响应
 //! 4. Node 对发现的 publisher 发起 SUB 连接（数据面直连）
 //!
-//! zeromq 0.4 适配：
-//! - DealerSocket 不再支持 split()，使用 tokio::select! 交替收发
+//! ## 精确前缀订阅
+//!
+//! 不再使用 `subscribe("")` 全前缀订阅，改为：
+//! - 通配符 topic 转为前缀（如 `agent/*/stream` → 订阅 `agent/`）
+//! - 系统消息强制订阅 `sys/`
+//! - 去重后精确订阅，减少无用消息接收
+//!
+//! ## zeromq 0.4 适配
+//!
+//! DealerSocket 不支持 split()，使用 tokio::select! 交替收发
 //! - ZmqMessage 从 Vec<Bytes> 构造使用 try_from()
 
 use bytes::Bytes;

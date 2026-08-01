@@ -1,4 +1,12 @@
-//! Ccode tools library.
+//! # ccode-tools
+//!
+//! 工具执行层，包含 Shell 安全检查、权限链集成与文件操作工具集。
+//!
+//! | 核心能力 | 说明 |
+//! |---|---|
+//! | Shell 安全检查 | 14 项 Shell 命令安全预检 |
+//! | 权限链集成 | 与 ccode-hooks 权限决策链对接 |
+//! | 文件操作工具集 | 读写、搜索、编辑等文件操作工具 |
 
 pub use ccode_version::VERSION;
 

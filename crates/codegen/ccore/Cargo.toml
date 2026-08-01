@@ -76,6 +76,9 @@ git2 = "0.20"
 # 哈希
 blake3 = { workspace = true }
 
+# 序列化（向量存储）
+bincode = "1"
+
 # 压缩管道（snip + budget）
 ccode-compaction = { path = "../../common/ccode-compaction" }
 

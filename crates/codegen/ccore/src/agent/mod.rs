@@ -1,4 +1,21 @@
-//! Agent 模块 - Agent 编排、子 Agent、Prompt、Skill
+//! Agent 模块 - Agent 编排、循环工程、记忆、技能
+//!
+//! ## 4 层循环工程（对标 Claude Code）
+//!
+//! | 循环 | 模块 | 说明 |
+//! |------|------|------|
+//! | Turn | `loop_state` | LoopStateMachine 状态机驱动单轮对话 |
+//! | Goal | `goal_loop` | /goal 目标驱动：自动拆子任务+验证+退出 |
+//! | Schedule | `schedule_loop` | /schedule 定时循环：定时唤醒+执行+等待 |
+//! | Proactive | `proactive_loop` | 闲置自主扫描代码质量+修复 |
+//!
+//! ## 其他核心能力
+//!
+//! - `doom_loop`: 3 级 Doom Loop 逃脱（注入提示→禁用工具→降级模型）
+//! - `orchestrator`: 子 Agent 编排
+//! - `subagent`: 子 Agent 创建与结果回传
+//! - `skills`: 技能系统 + model 自动切换
+//! - `prompt`: System prompt 构建
 
 pub mod prompt;
 pub mod subagent;
@@ -10,6 +27,9 @@ pub mod skills;
 pub mod experiential;
 pub mod decentralized;
 pub mod meta_cognitive;
+pub mod goal_loop;
+pub mod schedule_loop;
+pub mod proactive_loop;
 
 use serde::{Deserialize, Serialize};
 

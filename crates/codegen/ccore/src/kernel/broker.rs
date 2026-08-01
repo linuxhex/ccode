@@ -1,16 +1,25 @@
-//! ZeroMQ 消息路由器
+//! ZeroMQ 消息路由器（ROS 1 Master 角色）
 //!
-//! ROS 1 风格双面架构：
-//! - 控制面：Kernel ROUTER/PUB 处理注册、发现、心跳
-//! - 数据面：Node PUB/SUB 点对点传输业务数据
+//! ## 双面架构
 //!
-//! Broker 职责（ROS 1 的 roscore 中的 Master 部分）：
-//! - 维护 NodeId → ZMQ identity 映射（用于控制面 ROUTER 定向发送）
-//! - 维护 topic pattern → NodeId 订阅关系
-//! - 维护 topic → publisher PUB 地址映射（用于数据面发现）
-//! - 维护 service → provider REP 地址映射（用于 Service 发现）
+//! - **控制面**：Kernel ROUTER/PUB 处理注册、发现、心跳
+//! - **数据面**：Node PUB/SUB 点对点传输业务数据，不经 Broker 转发
 //!
-//! 注意：Broker **不再转发业务数据**，数据面由 Node 间 PUB/SUB 直连。
+//! ## 核心数据结构
+//!
+//! | 结构 | 用途 | 查询复杂度 |
+//! |------|------|-----------|
+//! | `node_identities` | NodeId → ZMQ identity 映射 | O(1) HashMap |
+//! | `subscriptions` | topic pattern → 订阅者列表 | O(s) 遍历匹配 |
+//! | `publishers` | NodeId → Publisher 信息 | O(1) HashMap |
+//! | `topic_publishers` | topic → 发布者 NodeId 列表 | O(1) 精确查找 / O(t) 通配符 |
+//! | `service_providers` | service_name → Provider 信息 | O(1) HashMap |
+//!
+//! ## 性能优化
+//!
+//! - 精确订阅：直接查 `topic_publishers` 索引 O(1)
+//! - 通配符订阅：遍历 `topic_publishers` + `topic_matches` 模式匹配
+//! - 消息编码共享：`route_message` 只 encode 一次，所有目标共享帧数据
 
 use anyhow::Result;
 use std::collections::HashMap;

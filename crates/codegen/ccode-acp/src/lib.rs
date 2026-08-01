@@ -1,3 +1,13 @@
+//! # ccode-acp
+//!
+//! ACP（Agent Communication Protocol）客户端，桥接 IDE/stdio 与消息总线。
+//!
+//! | 核心能力 | 说明 |
+//! |---|---|
+//! | 协议解析 | ACP 消息序列化与反序列化 |
+//! | IDE 桥接 | 通过 stdio 与 IDE 双向通信 |
+//! | 消息总线 | Agent/Client 通道与 Gateway 路由 |
+
 mod channel;
 mod common;
 mod gateway;

@@ -1,13 +1,20 @@
-//! Agent Node - 完整的 Agent 循环实现
+//! ThinkerNode - Agent 核心循环实现
 //!
-//! Agent 核心循环：
+//! ## 主循环流程
+//!
 //! 1. 接收 input（来自 TUI 或父 Agent）
 //! 2. 构建 L0 工作记忆 → 发送 sampler/request
 //! 3. 收到 LLM 流式响应 → 解析 tool_call 或 text
-//! 4. 如果有 tool_call → 发送到 Tool Node → 收到 tool_result → 回到步骤 2
-//! 5. 如果是纯文本 → 发送到 TUI/父 Agent → 等待下一轮 input
+//! 4. tool_call → 发送到 ToolNode → 收到 tool_result → 回到步骤 2
+//! 5. 纯文本 → 发送到 TUI/父 Agent → 等待下一轮 input
 //! 6. 每轮结束执行滑动窗口更新
-//! 7. Doom Loop 检测：重复工具调用超过阈值则终止
+//! 7. Doom Loop 检测：重复工具调用超过阈值则触发 3 级逃脱
+//!
+//! ## 性能优化
+//!
+//! - `to_chat_messages_direct`: 直接构建 ChatMessage，跳过中间 Vec 转换
+//! - `InputPayload`/`SamplerStreamMsg`: 一次反序列化到结构体，消除双重 serde
+//! - 增量 token 计数器：O(1) 读取 used_tokens_cached
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

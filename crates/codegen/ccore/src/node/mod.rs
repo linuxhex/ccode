@@ -1,11 +1,30 @@
 //! Node trait 定义 - 所有 Node 进程的统一接口
 //!
-//! 融合架构：6 个活跃 Node
-//! - Sampler / State / Tool / Thinker / TUI / Acp
+//! ## 分布式架构：6 种 Node
+//!
+//! | Node | 职责 | 通信方式 |
+//! |------|------|---------|
+//! | Thinker | Agent 核心循环：LLM 调用 + 记忆 + Doom Loop 检测 | SUB 订阅 + PUB 发布 |
+//! | Sampler | LLM Provider 适配 + 流式响应 + 模型切换 | REP 服务 |
+//! | Tool | 工具执行 + 权限链 + Shell 安全检查 | SUB 订阅 + PUB 发布 |
+//! | State | 状态持久化 + 断点恢复 | REP 服务 |
+//! | TUI | 终端 UI 渲染 + 用户输入 | SUB 订阅 + PUB 发布 |
+//! | Acp | IDE/stdio ACP client 与消息总线的边界桥接 | SUB 订阅 + PUB 发布 |
+//!
+//! ## 感官/运动融合
+//!
 //! - 感官能力（Eye/Ear/Nose/Skin）内置到 ThinkerNode
 //! - 运动能力（Hand/Limb）由 ToolNode 统一执行
 //! - 交互能力（Ear/Mouth）由 TUINode 统一处理
-//! - AcpNode：IDE/stdio ACP client 与消息总线之间的边界
+//!
+//! ## 权限模式
+//!
+//! | 模式 | 说明 |
+//! |------|------|
+//! | Yolo | 自动允许所有操作 |
+//! | Trust | 只读工具自动信任，写操作需确认 |
+//! | Ask | 每次操作都需要确认 |
+//! | ReadOnly | 只允许只读工具（类似 Claude Code Plan Mode） |
 
 pub mod agent;
 pub mod sampler;
@@ -133,6 +152,8 @@ pub enum PermissionMode {
     Trust,
     /// 每次操作都需要确认
     Ask,
+    /// 只读模式（类似 Claude Code Plan Mode）— 只允许只读工具
+    ReadOnly,
 }
 
 /// Node 运行上下文，提供消息总线连接信息
