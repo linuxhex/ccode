@@ -30,6 +30,7 @@ pub mod meta_cognitive;
 pub mod goal_loop;
 pub mod schedule_loop;
 pub mod proactive_loop;
+pub mod goal_verifier;
 
 use serde::{Deserialize, Serialize};
 

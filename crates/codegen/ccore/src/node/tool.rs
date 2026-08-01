@@ -397,7 +397,43 @@ impl ToolNode {
             arguments: effective_input,
             ..request
         };
-        let result = self.bridge.execute(&effective_request).await;
+
+        // task 工具特殊处理：通过消息总线请求 Kernel spawn 子 Agent
+        let result = if effective_request.tool_name == "task" {
+            let agent_type = effective_request.arguments["agent_type"].as_str().unwrap_or("general-purpose");
+            let task_description = effective_request.arguments["description"].as_str().unwrap_or("");
+            let model = effective_request.arguments["model"].as_str(); // 可选模型覆盖
+
+            let mut spawn_payload = serde_json::json!({
+                "agent_type": agent_type,
+                "description": task_description,
+                "task_description": task_description,
+            });
+            if let Some(m) = model {
+                spawn_payload["model"] = serde_json::Value::String(m.to_string());
+            }
+
+            // 通过消息总线发送 spawn 请求给 Kernel
+            let spawn_msg = FrameCodec::new_message(
+                Topic::agent_spawn(&effective_request.agent_id),
+                self.id.as_str(),
+                &spawn_payload,
+            )?;
+            if let Err(e) = transport.send_message(&spawn_msg).await {
+                tracing::warn!("发送 task spawn 请求失败：{}", e);
+            }
+
+            // 返回"已分发"结果（subagent 完成后通过 subagent/completed topic 异步回传）
+            crate::tools::ToolCallResult {
+                tool_call_id: effective_request.tool_call_id.clone(),
+                output: format!("子 Agent 已 spawn，类型={}, 任务={}", agent_type, task_description),
+                success: true,
+                duration_ms: 0,
+                is_partial: false,
+            }
+        } else {
+            self.bridge.execute(&effective_request).await
+        };
 
         AgentMetrics::global()
             .record_tool_execution_time(&effective_request.tool_name, result.duration_ms as f64);

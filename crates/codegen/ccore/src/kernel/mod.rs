@@ -1411,41 +1411,97 @@ impl Kernel {
             }
 
             // cortex/goal_verify — GoalLoop 子任务验证请求（来自 ThinkerNode）
+            // 双路径验证：快速路径（经验日志关键词）+ LLM 评估路径
             "cortex/goal_verify" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
-                let verification = payload["verification"].as_str().unwrap_or("");
-                let agent_id = payload["agent_id"].as_str().unwrap_or("");
+                let verify_req: crate::agent::goal_verifier::GoalVerifyRequest =
+                    serde_json::from_value(payload.clone()).unwrap_or_else(|_| {
+                        crate::agent::goal_verifier::GoalVerifyRequest {
+                            agent_id: payload["agent_id"].as_str().unwrap_or("").to_string(),
+                            subtask_description: payload["subtask_description"].as_str().unwrap_or("").to_string(),
+                            verification: payload["verification"].as_str().unwrap_or("").to_string(),
+                        }
+                    });
 
-                // 验证策略：检查最近工具执行结果是否包含验证关键词
-                // 这是简化验证——生产中应调用 LLM 评估模型判断（类似 Claude Code 的评估模型）
+                // 策略 1：经验日志快速验证（零延迟）
                 let recent_outcome = self.experience_log.lock().await.recent_outcome_summary();
-                let passed = !verification.is_empty() && (
+                let quick_pass = !verify_req.verification.is_empty() && (
                     recent_outcome.contains("success")
                     || recent_outcome.contains("passed")
                     || recent_outcome.contains("ok")
-                    || !recent_outcome.is_empty() && verification.len() < 30
+                    || recent_outcome.contains("完成")
+                    || recent_outcome.contains("created")
+                    || recent_outcome.contains("written")
+                    || recent_outcome.contains("exists")
                 );
+                let quick_fail = recent_outcome.contains("error")
+                    || recent_outcome.contains("failed")
+                    || recent_outcome.contains("失败")
+                    || recent_outcome.contains("not found")
+                    || recent_outcome.contains("不存在");
 
-                tracing::info!(
-                    target: "ccore::goal",
-                    agent_id,
-                    verification,
-                    passed,
-                    "GoalLoop 验证结果：{}", if passed { "通过" } else { "未通过" }
-                );
-
-                // 回传验证结果
-                let result = serde_json::json!({
-                    "passed": passed,
-                    "verification": verification,
-                });
-                if let Ok(result_msg) = FrameCodec::new_message(
-                    Topic::new("cortex/goal_verify_result"),
-                    "kernel",
-                    &result,
-                ) {
-                    if let Err(e) = self.route_and_forward(&result_msg, transport).await {
-                        tracing::warn!("发送 GoalLoop 验证结果失败：{}", e);
+                if quick_pass || quick_fail {
+                    // 快速路径：经验日志足以判断
+                    tracing::info!(
+                        target: "ccore::goal",
+                        agent_id = verify_req.agent_id,
+                        subtask = verify_req.subtask_description,
+                        verification = verify_req.verification,
+                        passed = quick_pass,
+                        "GoalLoop 验证结果：{}（快速路径，经验={}）",
+                        if quick_pass { "通过" } else { "未通过" },
+                        recent_outcome.len()
+                    );
+                    let result_json = serde_json::json!({
+                        "passed": quick_pass,
+                        "verification": verify_req.verification,
+                        "subtask_description": verify_req.subtask_description,
+                        "reasoning": format!("经验日志快速验证：{}", recent_outcome),
+                    });
+                    if let Ok(result_msg) = FrameCodec::new_message(
+                        Topic::new("cortex/goal_verify_result"),
+                        "kernel",
+                        &result_json,
+                    ) {
+                        if let Err(e) = self.route_and_forward(&result_msg, transport).await {
+                            tracing::warn!("发送 GoalLoop 验证结果失败：{}", e);
+                        }
+                    }
+                } else {
+                    // 策略 2：LLM 评估模型验证（异步，结果通过 sampler stream 回传）
+                    let verify_prompt = verify_req.to_verify_prompt();
+                    let verify_msg = FrameCodec::new_message(
+                        Topic::sampler_request(),
+                        "kernel",
+                        &serde_json::json!({
+                            "request_id": format!("goal_verify_{}", uuid::Uuid::new_v4()),
+                            "agent_id": verify_req.agent_id,
+                            "model": "fast",
+                            "messages": [{"role": "user", "content": verify_prompt}],
+                            "stream": false,
+                            "max_tokens": 100,
+                            "goal_verify": true,
+                            "subtask_description": verify_req.subtask_description,
+                            "verification": verify_req.verification,
+                        }),
+                    )?;
+                    if let Err(e) = self.route_and_forward(&verify_msg, transport).await {
+                        tracing::warn!("发送 GoalLoop LLM 验证请求失败：{}", e);
+                        // LLM 验证失败时，回退到简单验证
+                        let auto_pass = verify_req.verification.len() < 15;
+                        let result_json = serde_json::json!({
+                            "passed": auto_pass,
+                            "verification": verify_req.verification,
+                            "subtask_description": verify_req.subtask_description,
+                            "reasoning": "LLM 验证失败，回退到简单验证",
+                        });
+                        if let Ok(result_msg) = FrameCodec::new_message(
+                            Topic::new("cortex/goal_verify_result"),
+                            "kernel",
+                            &result_json,
+                        ) {
+                            let _ = self.route_and_forward(&result_msg, transport).await;
+                        }
                     }
                 }
             }

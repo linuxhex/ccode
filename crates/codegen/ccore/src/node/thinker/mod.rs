@@ -138,8 +138,27 @@ pub struct ThinkerNode {
 }
 
 impl ThinkerNode {
-    pub fn new(id: NodeId, config: AgentConfig) -> Self {
+    pub fn new(id: NodeId, mut config: AgentConfig) -> Self {
         let max_tokens = 128_000;
+
+        // 确保 task 工具定义在 config.tools 中（LLM 需要知道可以调用 task 工具）
+        let has_task_tool = config.tools.iter().any(|t| t.name == "task");
+        if !has_task_tool {
+            config.tools.push(crate::sampler::provider::ToolDefinition {
+                name: "task".to_string(),
+                description: "Spawn a sub-agent to handle a subtask independently. The sub-agent runs with its own context and tools, returning results when complete.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "description": { "type": "string", "description": "Task description for the sub-agent" },
+                        "agent_type": { "type": "string", "description": "Sub-agent type (general-purpose, code-reviewer, explore)", "default": "general-purpose" },
+                        "model": { "type": "string", "description": "Optional model override" }
+                    },
+                    "required": ["description"]
+                }),
+            });
+        }
+
         Self {
             id,
             state: AgentState::Idle,
