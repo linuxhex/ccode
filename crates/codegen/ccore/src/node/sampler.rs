@@ -134,9 +134,9 @@ impl SamplerNode {
                 Ok(chunk) => {
                     // 累积 usage
                     if let Some(ref usage) = chunk.usage {
-                        // 对于 prompt_tokens，取最大值（通常只在 message_start 时设置一次）
+                        // Anthropic 流式 API：message_start 报告 input_tokens，message_delta 报告累计 output_tokens
+                        // 两者都是最终值（非增量），取 max 确保捕获最终统计
                         accumulated_usage.prompt_tokens = accumulated_usage.prompt_tokens.max(usage.prompt_tokens);
-                        // 对于 completion_tokens，累加（message_delta 中逐步返回）
                         if usage.completion_tokens > 0 {
                             accumulated_usage.completion_tokens = accumulated_usage.completion_tokens.max(usage.completion_tokens);
                         }

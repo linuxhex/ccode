@@ -580,6 +580,24 @@ impl Node for ThinkerNode {
 
                 self.listen(content, role); // 内置听觉
 
+                // ERL 闭环：检索与当前任务相关的历史启发式，注入工作记忆
+                if !content.is_empty() {
+                    let erl_request = FrameCodec::new_message(
+                        Topic::new("cortex/erl_retrieve_request"),
+                        self.id.as_str(),
+                        &serde_json::json!({
+                            "agent_id": self.id.to_string(),
+                            "task": content,
+                            "top_k": 3,
+                        }),
+                    );
+                    if let Ok(msg) = erl_request {
+                        if let Err(e) = transport.send_message(&msg).await {
+                            tracing::debug!("发送 ERL 检索请求失败：{}", e);
+                        }
+                    }
+                }
+
                 // /goal 命令处理：启动目标驱动循环
                 if content.starts_with("/goal ") {
                     let goal_description = content.strip_prefix("/goal ").unwrap_or("").to_string();
@@ -1000,9 +1018,11 @@ impl Node for ThinkerNode {
             "cortex/erl_heuristic" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
                 if let Some(heuristic) = payload["heuristic"].as_str() {
-                    tracing::info!("ERL 提取经验教训：{}", heuristic);
+                    let source = payload["source"].as_str().unwrap_or("extract");
+                    let label = if source == "retrieve" { "历史经验" } else { "经验教训" };
+                    tracing::info!(source, "ERL 注入{}：{}", label, heuristic.chars().take(100).collect::<String>());
                     self.working_memory.push_system(
-                        format!("[经验教训] {}", heuristic),
+                        format!("[{}] {}", label, heuristic),
                         Self::estimate_tokens(heuristic),
                     );
                 }

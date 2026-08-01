@@ -279,26 +279,7 @@ impl MetaCognitiveController {
     }
 
     fn trigram_similarity(&self, a: &str, b: &str) -> f64 {
-        let trigrams_a: std::collections::HashSet<_> = a
-            .chars()
-            .collect::<Vec<_>>()
-            .windows(3)
-            .map(|w| w.iter().collect::<String>())
-            .collect();
-        let trigrams_b: std::collections::HashSet<_> = b
-            .chars()
-            .collect::<Vec<_>>()
-            .windows(3)
-            .map(|w| w.iter().collect::<String>())
-            .collect();
-
-        if trigrams_a.is_empty() || trigrams_b.is_empty() {
-            return 0.0;
-        }
-
-        let intersection = trigrams_a.intersection(&trigrams_b).count() as f64;
-        let union = trigrams_a.union(&trigrams_b).count() as f64;
-        intersection / union
+        crate::utils::trigram_similarity(a, b)
     }
 
     /// 获取统计信息

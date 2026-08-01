@@ -20,8 +20,6 @@ use crate::message::Topic;
 use crate::node::{Node, NodeId, NodeType, NodeContext};
 use crate::node::transport::NodeTransportHandle;
 use crate::memory::short_term::ShortTermMemory;
-use crate::memory::long_term::LongTermMemory;
-use crate::memory::window::SlidingWindow;
 
 /// JSONL 条目 — 每行一条事件，追加写入
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -81,12 +79,6 @@ pub struct StateNode {
     id: NodeId,
     /// L1 短期记忆
     short_term: ShortTermMemory,
-    /// L2 长期记忆
-    #[allow(dead_code)]
-    long_term: Option<LongTermMemory>,
-    /// 滑动窗口更新器
-    #[allow(dead_code)]
-    sliding_window: SlidingWindow,
     /// 持久化根目录
     storage_root: PathBuf,
     /// 当前会话 ID
@@ -103,8 +95,6 @@ impl StateNode {
         Self {
             id,
             short_term: ShortTermMemory::new(),
-            long_term: None,
-            sliding_window: SlidingWindow::new(128_000),
             storage_root,
             session_id,
             jsonl_path: None,
@@ -230,12 +220,13 @@ impl StateNode {
     /// 查询当前对话状态
     fn query_state(&self) -> ConversationState {
         let entries = self.short_term.all_entries();
+        let total_tokens: u32 = entries.iter().map(|e| e.token_count).sum();
         ConversationState {
             session_id: self.session_id.clone(),
             total_messages: entries.len(),
-            total_tokens: entries.iter().map(|e| e.token_count).sum(),
+            total_tokens,
             turn_count: entries.last().map(|e| e.turn).unwrap_or(0),
-            l0_used_tokens: 0,
+            l0_used_tokens: total_tokens,
             l0_max_tokens: 128_000,
         }
     }

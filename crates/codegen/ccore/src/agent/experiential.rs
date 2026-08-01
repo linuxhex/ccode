@@ -242,24 +242,9 @@ impl ExperientialReflectiveLearner {
             }
 
             // trigram相似度
-            let trigrams_task: std::collections::HashSet<_> = task
-                .chars()
-                .collect::<Vec<_>>()
-                .windows(3)
-                .map(|w| w.iter().collect::<String>())
-                .collect();
-            let trigrams_h: std::collections::HashSet<_> = h
-                .content
-                .chars()
-                .collect::<Vec<_>>()
-                .windows(3)
-                .map(|w| w.iter().collect::<String>())
-                .collect();
-
-            if !trigrams_task.is_empty() && !trigrams_h.is_empty() {
-                let intersection = trigrams_task.intersection(&trigrams_h).count() as f64;
-                let union = trigrams_task.union(&trigrams_h).count() as f64;
-                score += (intersection / union) * 0.3;
+            let sim = crate::utils::trigram_similarity(task, &h.content);
+            if sim > 0.0 {
+                score += sim * 0.3;
             }
 
             // 有效性加权

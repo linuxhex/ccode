@@ -1410,6 +1410,56 @@ impl Kernel {
                 }
             }
 
+            // cortex/erl_retrieve_request — ERL 检索请求（来自 ThinkerNode turn 开始）
+            // 闭环关键：从 ERL 池中检索与当前任务相关的启发式规则，注入工作记忆
+            "cortex/erl_retrieve_request" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
+                let task_description = payload["task"].as_str().unwrap_or("");
+                let top_k = payload["top_k"].as_u64().unwrap_or(3) as usize;
+                let agent_id = payload["agent_id"].as_str().unwrap_or("");
+
+                if task_description.is_empty() {
+                    return Ok(());
+                }
+
+                // 从 ERL 池中检索相关启发式
+                let heuristics = self.erl().retrieve_relevant(task_description, top_k);
+                if heuristics.is_empty() {
+                    tracing::debug!(
+                        target: "ccore::erl",
+                        task = task_description,
+                        "ERL 无相关启发式"
+                    );
+                    return Ok(());
+                }
+
+                // 格式化为可注入工作记忆的文本
+                let formatted = self.erl().format_for_injection(&heuristics);
+                let result = serde_json::json!({
+                    "heuristic": formatted,
+                    "from_success": true,
+                    "relevance": heuristics.iter().map(|h| h.relevance_score).fold(0.0f64, f64::max),
+                    "source": "retrieve",
+                });
+                if let Ok(result_msg) = FrameCodec::new_message(
+                    Topic::new("cortex/erl_heuristic"),
+                    "kernel",
+                    &result,
+                ) {
+                    if let Err(e) = self.route_and_forward(&result_msg, transport).await {
+                        tracing::warn!("发送 ERL 检索结果失败：{}", e);
+                    }
+                }
+                tracing::info!(
+                    target: "ccore::erl",
+                    agent_id,
+                    count = heuristics.len(),
+                    task = task_description.chars().take(80).collect::<String>(),
+                    "ERL 注入 {} 条历史启发式到工作记忆",
+                    heuristics.len()
+                );
+            }
+
             // cortex/goal_verify — GoalLoop 子任务验证请求（来自 ThinkerNode）
             // 双路径验证：快速路径（经验日志关键词）+ LLM 评估路径
             "cortex/goal_verify" => {
