@@ -231,9 +231,9 @@ fn handle_tools_list(
 
 /// 处理 tools/call 请求
 ///
-/// 查找工具并调用处理函数，返回执行结果。
-/// 由于实际工具执行是异步的（通过消息总线转发），
-/// 此处返回 dispatch 确认。
+/// 查找工具并直接执行，返回执行结果。
+/// 内置工具（read/write/edit/bash/glob/grep）同步执行，
+/// 未知工具返回错误。
 fn handle_tools_call(
     id: Option<Value>,
     params: &Option<Value>,
@@ -263,7 +263,7 @@ fn handle_tools_call(
         }
     };
 
-    let _arguments = params_value
+    let arguments = params_value
         .get("arguments")
         .cloned()
         .unwrap_or(serde_json::json!({}));
@@ -279,20 +279,16 @@ fn handle_tools_call(
         );
     }
 
-    // 同步分发：将调用请求通过消息总线发送到 ToolNode
-    // 由于 handle_request 是同步函数，实际异步调用在 event_loop 处理
-    // 此处返回"已分发"确认
-    let result = serde_json::json!({
-        "content": [
-            {
-                "type": "text",
-                "text": format!("工具 {} 调用已分发到 ToolNode", tool_name),
-            },
-        ],
-        "isError": false,
-    });
-
-    JsonRpcResponse::success(id, result)
+    // 直接执行内置工具
+    match registry.execute_tool(tool_name, &arguments) {
+        Ok(result) => JsonRpcResponse::success(id, result),
+        Err(e) => JsonRpcResponse::error(
+            id,
+            -32000,
+            format!("工具执行失败：{}", e),
+            None,
+        ),
+    }
 }
 
 /// 处理 ping 请求

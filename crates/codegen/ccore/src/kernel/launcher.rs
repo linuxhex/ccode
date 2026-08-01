@@ -145,6 +145,10 @@ impl NodeLauncher {
         };
         let mut thinker = ThinkerNode::new(thinker_id.clone(), thinker_config);
 
+        // 加载项目上下文（CCODE.md / CLAUDE.md），注入到工作记忆
+        let project_dir = std::path::PathBuf::from(&self.kernel_config.working_dir);
+        thinker.load_project_context(&project_dir);
+
         // 连接情景记忆桥接（ThinkerNode ↔ EpisodicMemoryStore，与 Kernel 共享同一实例）
         thinker.set_memory_bridge(Box::new(EpisodicMemoryBridge::new(self.episodic_memory.clone())));
 

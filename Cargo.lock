@@ -1729,6 +1729,7 @@ name = "ccode-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ccode-hooks",
  "ccode-shell",
  "ccore",
  "clap",
@@ -1737,6 +1738,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

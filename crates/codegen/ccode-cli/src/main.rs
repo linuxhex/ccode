@@ -108,6 +108,17 @@ fn main() -> anyhow::Result<()> {
             };
             let mut kernel = ccore::kernel::Kernel::new(kernel_config);
             kernel.set_runtime_config(ccore::kernel::KernelRuntimeConfig::from(&config));
+
+            // 注入 HookDispatcher 桥接（让 ToolNode 的 pre/post_tool_use 生效）
+            let hook_adapter = ccode_shell::agent::hook_adapter::HookDispatcherAdapter::new(
+                ccode_hooks::discovery::HookRegistry::default(),
+                None,
+                false,
+                uuid::Uuid::new_v4().to_string(),
+                args.work_dir.clone().unwrap_or_else(|| ".".into()),
+            );
+            kernel.set_hook_dispatcher(std::sync::Arc::new(hook_adapter));
+
             kernel.run().await
         })?;
     }

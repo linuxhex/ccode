@@ -131,6 +131,10 @@ pub struct ThinkerNode {
     doom_loop_escape_attempts: u32,
     /// 项目上下文（CCODE.md，会话开始时注入）
     project_context: crate::tools::project_context::ProjectContext,
+    /// Token 预算被拒绝标志（收到 cortex/budget_deny 后设置，阻止后续 LLM 调用）
+    budget_denied: bool,
+    /// 强制结束 turn 标志（LoopStateMachine 判定 EndTurn 后设置，阻止继续采样）
+    force_end_turn: bool,
 }
 
 impl ThinkerNode {
@@ -164,6 +168,8 @@ impl ThinkerNode {
             goal_loop: None,
             doom_loop_escape_attempts: 0,
             project_context: crate::tools::project_context::ProjectContext::default(),
+            budget_denied: false,
+            force_end_turn: false,
         }
     }
 
@@ -311,7 +317,7 @@ impl ThinkerNode {
             match loop_action {
                 LoopAction::EndTurn { reason } => {
                     tracing::info!(target: "ccore::loop", reason = ?reason, "LoopStateMachine 判定结束 turn");
-                    // EndTurn 由 sampler done handler 处理，此处仅记录
+                    self.force_end_turn = true;
                 }
                 LoopAction::CallLLM => {
                     // 继续调用 LLM（已在后续 send_sample_request 中处理）
@@ -447,9 +453,15 @@ impl ThinkerNode {
     /// 请求 Token 预算和熔断器检查（通过消息总线）
     ///
     /// 返回 true 表示允许执行，false 表示应跳过（预算不足或熔断器开启）。
-    /// 采用 fire-and-forget 模式：默认放行，如果预算不足 Kernel 会通过
-    /// cortex/budget_deny 通知，ThinkerNode 在 handle_message 中处理拒绝。
+    /// 如果已被 Kernel 拒绝（budget_denied=true），立即返回 false。
+    /// 同时发送 fire-and-forget 到 Kernel 进行持续预算追踪。
     async fn check_budget_and_circuit(&self, transport: &NodeTransportHandle) -> bool {
+        // 如果已被 Kernel 拒绝，立即阻止
+        if self.budget_denied {
+            tracing::warn!("Token 预算已被拒绝，阻止 LLM 调用");
+            return false;
+        }
+        // 请求 Kernel 检查（fire-and-forget，结果通过 cortex/budget_deny 异步通知）
         let msg = FrameCodec::new_message(
             Topic::new("cortex/budget_check"),
             self.id.as_str(),
@@ -462,7 +474,6 @@ impl ThinkerNode {
                 tracing::debug!("发送预算检查请求失败（放行）：{}", e);
             }
         }
-        // fire-and-forget 模式：默认放行，如果预算不足 Kernel 会通过 cortex/budget_deny 通知
         true
     }
 
@@ -470,8 +481,11 @@ impl ThinkerNode {
     ///
     /// 发送前先通过消息总线请求 Token 预算和熔断器检查。
     async fn send_sample_request(&mut self, transport: &NodeTransportHandle) -> anyhow::Result<()> {
-        // 请求预算和熔断器检查（fire-and-forget，拒绝通过 cortex/budget_deny 异步通知）
-        self.check_budget_and_circuit(transport).await;
+        // 请求预算和熔断器检查，如果被拒绝则跳过本次 LLM 调用
+        if !self.check_budget_and_circuit(transport).await {
+            tracing::warn!("Token 预算或熔断器拒绝，跳过本次 LLM 调用");
+            return Ok(());
+        }
 
         self.current_sample_request_id = None;
         AgentMetrics::global().record_loop_count(1);
@@ -519,6 +533,11 @@ impl Node for ThinkerNode {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
                 let content = payload["content"].as_str().unwrap_or("");
                 let role = payload["role"].as_str().unwrap_or("user");
+
+                // 新 turn 开始，重置预算拒绝和强制结束标志
+                self.budget_denied = false;
+                self.force_end_turn = false;
+
                 self.listen(content, role); // 内置听觉
 
                 // /goal 命令处理：启动目标驱动循环
@@ -733,6 +752,14 @@ impl Node for ThinkerNode {
                     let all_done = self.handle_tool_result(tool_call_id, &tool_name, output, success, transport).await;
 
                     if all_done {
+                        // 如果状态机判定结束 turn，不继续调用 LLM
+                        if self.force_end_turn {
+                            self.force_end_turn = false;
+                            tracing::info!("LoopStateMachine 判定 EndTurn，不继续采样，直接结束 turn");
+                            self.persist_to_state(transport).await;
+                            return Ok(());
+                        }
+
                         // 工具执行完毕，检查 Doom Loop
                         let doom_result = self.check_doom_loop();
                         if doom_result.detected {
@@ -874,6 +901,7 @@ impl Node for ThinkerNode {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
                 let reason = payload["reason"].as_str().unwrap_or("unknown");
                 tracing::warn!("LLM 调用被拒绝：{}", reason);
+                self.budget_denied = true;
                 // 通知用户
                 let notice_msg = FrameCodec::new_message(
                     Topic::agent_output(self.id.as_str()),

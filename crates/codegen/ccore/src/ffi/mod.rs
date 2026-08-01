@@ -45,6 +45,10 @@ pub unsafe extern "C" fn ccore_start(config_json: *const c_char) -> i32 {
     rt.block_on(async {
         let mut kernel = Kernel::new(kernel_config);
         kernel.set_runtime_config(KernelRuntimeConfig::from(&config));
+
+        // 注入默认 NoOpHookDispatcher（产品层 FFI 用户应自行调用 set_hook_dispatcher 注入真实实现）
+        kernel.set_hook_dispatcher(std::sync::Arc::new(crate::tools::hook_bridge::NoOpHookDispatcher));
+
         tokio::select! {
             result = kernel.run() => result.map(|_| 0).unwrap_or(-5),
             _ = shutdown_rx => 0,

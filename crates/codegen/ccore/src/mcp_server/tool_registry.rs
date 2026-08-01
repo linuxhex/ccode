@@ -110,6 +110,158 @@ impl McpToolRegistry {
         }))
     }
 
+    /// 执行内置工具（同步直接执行，不经过消息总线）
+    ///
+    /// 支持 read/write/edit/bash/glob/grep 六个内置工具。
+    /// 对于 bash 工具，仅允许白名单命令以确保安全。
+    pub fn execute_tool(&self, name: &str, arguments: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        match name {
+            "read" => {
+                let path = arguments["path"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 path 参数"))?;
+                match std::fs::read_to_string(path) {
+                    Ok(content) => Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": content}],
+                        "isError": false
+                    })),
+                    Err(e) => Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": format!("读取失败：{}", e)}],
+                        "isError": true
+                    }))
+                }
+            }
+            "write" => {
+                let path = arguments["path"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 path 参数"))?;
+                let content = arguments["content"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 content 参数"))?;
+                match std::fs::write(path, content) {
+                    Ok(()) => Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": "写入成功"}],
+                        "isError": false
+                    })),
+                    Err(e) => Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": format!("写入失败：{}", e)}],
+                        "isError": true
+                    }))
+                }
+            }
+            "edit" => {
+                let path = arguments["path"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 path 参数"))?;
+                let old = arguments["old_string"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 old_string 参数"))?;
+                let new = arguments["new_string"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 new_string 参数"))?;
+                match std::fs::read_to_string(path) {
+                    Ok(content) => {
+                        let new_content = content.replacen(old, new, 1);
+                        if new_content == content {
+                            Ok(serde_json::json!({
+                                "content": [{"type": "text", "text": "未找到匹配文本"}],
+                                "isError": true
+                            }))
+                        } else {
+                            match std::fs::write(path, &new_content) {
+                                Ok(()) => Ok(serde_json::json!({
+                                    "content": [{"type": "text", "text": "编辑成功"}],
+                                    "isError": false
+                                })),
+                                Err(e) => Ok(serde_json::json!({
+                                    "content": [{"type": "text", "text": format!("写入失败：{}", e)}],
+                                    "isError": true
+                                }))
+                            }
+                        }
+                    }
+                    Err(e) => Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": format!("读取失败：{}", e)}],
+                        "isError": true
+                    }))
+                }
+            }
+            "bash" => {
+                let command = arguments["command"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 command 参数"))?;
+                // 安全：仅允许白名单命令
+                let allowed = ["ls", "cat", "pwd", "echo", "which", "head", "tail", "wc", "grep", "find", "git", "cargo", "rustc"];
+                let cmd_name = command.split_whitespace().next().unwrap_or("");
+                if !allowed.contains(&cmd_name) {
+                    return Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": format!("命令 {} 不在白名单中", cmd_name)}],
+                        "isError": true
+                    }));
+                }
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .output();
+                match output {
+                    Ok(out) => {
+                        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                        let text = if stderr.is_empty() { stdout } else { format!("{}\n{}", stdout, stderr) };
+                        Ok(serde_json::json!({
+                            "content": [{"type": "text", "text": text}],
+                            "isError": !out.status.success()
+                        }))
+                    }
+                    Err(e) => Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": format!("执行失败：{}", e)}],
+                        "isError": true
+                    }))
+                }
+            }
+            "glob" => {
+                let pattern = arguments["pattern"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 pattern 参数"))?;
+                let path = arguments["path"].as_str().unwrap_or(".");
+                let output = std::process::Command::new("find")
+                    .arg(path)
+                    .arg("-name")
+                    .arg(pattern)
+                    .output();
+                match output {
+                    Ok(out) => {
+                        let text = String::from_utf8_lossy(&out.stdout).to_string();
+                        Ok(serde_json::json!({
+                            "content": [{"type": "text", "text": text}],
+                            "isError": false
+                        }))
+                    }
+                    Err(e) => Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": format!("查找失败：{}", e)}],
+                        "isError": true
+                    }))
+                }
+            }
+            "grep" => {
+                let pattern = arguments["pattern"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 pattern 参数"))?;
+                let path = arguments["path"].as_str().unwrap_or(".");
+                let output = std::process::Command::new("grep")
+                    .arg("-r")
+                    .arg(pattern)
+                    .arg(path)
+                    .output();
+                match output {
+                    Ok(out) => {
+                        let text = String::from_utf8_lossy(&out.stdout).to_string();
+                        Ok(serde_json::json!({
+                            "content": [{"type": "text", "text": text}],
+                            "isError": false
+                        }))
+                    }
+                    Err(e) => Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": format!("搜索失败：{}", e)}],
+                        "isError": true
+                    }))
+                }
+            }
+            _ => Err(anyhow::anyhow!("未知工具：{}", name))
+        }
+    }
+
     // ---- 内置工具注册 ----
 
     /// 注册 read 工具 — 读取文件内容
