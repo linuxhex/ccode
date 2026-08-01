@@ -19,6 +19,9 @@ pub enum StreamingEvent {
     Finish,
 }
 
+/// Spinner 动画帧序列（Braille 旋转，与 Claude Code 一致）
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// 工具调用块（进行中/已完成）
 #[derive(Debug, Clone)]
 pub struct ToolCallBlock {
@@ -27,6 +30,23 @@ pub struct ToolCallBlock {
     pub start_time: Instant,
     pub end_time: Option<Instant>,
     pub success: Option<bool>,
+}
+
+impl ToolCallBlock {
+    /// 获取当前 spinner 字符（进行中时旋转，完成时显示 ✓/✗）
+    pub fn spinner_char(&self) -> &str {
+        match (self.end_time, self.success) {
+            (Some(_), Some(true)) => "✓",
+            (Some(_), Some(false)) => "✗",
+            (Some(_), None) => "?",
+            (None, _) => {
+                // 进行中：根据经过时间计算帧索引（100ms 一帧）
+                let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+                let frame_idx = ((elapsed_ms / 100) % SPINNER_FRAMES.len() as u64) as usize;
+                SPINNER_FRAMES[frame_idx]
+            }
+        }
+    }
 }
 
 impl ToolCallBlock {

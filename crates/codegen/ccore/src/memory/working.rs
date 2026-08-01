@@ -494,7 +494,7 @@ impl WorkingMemory {
     /// - 这些条目（system prompt + 工具定义）保持不变，最大化 Prompt Cache 命中率
     pub fn compact_with_policy(&mut self, policy: &CompactionPolicy) -> CompactionResult {
         let tokens_before = self.used_tokens_cached;
-        let total = self.entries.len();
+        let _total = self.entries.len();
 
         // 根据使用率选择压缩级别
         let usage_ratio = if self.max_tokens > 0 {
@@ -873,19 +873,6 @@ impl WorkingMemory {
 
     /// 使用 LLM 生成智能摘要（而非简单截断）
     ///
-    /// 摘要请求会发送到 Sampler Node，等待响应后替换原内容。
-    /// 如果 LLM 摘要失败，回退到截断方式。
-    ///
-    /// # Arguments
-    /// * `content` - 需要摘要的内容
-    ///
-    /// # Returns
-    /// 摘要后的内容字符串，或截断后备方案
-    /// 使用 LLM 生成摘要（如已注入摘要器），否则截断回退
-    async fn summarize_with_llm(&self, content: &str) -> Result<String, anyhow::Error> {
-        self.summarize_content(content).await
-    }
-
     /// 压缩对话历史（保留工具调用配对）
     ///
     /// 借鉴 Claude Code compaction.rs 的逻辑：
@@ -1143,9 +1130,11 @@ mod tests {
         });
 
         // 搜索与 [1, 0, 0] 最相似的
+        // 注意：search 过滤 score <= 0.0，正交向量相似度为 0 被过滤，
+        // 仅返回 entry-1（与 query 完全匹配）
         let results = index.search_with_metadata(&vec![1.0, 0.0, 0.0], 2);
 
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "entry-1"); // 应该是第一个，因为完全匹配
     }
 

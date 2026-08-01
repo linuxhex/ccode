@@ -43,8 +43,12 @@ pub struct TokenBudgetManager {
     /// 已使用的token数
     tokens_used: usize,
     /// 系统提示占用的token数
+    /// 保留：预算计算需要区分系统/工具/对话 token 占比
+    #[allow(dead_code)]
     system_prompt_tokens: usize,
     /// 工具定义占用的token数
+    /// 保留：预算计算需要区分系统/工具/对话 token 占比
+    #[allow(dead_code)]
     tool_definition_tokens: usize,
     /// 模型上下文窗口缓存
     model_windows: HashMap<String, usize>,

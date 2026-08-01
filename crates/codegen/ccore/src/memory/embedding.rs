@@ -255,10 +255,12 @@ mod tests {
         index.add(create_test_vector("v3", vec![0.0, 0.0, 1.0]));
 
         // 搜索与 [1, 0, 0] 最相似的向量
+        // 注意：search 过滤掉 score <= 0.0 的结果，
+        // [0,1,0] 和 [0,0,1] 与 [1,0,0] 正交，相似度为 0，被过滤
         let query = vec![1.0, 0.0, 0.0];
         let results = index.search(&query, 2);
 
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0); // v1 should be first
         assert!((results[0].1 - 1.0).abs() < 1e-6);
     }

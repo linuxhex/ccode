@@ -427,7 +427,7 @@ impl GoalLoop {
             if let Some(s) = self.spec.subtasks.get_mut(self.current_subtask_idx) {
                 s.state = SubTaskState::Failed;
             }
-            let subtask_desc = self
+            let _subtask_desc = self
                 .spec
                 .subtasks
                 .get(self.current_subtask_idx)

@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
 use crate::message::Message;
-use crate::node::NodeId;
 
 /// MCP 传输方式
 #[derive(Debug, Clone, Serialize, Deserialize)]

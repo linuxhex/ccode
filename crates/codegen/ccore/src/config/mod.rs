@@ -2,7 +2,6 @@
 
 pub mod provider;
 pub mod memory;
-pub mod hot_reload;
 pub mod watcher;
 pub mod reloader;
 

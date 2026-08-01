@@ -396,4 +396,132 @@ mod tests {
         let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
     }
+
+    /// 集成测试：完整的 MCP 流程（initialize → tools/list → tools/call 未知工具 → 期望错误）
+    #[test]
+    fn test_full_mcp_flow() {
+        let registry = create_test_registry();
+
+        // 第一步：initialize
+        let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let init_result = handle_request(init_req, &registry, "test-server", "1.0.0").unwrap();
+        assert!(init_result.is_some(), "initialize 应返回响应");
+        let init_resp: Value = serde_json::from_str(&init_result.unwrap()).unwrap();
+        assert_eq!(init_resp["jsonrpc"], "2.0");
+        assert_eq!(init_resp["id"], 1);
+        assert_eq!(init_resp["result"]["serverInfo"]["name"], "test-server");
+        assert_eq!(init_resp["result"]["protocolVersion"], "2024-11-05");
+
+        // 第二步：tools/list
+        let list_req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let list_result = handle_request(list_req, &registry, "test-server", "1.0.0").unwrap();
+        assert!(list_result.is_some(), "tools/list 应返回响应");
+        let list_resp: Value = serde_json::from_str(&list_result.unwrap()).unwrap();
+        assert_eq!(list_resp["id"], 2);
+        let tools = list_resp["result"]["tools"].as_array().expect("tools 应为数组");
+        assert!(!tools.is_empty(), "工具列表不应为空");
+
+        // 第三步：tools/call 调用不存在的工具，期望返回错误
+        let call_req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}"#;
+        let call_result = handle_request(call_req, &registry, "test-server", "1.0.0").unwrap();
+        assert!(call_result.is_some(), "tools/call 应返回响应");
+        let call_resp: Value = serde_json::from_str(&call_result.unwrap()).unwrap();
+        assert_eq!(call_resp["id"], 3);
+        assert!(call_resp["error"].is_object(), "调用未知工具应返回错误");
+        assert_eq!(call_resp["error"]["code"], INVALID_PARAMS);
+    }
+
+    /// 集成测试：验证 tools/list 返回所有 6 个内置工具（read/write/edit/bash/glob/grep）
+    #[test]
+    fn test_tools_list_contains_all_builtin() {
+        let registry = create_test_registry();
+        let request = r#"{"jsonrpc":"2.0","id":10,"method":"tools/list"}"#;
+        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+
+        assert!(result.is_some());
+        let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        let tools = response["result"]["tools"].as_array().expect("tools 应为数组");
+
+        // 收集所有工具名称
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+
+        // 验证 6 个内置工具全部存在
+        let expected_tools = ["read", "write", "edit", "bash", "glob", "grep"];
+        for expected in &expected_tools {
+            assert!(
+                tool_names.contains(expected),
+                "工具列表中应包含内置工具：{}，实际工具列表：{:?}",
+                expected,
+                tool_names
+            );
+        }
+
+        // 确保恰好有 6 个工具
+        assert_eq!(
+            tools.len(),
+            6,
+            "应有恰好 6 个内置工具，实际数量：{}",
+            tools.len()
+        );
+    }
+
+    /// 集成测试：调用未知工具返回 INVALID_PARAMS 错误（非 METHOD_NOT_FOUND）
+    #[test]
+    fn test_tools_call_unknown_tool() {
+        let registry = create_test_registry();
+        let request = r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}"#;
+        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+
+        assert!(result.is_some());
+        let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
+
+        // tools/call 对未知工具返回 INVALID_PARAMS，而非 METHOD_NOT_FOUND
+        // 因为方法 tools/call 本身存在，只是工具名无效
+        assert!(response["error"].is_object(), "应返回错误对象");
+        assert_eq!(
+            response["error"]["code"], INVALID_PARAMS,
+            "未知工具应返回 INVALID_PARAMS 错误码"
+        );
+        // 验证错误消息中包含未知工具名
+        let error_msg = response["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            error_msg.contains("nonexistent_tool"),
+            "错误消息应包含未知工具名称，实际消息：{}",
+            error_msg
+        );
+    }
+
+    /// 集成测试：ping 请求返回空对象（pong）
+    #[test]
+    fn test_ping_returns_pong() {
+        let registry = create_test_registry();
+        let request = r#"{"jsonrpc":"2.0","id":30,"method":"ping"}"#;
+        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+
+        assert!(result.is_some(), "ping 应返回响应");
+        let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
+
+        // 验证协议版本和请求 ID
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 30);
+
+        // ping 返回空对象作为 pong
+        assert!(
+            response["result"].is_object(),
+            "ping 结果应为对象"
+        );
+        assert!(
+            response["result"].as_object().unwrap().is_empty(),
+            "ping 结果应为空对象（pong）"
+        );
+
+        // 确保没有错误字段
+        assert!(
+            response["error"].is_null(),
+            "ping 不应返回错误"
+        );
+    }
 }

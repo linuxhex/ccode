@@ -3,7 +3,6 @@
 //! 通过 AgentNode → SamplerNode 消息链路调用 LLM 生成摘要，
 //! 是 WorkingMemory 的 LlmSummarizer trait 的生产级实现。
 
-use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use super::working::LlmSummarizer;
@@ -81,7 +80,7 @@ impl DirectSamplerSummarizer {
 impl LlmSummarizer for DirectSamplerSummarizer {
     async fn summarize(&self, prompt: &str, content: &str) -> Result<String, anyhow::Error> {
         // 构建完整的摘要请求 prompt
-        let full_prompt = format!(
+        let _full_prompt = format!(
             "{}\n\n{}\n\n请用简洁的中文总结以上内容的要点，不超过 {} 个字：",
             prompt,
             content,

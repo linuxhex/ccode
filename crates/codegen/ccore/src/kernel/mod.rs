@@ -174,6 +174,8 @@ pub struct Kernel {
     #[allow(dead_code)]
     config_watcher: Option<ConfigWatcher>,
     /// 配置变更事件接收端（由 ConfigWatcher 创建，在 run() 中消费）
+    /// 保留：未来热更新功能将消费此通道
+    #[allow(dead_code)]
     config_event_rx: Option<mpsc::Receiver<crate::config::watcher::ConfigChangeEvent>>,
     /// 情景记忆存储（Zettelkasten 知识网络）— 与 ThinkerNode 共享
     /// 在感官信号处理时自动记录关键事件，供 ThinkerNode 检索

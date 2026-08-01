@@ -691,7 +691,7 @@ impl ThinkerNode {
     fn run_compaction_pipeline(&mut self) {
         let current_tokens = self.working_memory.used_tokens();
         let max_tokens = self.working_memory.max_tokens();
-        let usage_percent = if max_tokens > 0 {
+        let _usage_percent = if max_tokens > 0 {
             (current_tokens * 100) / max_tokens
         } else {
             0

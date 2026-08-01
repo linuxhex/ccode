@@ -5,7 +5,7 @@
 //! - Atomic Claim：防止多个 Worker 重复处理同一任务
 //! - Team Memory：子 Agent 间共享上下文
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use crate::agent::subagent::{SubAgentState, SubAgentDefinition};
 use crate::node::NodeId;

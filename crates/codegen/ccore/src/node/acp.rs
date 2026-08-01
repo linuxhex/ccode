@@ -23,6 +23,8 @@ use crate::node::{Node, NodeContext, NodeId, NodeType};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
+    /// JSON-RPC 协议版本字段，反序列化必需
+    #[allow(dead_code)]
     jsonrpc: String,
     id: Option<serde_json::Value>,
     method: String,

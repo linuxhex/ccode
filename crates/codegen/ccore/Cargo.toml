@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
+dashboard = []
 
 [dependencies]
 # 异步运行时

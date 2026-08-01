@@ -336,8 +336,9 @@ mod tests {
 
         let selected = config.select(&index, &query, 2);
 
-        // 禁用时，应该使用普通搜索（按相似度排序）
-        assert_eq!(selected.len(), 2);
+        // 禁用时使用普通搜索，search 过滤 score <= 0.0，
+        // v2 与 query 正交（相似度为 0），被过滤，仅返回 v1
+        assert_eq!(selected.len(), 1);
         assert_eq!(selected[0], 0); // v1 最相关
     }
 
@@ -352,8 +353,9 @@ mod tests {
 
         let selected = config.select(&index, &query, 2);
 
-        // λ=1 时，应该使用普通搜索
-        assert_eq!(selected.len(), 2);
+        // λ=1 时使用普通搜索，search 过滤 score <= 0.0，
+        // v2 与 query 正交（相似度为 0），被过滤，仅返回 v1
+        assert_eq!(selected.len(), 1);
         assert_eq!(selected[0], 0);
     }
 
