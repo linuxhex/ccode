@@ -31,6 +31,17 @@
 //! 5. 每轮结束执行滑动窗口更新
 //! 6. Doom Loop 检测：重复工具调用超过阈值则终止
 
+// ── 子模块（拆分自原 god file） ──
+pub mod sensory;
+pub mod compaction;
+pub mod goal;
+pub mod memory_bridge;
+
+// ── 重导出子模块公共项，保持外部路径兼容 ──
+pub use sensory::SensorySignal;
+pub use compaction::CompactionConfig;
+pub use memory_bridge::{MemoryBridge, EpisodicMemoryBridge};
+
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -56,108 +67,9 @@ use crate::memory::window::SlidingWindow;
 use crate::memory::embedding::EmbeddingIndex;
 use crate::memory::intent_retriever::IntentRetriever;
 
-/// 记忆桥接 trait — 连接外部记忆系统（如 ccode-memory）到 ThinkerNode
-///
-/// 实现此 trait 的模块负责：
-/// - 根据用户输入搜索相关长期记忆（冷区→热区注入）
-/// - 在会话结束时提取关键知识（热区→冷区持久化）
-pub trait MemoryBridge: Send + Sync {
-    /// 根据查询文本搜索相关记忆，返回注入工作记忆的文本片段
-    fn search_relevant(&self, query: &str, top_k: usize) -> Vec<String> { let _ = (query, top_k); Vec::new() }
-    /// 会话结束时提取关键知识并持久化
-    fn extract_and_store(&self, _messages: &[(String, String)]) {}
-}
-
-/// 空记忆桥接（默认实现，不做任何事）
-struct NoopMemoryBridge;
-impl MemoryBridge for NoopMemoryBridge {}
-
-/// 情景记忆桥接 — 连接 EpisodicMemoryStore 到 ThinkerNode
-pub struct EpisodicMemoryBridge {
-    store: std::sync::Arc<crate::memory::episodic::EpisodicMemoryStore>,
-}
-
-impl EpisodicMemoryBridge {
-    pub fn new(store: std::sync::Arc<crate::memory::episodic::EpisodicMemoryStore>) -> Self {
-        Self { store }
-    }
-}
-
-impl MemoryBridge for EpisodicMemoryBridge {
-    fn search_relevant(&self, query: &str, top_k: usize) -> Vec<String> {
-        let context = self.store.reconstruct_context(query, top_k);
-        if context.is_empty() {
-            Vec::new()
-        } else {
-            vec![context]
-        }
-    }
-
-    fn extract_and_store(&self, messages: &[(String, String)]) {
-        use crate::memory::episodic::{MemoryType, MemorySource};
-        for (i, (role, content)) in messages.iter().enumerate() {
-            if content.len() < 50 {
-                continue;
-            }
-            let keywords: Vec<String> = content.split_whitespace().take(8).map(|s| s.to_string()).collect();
-            self.store.encode(
-                if role == "assistant" { MemoryType::Episodic } else { MemoryType::Semantic },
-                &content.chars().take(500).collect::<String>(),
-                role,
-                keywords,
-                MemorySource {
-                    session_id: String::new(),
-                    timestamp: chrono::Utc::now().timestamp(),
-                    message_index: Some(i),
-                    confidence: 0.7,
-                },
-            );
-        }
-    }
-}
 use crate::sampler::provider::{
     SampleRequest, ChatMessage, StreamChunk, StreamChannel, ToolDefinition as SamplerToolDefinition,
 };
-
-/// 压缩管道配置（驱动 5 层压缩：Budget → Snip → MicroCompact → Collapse → Auto）
-#[derive(Debug, Clone)]
-pub struct CompactionConfig {
-    /// 微压缩阈值：超过此消息数时触发微压缩
-    pub microcompact_threshold: usize,
-    /// 上下文折叠阈值：token 占用率超过此百分比时触发
-    pub collapse_threshold_percent: u32,
-    /// 自动压缩阈值：token 占用率超过此百分比时触发全量压缩
-    pub auto_compact_threshold_percent: u32,
-    /// 保留最近 K 轮不压缩（热区）
-    pub keep_recent: usize,
-}
-
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self {
-            microcompact_threshold: 20,
-            collapse_threshold_percent: 85,
-            auto_compact_threshold_percent: 95,
-            keep_recent: 5,
-        }
-    }
-}
-
-/// 感官信号缓冲最大容量
-const SENSORY_BUFFER_CAPACITY: usize = 20;
-
-/// 感官信号（内部使用，不经消息总线）
-#[derive(Debug, Clone)]
-pub struct SensorySignal {
-    /// 来源器官（如 "nose", "skin", "eye"）
-    pub source_organ: String,
-    /// 信号类型（如 "compile_error", "touch"）
-    pub signal_type: String,
-    /// 供 LLM 理解的摘要
-    pub summary: String,
-    /// 严重程度（"info", "warning", "error"）
-    pub severity: String,
-}
 
 /// Thinker Node 实现（仿生架构，路线 A：感官内置）
 ///
@@ -217,6 +129,8 @@ pub struct ThinkerNode {
     goal_loop: Option<GoalLoop>,
     /// Doom Loop 逃脱尝试次数（超过 3 次才真正终止）
     doom_loop_escape_attempts: u32,
+    /// 项目上下文（CCODE.md，会话开始时注入）
+    project_context: crate::tools::project_context::ProjectContext,
 }
 
 impl ThinkerNode {
@@ -235,7 +149,7 @@ impl ThinkerNode {
             compaction_config: CompactionConfig::default(),
             last_microcompact_count: 0,
             context_collapse_active: false,
-            memory_bridge: Box::new(NoopMemoryBridge),
+            memory_bridge: Box::new(memory_bridge::NoopMemoryBridge),
             config,
             pending_tool_calls: HashMap::new(),
             pending_tool_results: HashMap::new(),
@@ -243,12 +157,13 @@ impl ThinkerNode {
             inference_start: None,
             tokens_used: 0,
             turns_executed: 0,
-            sensory_buffer: Vec::with_capacity(SENSORY_BUFFER_CAPACITY),
+            sensory_buffer: Vec::with_capacity(sensory::SENSORY_BUFFER_CAPACITY),
             cancel_requested: false,
             agentic_session_active: false,
             intent_retriever: IntentRetriever::new(EmbeddingIndex::new()),
             goal_loop: None,
             doom_loop_escape_attempts: 0,
+            project_context: crate::tools::project_context::ProjectContext::default(),
         }
     }
 
@@ -257,384 +172,13 @@ impl ThinkerNode {
         self.memory_bridge = bridge;
     }
 
-    /// 启动目标驱动循环
-    ///
-    /// 从用户描述创建 GoalLoop，自动拆解子任务、执行、验证。
-    pub fn start_goal(&mut self, description: String) {
-        let goal_loop = GoalLoop::from_description(description);
-        tracing::info!(
-            target: "ccore::goal",
-            description = %goal_loop.description(),
-            "GoalLoop 已启动"
-        );
-        self.goal_loop = Some(goal_loop);
-    }
-
-    /// 处理 GoalLoop 动作（由 on_turn_complete / on_verification_result 产生）
-    ///
-    /// 根据动作类型：注入工作记忆、发送验证请求、或清除 goal_loop。
-    async fn process_goal_action(&mut self, action: GoalAction, transport: &NodeTransportHandle) -> anyhow::Result<()> {
-        match action {
-            GoalAction::ExecuteSubTask { description } => {
-                // 将子任务描述注入工作记忆，驱动下一轮对话
-                self.working_memory.push_user(
-                    description.clone(),
-                    Self::estimate_tokens(&description),
-                );
-                tracing::info!(target: "ccore::goal", description = %description, "GoalLoop：执行子任务");
-            }
-            GoalAction::VerifySubTask { verification } => {
-                // 通过 bus 发送验证请求
-                let verify_msg = FrameCodec::new_message(
-                    Topic::new("cortex/goal_verify"),
-                    self.id.as_str(),
-                    &serde_json::json!({
-                        "agent_id": self.id.to_string(),
-                        "verification": verification,
-                    }),
-                )?;
-                if let Err(e) = transport.send_message(&verify_msg).await {
-                    tracing::debug!("发送 GoalLoop 验证请求失败：{}", e);
-                }
-                tracing::info!(target: "ccore::goal", "GoalLoop：请求验证子任务");
-            }
-            GoalAction::GoalComplete { reason } => {
-                tracing::info!(target: "ccore::goal", reason = ?reason, "GoalLoop：目标完成");
-                self.goal_loop = None;
-            }
-            GoalAction::SubTaskFailed { subtask_idx, will_retry } => {
-                tracing::warn!(
-                    target: "ccore::goal",
-                    subtask_idx,
-                    will_retry,
-                    "GoalLoop：子任务失败"
-                );
-                if !will_retry {
-                    // 不再重试时，继续循环让 GoalLoop 前进到下一个子任务
-                }
-            }
-            GoalAction::PlanSubTasks => {
-                // 规划阶段：注入提示让 LLM 生成子任务列表
-                if let Some(ref gl) = self.goal_loop {
-                    let desc = gl.description().to_string();
-                    self.working_memory.push_user(
-                        format!("请将以下目标拆解为可执行的子任务列表：\n{}", desc),
-                        Self::estimate_tokens(&desc),
-                    );
-                }
-            }
+    /// 加载项目上下文（CCODE.md）
+    pub fn load_project_context(&mut self, dir: &std::path::Path) {
+        self.project_context = crate::tools::project_context::ProjectContext::load_from_dir(dir);
+        if let Some(prompt) = self.project_context.system_prompt() {
+            let tokens = Self::estimate_tokens(&prompt);
+            self.working_memory.push_system(prompt, tokens);
         }
-        Ok(())
-    }
-
-    /// 处理目标验证结果回调
-    pub async fn on_goal_verification_result(&mut self, passed: bool, transport: &NodeTransportHandle) -> anyhow::Result<()> {
-        if let Some(ref mut gl) = self.goal_loop {
-            let action = gl.on_verification_result(passed);
-            self.process_goal_action(action, transport).await?;
-        }
-        Ok(())
-    }
-
-    /// 从 LLM 响应中解析子任务列表
-    ///
-    /// 支持两种格式：
-    /// 1. JSON 数组：[{"description":"...","verification":"..."}]
-    /// 2. 编号列表：1. 任务描述
-    fn parse_subtasks_from_llm_response(&self, text: &str) -> Vec<crate::agent::goal_loop::SubTask> {
-        use crate::agent::goal_loop::{SubTask, SubTaskState};
-
-        // 尝试 JSON 数组格式
-        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(text) {
-            return arr.iter().filter_map(|item| {
-                let desc = item["description"].as_str()?.to_string();
-                let verification = item["verification"].as_str().unwrap_or("完成").to_string();
-                Some(SubTask {
-                    description: desc,
-                    state: SubTaskState::Pending,
-                    verification,
-                    attempts: 0,
-                    max_retries: 2,
-                })
-            }).collect();
-        }
-
-        // 尝试在文本中查找 JSON 数组（可能被包裹在 markdown code block 中）
-        if let Some(start) = text.find('[') {
-            if let Some(end) = text.rfind(']') {
-                if end > start {
-                    let json_str = &text[start..=end];
-                    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
-                        return arr.iter().filter_map(|item| {
-                            let desc = item["description"].as_str()?.to_string();
-                            let verification = item["verification"].as_str().unwrap_or("完成").to_string();
-                            Some(SubTask {
-                                description: desc,
-                                state: SubTaskState::Pending,
-                                verification,
-                                attempts: 0,
-                                max_retries: 2,
-                            })
-                        }).collect();
-                    }
-                }
-            }
-        }
-
-        // 尝试编号列表格式（1. xxx 或 - xxx）
-        let subtasks: Vec<SubTask> = text.lines()
-            .filter(|line| {
-                let trimmed = line.trim();
-                trimmed.starts_with(|c: char| c.is_ascii_digit()) && trimmed.contains('.')
-                    || trimmed.starts_with("- ")
-            })
-            .filter_map(|line| {
-                let desc = line.trim()
-                    .trim_start_matches(|c: char| c.is_ascii_digit())
-                    .trim_start_matches('.')
-                    .trim_start_matches('-')
-                    .trim()
-                    .to_string();
-                if desc.len() > 3 {
-                    Some(SubTask {
-                        description: desc,
-                        state: SubTaskState::Pending,
-                        verification: "完成".to_string(),
-                        attempts: 0,
-                        max_retries: 2,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        subtasks
-    }
-
-    // ── 内置感官模块（路线 A：不拆独立进程） ──
-
-    /// 听觉（Ear）：处理用户输入
-    ///
-    /// 将用户输入存入工作记忆，同时从长期记忆中搜索相关内容注入热区。
-    fn listen(&mut self, content: &str, role: &str) {
-        let _entry_id = self.short_term_memory.store(
-            role.to_string(),
-            content.to_string(),
-            Self::estimate_tokens(content),
-            false,
-        );
-
-        self.working_memory.push_hot(
-            MessageRole::try_from(role).unwrap_or(MessageRole::User),
-            content.to_string(),
-            Self::estimate_tokens(content),
-        );
-
-        // 从长期记忆搜索相关内容，注入工作记忆（冷区→热区）
-        let relevant = self.memory_bridge.search_relevant(content, 5);
-        for memory in relevant {
-            let token_count = Self::estimate_tokens(&memory);
-            self.working_memory.push_system(
-                format!("[长期记忆] {}", memory),
-                token_count,
-            );
-            tracing::debug!("注入长期记忆：{} 字符", memory.len());
-        }
-
-        // Context Engine：意图扩展 + 代码块检索，注入代码级上下文
-        let intents = IntentRetriever::expand_intents(content);
-        if !intents.is_empty() {
-            // 简单用零向量占位（真实场景需调 embedding 模型生成 query embedding）
-            let query_embedding = vec![0.0f32; 1536];
-            let results = self.intent_retriever.search_by_intents(&intents, &query_embedding, 5);
-            for result in results {
-                let token_count = Self::estimate_tokens(&result.preview);
-                self.working_memory.push_system(
-                    format!("[代码上下文] {} ({}:{}, 相关度:{:.2})", result.name, result.file_path.display(), result.source_intent, result.relevance_score),
-                    token_count,
-                );
-                tracing::debug!("注入代码上下文：{} (score={:.2})", result.name, result.relevance_score);
-            }
-        }
-
-        self.state = AgentState::Thinking;
-        tracing::debug!("Thinker {} 听到输入，轮次 {}", self.id, self.turns_executed);
-    }
-
-    /// 触觉（Skin）：感知工具执行结果
-    ///
-    /// 解析工具输出，提取关键信息注入工作记忆。
-    /// 对于编译/检查类工具输出，自动调用 sniff() 解析错误。
-    /// 同时通过消息总线向 Kernel 发送感官信号，让反射弧和经验学习有输入。
-    async fn feel(&mut self, tool_name: &str, output: &str, success: bool, transport: &NodeTransportHandle) {
-        let summary = if success {
-            format!("[工具 {} 执行成功]", tool_name)
-        } else {
-            format!("[工具 {} 执行失败]", tool_name)
-        };
-
-        // 记录触觉信号
-        self.push_sensory(SensorySignal {
-            source_organ: "skin".into(),
-            signal_type: "tool_result".into(),
-            summary: summary.clone(),
-            severity: if success { "info" } else { "error" }.into(),
-        });
-
-        // 向 Kernel 发送感官信号（让反射弧和经验学习有输入）
-        if let Err(e) = self.publish_sensory_to_kernel(
-            &format!("sensory/skin/{}", tool_name),
-            &serde_json::json!({
-                "tool_name": tool_name,
-                "success": success,
-                "output_preview": output.chars().take(200).collect::<String>(),
-                "agent_id": self.id.to_string(),
-            }),
-            transport,
-        ).await {
-            tracing::debug!("发送感官信号到 Kernel 失败：{}", e);
-        }
-
-        // 如果是编译/检查类工具，自动嗅探
-        if !success && Self::is_compile_related_tool(tool_name) {
-            self.sniff(output, transport).await;
-        }
-    }
-
-    /// 嗅觉（Nose）：解析编译错误和代码异味
-    ///
-    /// 从工具输出中提取错误信息，格式化后注入工作记忆。
-    /// 同时向 Kernel 发送感官信号，让反射弧和经验学习有输入。
-    /// 编译错误格式：error[E0xxx]: message
-    async fn sniff(&mut self, output: &str, transport: &NodeTransportHandle) {
-        let error_lines: Vec<&str> = output
-            .lines()
-            .filter(|line| line.contains("error[") || line.contains("error:"))
-            .take(5) // 最多取 5 条错误
-            .collect();
-
-        if error_lines.is_empty() {
-            return;
-        }
-
-        let summary = format!("编译/检查发现 {} 个错误：\n{}", error_lines.len(), error_lines.join("\n"));
-
-        self.push_sensory(SensorySignal {
-            source_organ: "nose".into(),
-            signal_type: "compile_error".into(),
-            summary: summary.clone(),
-            severity: "error".into(),
-        });
-
-        // 注入工作记忆供 LLM 处理（感官信号作为 system 消息）
-        let token_count = Self::estimate_tokens(&summary);
-        self.working_memory.push_system(summary.clone(), token_count);
-
-        // 向 Kernel 发送感官信号（让反射弧和经验学习有输入）
-        if let Err(e) = self.publish_sensory_to_kernel(
-            "sensory/nose/compile_error",
-            &serde_json::json!({
-                "error_count": error_lines.len(),
-                "errors": error_lines,
-                "agent_id": self.id.to_string(),
-            }),
-            transport,
-        ).await {
-            tracing::debug!("发送嗅探感官信号到 Kernel 失败：{}", e);
-        }
-    }
-
-    /// 视觉（Eye）：观察工具结果中的文件内容
-    ///
-    /// 从 Read/Glob/Grep 等工具输出中提取文件内容摘要，
-    /// 并向 Kernel 发送感官信号
-    async fn observe(&mut self, tool_name: &str, output: &str, transport: &NodeTransportHandle) {
-        let summary = match tool_name {
-            "Read" => {
-                let line_count = output.lines().count();
-                format!("[观察到文件内容，共 {} 行]", line_count)
-            }
-            "Glob" | "Grep" => {
-                let match_count = output.lines().count();
-                format!("[观察到 {} 条匹配结果]", match_count)
-            }
-            _ => return, // 非观察类工具，不处理
-        };
-
-        self.push_sensory(SensorySignal {
-            source_organ: "eye".into(),
-            signal_type: "file_observation".into(),
-            summary,
-            severity: "info".into(),
-        });
-
-        // 向 Kernel 发送感官信号
-        if let Err(e) = self.publish_sensory_to_kernel(
-            &format!("sensory/eye/{}", tool_name.to_lowercase()),
-            &serde_json::json!({
-                "tool_name": tool_name,
-                "agent_id": self.id.to_string(),
-            }),
-            transport,
-        ).await {
-            tracing::debug!("发送视觉感官信号到 Kernel 失败：{}", e);
-        }
-    }
-
-    /// 向 Kernel 发送感官信号
-    ///
-    /// ThinkerNode 内置感官处理后，通过控制面消息通知 Kernel，
-    /// 让 Kernel 的 ReflexRouter 和 ExperienceLog 有输入源。
-    /// topic 格式：sensory/{organ}/{detail}，如 sensory/nose/compile_error
-    async fn publish_sensory_to_kernel(
-        &self,
-        topic: &str,
-        payload: &serde_json::Value,
-        transport: &NodeTransportHandle,
-    ) -> anyhow::Result<()> {
-        let msg = FrameCodec::new_message(
-            Topic::new(topic),
-            self.id.as_str(),
-            payload,
-        )?;
-        // 感官信号走控制面（经 Kernel ROUTER），确保 Kernel 一定收到
-        transport.send_message(&msg).await?;
-        Ok(())
-    }
-
-    /// 请求元认知评估（通过消息总线，异步回调）
-    ///
-    /// ThinkerNode 不直接持有 MetaCognitiveController，
-    /// 而是通过 bus 发送 cortex/meta_assess 请求，
-    /// Kernel 收到后评估并将结果通过 cortex/meta_result 返回。
-    async fn request_meta_assessment(&self, context: &str, transport: &NodeTransportHandle) {
-        let msg = FrameCodec::new_message(
-            Topic::new("cortex/meta_assess"),
-            self.id.as_str(),
-            &serde_json::json!({
-                "agent_id": self.id.to_string(),
-                "context": context,
-            }),
-        );
-        if let Ok(msg) = msg {
-            if let Err(e) = transport.send_message(&msg).await {
-                tracing::debug!("发送元认知评估请求失败：{}", e);
-            }
-        }
-    }
-
-    /// 判断工具是否与编译/检查相关
-    fn is_compile_related_tool(tool_name: &str) -> bool {
-        matches!(tool_name, "Bash" | "RunCommand" | "CargoCheck" | "CargoBuild" | "CargoTest")
-    }
-
-    /// 向感官缓冲中追加信号
-    fn push_sensory(&mut self, signal: SensorySignal) {
-        if self.sensory_buffer.len() >= SENSORY_BUFFER_CAPACITY {
-            self.sensory_buffer.remove(0);
-        }
-        self.sensory_buffer.push(signal);
     }
 
     // ── 核心推理循环 ──
@@ -756,68 +300,28 @@ impl ThinkerNode {
             } else {
                 ToolExecutionOutcome::Failure(output.chars().take(100).collect())
             };
-            self.loop_state_machine.transition(LoopEvent::ToolExecutionCompleted {
+            let loop_action = self.loop_state_machine.transition(LoopEvent::ToolExecutionCompleted {
                 tool_use_id: tool_call_id.to_string(),
                 tool_name: tool_name.to_string(),
                 result: outcome,
             });
             self.state = self.loop_state_machine.state();
+
+            // 消费 LoopAction：状态机的判定驱动主循环行为
+            match loop_action {
+                LoopAction::EndTurn { reason } => {
+                    tracing::info!(target: "ccore::loop", reason = ?reason, "LoopStateMachine 判定结束 turn");
+                    // EndTurn 由 sampler done handler 处理，此处仅记录
+                }
+                LoopAction::CallLLM => {
+                    // 继续调用 LLM（已在后续 send_sample_request 中处理）
+                }
+                _ => {}
+            }
             true
         } else {
             false
         }
-    }
-
-    /// 每轮结束时执行滑动窗口更新，驱动冷热分层
-    ///
-    /// 将工作记忆中的消息按冷热评分分类：Hot 保留完整、Warm 摘要、Cold 占位。
-    /// 更新后替换工作记忆条目，实现有限 token 预算内保留最关键信息。
-    fn update_context_window(&mut self) {
-        self.turns_executed += 1;
-
-        // 从工作记忆构建 MessageMeta（滑动窗口需要每条消息的元数据）
-        let entries = self.working_memory.entries();
-        let messages: Vec<crate::memory::window::MessageMeta> = entries
-            .iter()
-            .enumerate()
-            .map(|(idx, e)| {
-                let (role, content, token_count) = match e {
-                    crate::memory::working::WorkingEntry::Hot { role, content, token_count } => {
-                        (format!("{:?}", role), content.clone(), *token_count)
-                    }
-                    crate::memory::working::WorkingEntry::Warm { summary, token_count, .. } => {
-                        ("warm".into(), summary.clone(), *token_count)
-                    }
-                    crate::memory::working::WorkingEntry::Cold { placeholder, token_count, .. } => {
-                        ("cold".into(), placeholder.clone(), *token_count)
-                    }
-                };
-                crate::memory::window::MessageMeta {
-                    elapsed_turns: self.turns_executed.saturating_sub(idx as u32),
-                    relevance: if role == "User" || role == "Assistant" { 0.8 } else { 0.5 },
-                    recall_count: 0,
-                    is_tool_result: role == "User" && content.starts_with('['),
-                    tool_importance: 0.5,
-                    role,
-                    content,
-                    token_count,
-                    source_range: (idx, idx + 1),
-                }
-            })
-            .collect();
-
-        // 滑动窗口更新：按冷热评分重新分类
-        let updated = self.sliding_window.update(&messages);
-        if !updated.is_empty() {
-            self.working_memory.replace_entries(updated);
-        }
-
-        let current_tokens = self.working_memory.used_tokens();
-        let max_tokens = self.working_memory.max_tokens();
-        tracing::debug!(
-            "滑动窗口更新完成：turn={}, tokens={}/{}",
-            self.turns_executed, current_tokens, max_tokens
-        );
     }
 
     /// 检查是否达到最大轮次
@@ -845,80 +349,6 @@ impl ThinkerNode {
         let canonical = serde_json::to_string(args).unwrap_or_else(|_| args.to_string());
         canonical.hash(&mut hasher);
         hasher.finish()
-    }
-
-    /// 运行 5 层压缩管道（在每次回到 sampler 前调用）
-    ///
-    /// 管道顺序：
-    /// 1. MicroCompact：清除旧工具结果（按消息数阈值）
-    /// 2. Context Collapse：LLM 摘要压缩早期轮次（按 token 占用率）
-    /// 3. Auto Compact：全量压缩（最后手段）
-    fn run_compaction_pipeline(&mut self) {
-        let current_tokens = self.working_memory.used_tokens();
-        let max_tokens = self.working_memory.max_tokens();
-        let _usage_percent = if max_tokens > 0 {
-            (current_tokens * 100) / max_tokens
-        } else {
-            0
-        };
-
-        // 层 1：MicroCompact — 清除旧工具结果
-        let msg_count = self.working_memory.entries().len();
-        if msg_count > self.compaction_config.microcompact_threshold
-            && msg_count > self.last_microcompact_count
-        {
-            let result = self.working_memory.compact();
-            self.last_microcompact_count = self.working_memory.entries().len();
-            tracing::info!(
-                "压缩管道 L1 MicroCompact：compacted={}, tokens {}→{}",
-                result.entries_compacted, result.tokens_before, result.tokens_after
-            );
-        }
-
-        // 重新计算占用率（MicroCompact 可能已释放空间）
-        let current_tokens = self.working_memory.used_tokens();
-        let usage_percent = if max_tokens > 0 {
-            (current_tokens * 100) / max_tokens
-        } else {
-            0
-        };
-
-        // 层 2：Context Collapse — LLM 摘要（需要外部 sampler，此处标记）
-        if usage_percent > self.compaction_config.collapse_threshold_percent
-            && !self.context_collapse_active
-        {
-            tracing::info!(
-                "压缩管道 L2 Context Collapse 触发：usage={}%>{}%",
-                usage_percent, self.compaction_config.collapse_threshold_percent
-            );
-            self.context_collapse_active = true;
-            // 通过 working_memory 的 compact 做本地摘要（不依赖外部 LLM）
-            let result = self.working_memory.compact();
-            self.context_collapse_active = false;
-            tracing::info!(
-                "压缩管道 L2 Context Collapse 完成：tokens {}→{}",
-                result.tokens_before, result.tokens_after
-            );
-        }
-
-        // 层 3：Auto Compact — 最后手段
-        let current_tokens = self.working_memory.used_tokens();
-        let usage_percent = if max_tokens > 0 {
-            (current_tokens * 100) / max_tokens
-        } else {
-            0
-        };
-        if usage_percent > self.compaction_config.auto_compact_threshold_percent {
-            tracing::warn!(
-                "压缩管道 L3 Auto Compact 触发：usage={}%>{}%，强制压缩",
-                usage_percent, self.compaction_config.auto_compact_threshold_percent
-            );
-            let result = self.working_memory.compact();
-            tracing::info!(
-                "压缩管道 L3 Auto Compact 完成：tokens {}→{}",
-                result.tokens_before, result.tokens_after
-            );
-        }
     }
 
     /// 处理反射弧 motor 指令（来自 Kernel ReflexRouter）

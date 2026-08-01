@@ -1372,6 +1372,84 @@ impl Kernel {
                 }
             }
 
+            // cortex/erl_trajectory — ERL 轨迹提取请求（来自 ThinkerNode turn 结束）
+            "cortex/erl_trajectory" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
+                if let Ok(trajectory) = serde_json::from_value::<crate::agent::experiential::TaskTrajectory>(
+                    payload["trajectory"].clone()
+                ) {
+                    // 调用 ERL 提取 heuristics
+                    let heuristics = self.erl().extract_heuristics(&trajectory);
+                    if !heuristics.is_empty() {
+                        // 将最重要的 heuristic 回传给 ThinkerNode
+                        let best = heuristics.iter()
+                            .max_by(|a, b| a.relevance_score.partial_cmp(&b.relevance_score).unwrap_or(std::cmp::Ordering::Equal))
+                            .expect("heuristics non-empty");
+                        let result = serde_json::json!({
+                            "heuristic": best.content,
+                            "from_success": best.from_success,
+                            "relevance": best.relevance_score,
+                        });
+                        if let Ok(result_msg) = FrameCodec::new_message(
+                            Topic::new("cortex/erl_heuristic"),
+                            "kernel",
+                            &result,
+                        ) {
+                            if let Err(e) = self.route_and_forward(&result_msg, transport).await {
+                                tracing::warn!("发送 ERL heuristic 结果失败：{}", e);
+                            }
+                        }
+                        tracing::info!(
+                            target: "ccore::erl",
+                            count = heuristics.len(),
+                            best_score = best.relevance_score,
+                            "ERL 从轨迹提取了 {} 条 heuristics",
+                            heuristics.len()
+                        );
+                    }
+                }
+            }
+
+            // cortex/goal_verify — GoalLoop 子任务验证请求（来自 ThinkerNode）
+            "cortex/goal_verify" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
+                let verification = payload["verification"].as_str().unwrap_or("");
+                let agent_id = payload["agent_id"].as_str().unwrap_or("");
+
+                // 验证策略：检查最近工具执行结果是否包含验证关键词
+                // 这是简化验证——生产中应调用 LLM 评估模型判断（类似 Claude Code 的评估模型）
+                let recent_outcome = self.experience_log.lock().await.recent_outcome_summary();
+                let passed = !verification.is_empty() && (
+                    recent_outcome.contains("success")
+                    || recent_outcome.contains("passed")
+                    || recent_outcome.contains("ok")
+                    || !recent_outcome.is_empty() && verification.len() < 30
+                );
+
+                tracing::info!(
+                    target: "ccore::goal",
+                    agent_id,
+                    verification,
+                    passed,
+                    "GoalLoop 验证结果：{}", if passed { "通过" } else { "未通过" }
+                );
+
+                // 回传验证结果
+                let result = serde_json::json!({
+                    "passed": passed,
+                    "verification": verification,
+                });
+                if let Ok(result_msg) = FrameCodec::new_message(
+                    Topic::new("cortex/goal_verify_result"),
+                    "kernel",
+                    &result,
+                ) {
+                    if let Err(e) = self.route_and_forward(&result_msg, transport).await {
+                        tracing::warn!("发送 GoalLoop 验证结果失败：{}", e);
+                    }
+                }
+            }
+
             // 控制面路由消息：经 Kernel ROUTER 转发到订阅者
             // ROS 1 风格：tool_call、tool_result、agent/output 等控制面消息
             // 通过 DEALER↔ROUTER 连接传输，Node 没有直连通道，必须经 Kernel 中转。

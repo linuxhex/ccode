@@ -161,6 +161,14 @@ impl ExperienceLog {
             .collect()
     }
 
+    /// 获取最近执行结果的摘要文本
+    pub fn recent_outcome_summary(&self) -> String {
+        self.entries.iter().rev().take(5)
+            .filter_map(|e| if e.result { Some("success") } else { Some("failure") })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     /// 清空日志
     pub fn clear(&mut self) {
         self.entries.clear();

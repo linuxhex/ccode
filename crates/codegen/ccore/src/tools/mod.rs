@@ -21,6 +21,7 @@ pub mod lsp;
 pub mod output_formatter;
 pub mod path_validator;
 pub mod permission;
+pub mod project_context;
 pub mod prompts;
 pub mod read_tracker;
 pub mod rustfmt_hook;
