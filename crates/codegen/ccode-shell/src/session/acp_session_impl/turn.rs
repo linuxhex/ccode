@@ -741,6 +741,8 @@ impl SessionActor {
         }
         self.drain_between_turn_completions().await;
         self.inject_workflow_status_reminder().await;
+        // ccore Context Engine：意图检索注入相关代码上下文
+        self.inject_context_engine_results(&user_message);
         let user_message = if user_images.is_empty() {
             user_message
         } else if self.is_cursor_harness() {
@@ -910,14 +912,14 @@ impl SessionActor {
                     .await;
 
                 // 根据采样轮结果驱动状态机转换
-                let loop_action = if let Ok(TurnOutcome::Completed { refusal, .. }) = &round {
+                let loop_action = if let Ok(TurnOutcome::Completed { refusal, tools_called, .. }) = &round {
                     if refusal.is_some() {
                         // 模型拒绝：状态机转换到 Done
                         loop_sm.transition(
                             ccode_agent::loop_state::LoopEvent::LLMResponse {
                                 stop_reason: "end_turn".to_string(),
                                 token_used: 0,
-                                tool_calls: vec![],
+                                tool_calls: tools_called.iter().map(|n| (String::new(), n.clone(), serde_json::Value::Null)).collect(),
                             },
                         )
                     } else {
@@ -929,12 +931,17 @@ impl SessionActor {
                                 },
                             )
                         } else {
-                            // 正常完成一轮，状态机记录并回到 CallingLLM
+                            // 正常完成一轮：根据是否有工具调用决定 stop_reason
+                            let stop_reason = if tools_called.is_empty() {
+                                "end_turn".to_string()
+                            } else {
+                                "tool_use".to_string()
+                            };
                             loop_sm.transition(
                                 ccode_agent::loop_state::LoopEvent::LLMResponse {
-                                    stop_reason: "tool_use".to_string(),
+                                    stop_reason,
                                     token_used: 0,
-                                    tool_calls: vec![],
+                                    tool_calls: tools_called.iter().map(|n| (String::new(), n.clone(), serde_json::Value::Null)).collect(),
                                 },
                             )
                         }

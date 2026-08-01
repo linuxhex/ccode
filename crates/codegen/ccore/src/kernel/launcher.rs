@@ -17,6 +17,8 @@
 //! - TUI：用户交互（= Ear + Mouth 交互层）
 //! - Acp：IDE/stdio ACP client 与消息总线边界
 
+use std::sync::Arc;
+
 use crate::kernel::{KernelConfig, KernelRuntimeConfig};
 use crate::node::{
     NodeId, NodeType, NodeContext,
@@ -32,6 +34,7 @@ use crate::node::transport::run_node;
 use crate::agent::AgentConfig;
 use crate::agent::AgentType;
 use crate::agent::subagent::{SubAgentNode, SubAgentDefinition};
+use crate::tools::hook_bridge::HookDispatcher;
 
 /// Node 进程描述
 #[derive(Debug, Clone)]
@@ -49,6 +52,8 @@ pub struct NodeLauncher {
     runtime_config: KernelRuntimeConfig,
     /// 情景记忆存储（与 Kernel 共享同一实例）
     episodic_memory: std::sync::Arc<crate::memory::episodic::EpisodicMemoryStore>,
+    /// HookDispatcher 桥接（可选，由产品层注入 ccode-hooks 适配器）
+    hook_dispatcher: Option<Arc<dyn HookDispatcher>>,
     /// 已启动的 Node 描述
     launched_nodes: Vec<NodeDescriptor>,
     /// 已启动的 Node 任务 JoinHandle（用于优雅关闭）
@@ -65,9 +70,15 @@ impl NodeLauncher {
             kernel_config,
             runtime_config,
             episodic_memory,
+            hook_dispatcher: None,
             launched_nodes: Vec::new(),
             task_handles: Vec::new(),
         }
+    }
+
+    /// 设置 HookDispatcher（由产品层注入 ccode-hooks 适配器）
+    pub fn set_hook_dispatcher(&mut self, dispatcher: Arc<dyn HookDispatcher>) {
+        self.hook_dispatcher = Some(dispatcher);
     }
 
     /// 获取 NodeContext（供各 Node 连接消息总线）
@@ -113,7 +124,12 @@ impl NodeLauncher {
         let tool_ctx = self.node_context();
         let tool_id = NodeId::new();
         let tool_id_clone = tool_id.clone();
-        let tool = ToolNode::new(tool_id.clone());
+        let mut tool = ToolNode::new(tool_id.clone());
+
+        // 注入 HookDispatcher 桥接（如果产品层已设置）
+        if let Some(dispatcher) = self.hook_dispatcher.take() {
+            tool.set_hook_dispatcher(dispatcher);
+        }
 
         // 4. Thinker Node
         let thinker_ctx = self.node_context();

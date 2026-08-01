@@ -525,6 +525,25 @@ impl SessionActor {
         self.push_system_reminder(INTERRUPT_REMINDER);
         tracing::debug!("Injected prior-turn interrupt reminder");
     }
+
+    /// 注入 Context Engine 意图检索结果到对话上下文。
+    ///
+    /// 在每次用户输入后调用 IntentRetriever，将检索到的相关代码块
+    /// 注入为 system reminder，让 LLM 在回答时自动感知相关代码。
+    pub(super) fn inject_context_engine_results(&self, user_message: &str) {
+        let results = self.ccore_state.search_by_intent(user_message, 5);
+        if results.is_empty() {
+            return;
+        }
+        let context = crate::session::ccore_integration::CcoreSessionState::format_retrieval_context(&results);
+        if !context.is_empty() {
+            self.push_system_reminder(&context);
+            tracing::debug!(
+                result_count = results.len(),
+                "Context Engine：注入意图检索上下文"
+            );
+        }
+    }
     /// Push a `<system-reminder>`-wrapped user message into the conversation.
     pub(super) fn push_system_reminder(&self, content: &str) {
         self.push_system_reminder_with_tag(content, "system-reminder");

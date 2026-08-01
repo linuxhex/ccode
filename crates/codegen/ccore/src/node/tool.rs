@@ -28,6 +28,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 
 use crate::message::frame::FrameCodec;
@@ -38,6 +39,7 @@ use crate::metrics::AgentMetrics;
 use crate::node::{Node, NodeId, NodeType, NodeContext, PermissionMode};
 use crate::node::transport::NodeTransportHandle;
 use crate::tools::bridge::ToolBridge;
+use crate::tools::hook_bridge::{HookDecision, HookDispatcher, NoOpHookDispatcher, ToolCallContext};
 use crate::tools::ToolCallRequest;
 
 /// 默认最大并发工具执行数
@@ -54,6 +56,8 @@ pub struct ToolNode {
     concurrency_semaphore: Semaphore,
     /// 待处理的权限请求（tool_call_id → oneshot sender）
     pending_permissions: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// Hook 桥接 dispatcher（解耦 ccode-hooks 的 trait object，默认 NoOp）
+    hook_dispatcher: Arc<dyn HookDispatcher>,
     /// Hook 注册表（PreToolUse/PostToolUse 等事件分发）
     hook_registry: Option<ccode_hooks::discovery::HookRegistry>,
     /// 权限规则集（allow/deny/ask 规则引擎）
@@ -70,10 +74,16 @@ impl ToolNode {
             permission_mode: PermissionMode::Trust,
             concurrency_semaphore: Semaphore::new(DEFAULT_MAX_CONCURRENT_TOOLS),
             pending_permissions: Mutex::new(HashMap::new()),
+            hook_dispatcher: Arc::new(NoOpHookDispatcher),
             hook_registry: None,
             permission_rules: None,
             auto_mode: false,
         }
+    }
+
+    /// 设置 HookDispatcher（注入 Hook 桥接实现）
+    pub fn set_hook_dispatcher(&mut self, dispatcher: Arc<dyn HookDispatcher>) {
+        self.hook_dispatcher = dispatcher;
     }
 
     /// 设置 Hook 注册表（接入 PreToolUse/PostToolUse 事件分发）
@@ -160,8 +170,55 @@ impl ToolNode {
             }
         };
 
+        // ── 阶段 0：HookDispatcher 桥接 PreToolUse ──
+        let hook_dispatcher_input = {
+            let ctx = ToolCallContext {
+                tool_name: request.tool_name.clone(),
+                input: request.arguments.clone(),
+                agent_id: request.agent_id.clone(),
+                working_dir: std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
+            match self.hook_dispatcher.pre_tool_use(&ctx).await {
+                HookDecision::Allow => None,
+                HookDecision::Deny(reason) => {
+                    tracing::info!(
+                        "HookDispatcher 拒绝工具执行：tool={}, reason={}",
+                        request.tool_name, reason
+                    );
+                    let result_msg = FrameCodec::new_message(
+                        Topic::agent_tool_result(&request.agent_id),
+                        self.id.as_str(),
+                        &serde_json::json!({
+                            "tool_call_id": request.tool_call_id,
+                            "output": format!("工具 {} 被 Hook 拒绝：{}", request.tool_name, reason),
+                            "success": false,
+                            "duration_ms": 0,
+                        }),
+                    )?;
+                    if let Err(_) = transport.publish_data(&result_msg).await {
+                        transport.send_message(&result_msg).await?;
+                    }
+                    return Ok(());
+                }
+                HookDecision::Rewrite { updated_input, additional_context } => {
+                    if let Some(ctx_info) = additional_context {
+                        tracing::info!(
+                            "HookDispatcher 改写工具参数：tool={}, 附加上下文={}",
+                            request.tool_name, ctx_info
+                        );
+                    } else {
+                        tracing::info!("HookDispatcher 改写工具参数：tool={}", request.tool_name);
+                    }
+                    Some(updated_input)
+                }
+            }
+        };
+
         // ── 阶段 1：PreToolUse Hook + 权限规则引擎 ──
-        let mut effective_input = request.arguments.clone();
+        // 使用 HookDispatcher 可能改写过的参数作为初始值
+        let mut effective_input = hook_dispatcher_input.unwrap_or_else(|| request.arguments.clone());
         if let Some(ref registry) = self.hook_registry {
             let cwd = std::env::current_dir()
                 .unwrap_or_default()
@@ -346,6 +403,19 @@ impl ToolNode {
             .record_tool_execution_time(&effective_request.tool_name, result.duration_ms as f64);
         if !result.success {
             AgentMetrics::global().record_error("tool_execution_failed");
+        }
+
+        // ── HookDispatcher 桥接 PostToolUse ──
+        {
+            let ctx = ToolCallContext {
+                tool_name: effective_request.tool_name.clone(),
+                input: effective_request.arguments.clone(),
+                agent_id: effective_request.agent_id.clone(),
+                working_dir: std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
+            self.hook_dispatcher.post_tool_use(&ctx, &result.output, result.success).await;
         }
 
         // ── 阶段 4：PostToolUse Hook ──

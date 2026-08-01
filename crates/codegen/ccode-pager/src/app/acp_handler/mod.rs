@@ -393,6 +393,10 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         plan_mode_modal_refresh_needed |=
                             detect_plan_mode_change(&notif.request.update, agent);
 
+                        // 将 ACP SessionUpdate 馈送到流式渲染器
+                        // （在 handle_update 之前调用，因为后者消耗 update）
+                        agent.feed_streaming_update(&notif.request.update);
+
                         let had_activity_before = agent.session.tracker.activity().is_some();
                         agent.session.handle_update(
                             notif.request.update,

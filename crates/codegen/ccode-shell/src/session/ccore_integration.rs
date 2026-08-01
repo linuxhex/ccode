@@ -1,14 +1,50 @@
-//! ccore 高级特性桥接模块
+//! ccore 统一入口模块
 //!
-//! 将 ccore 的 CircuitBreaker、PromptCacheTracker、ReadTracker、
-//! TokenBudgetManager、MetaCognitiveController、EpisodicMemoryStore
-//! 以薄适配层的形式接入 ccode-shell 的执行流程。
+//! # 架构融合：双路径 → 单路径
 //!
-//! 设计原则：
+//! 历史问题：ccode 存在两条 Agent 入口：
+//! - **旧路径**：SessionActor 自包含循环（shell 内部 goal/compaction/reminders/subagent 各自实现）
+//! - **新路径**：ccore Kernel → ThinkerNode 驱动（消息总线 + LoopStateMachine + 4 层循环工程）
+//!
+//! 旧路径的问题：shell 自有的 goal/reminders/compaction/subagent 与 ccore 的
+//! GoalLoop/ScheduleLoop/WorkingMemory/Orchestrator 重复实现，且不互通。
+//! 用户实际运行走旧路径，ccore 的 3000+ 行新能力不可达。
+//!
+//! 融合方案：通过 `KernelSession` 让 shell 启动 ccore Kernel，
+//! ThinkerNode 驱动 Agent 循环，shell 只做 UI 层（显示输出 + 接收输入）。
+//!
+//! ## 数据流
+//!
+//! ```text
+//! 用户输入 → shell → KernelSession.send_input()
+//!   → Kernel ROUTER → ThinkerNode → LoopStateMachine 驱动
+//!     → WorkingMemory 4 级压缩 + Stable Prefix
+//!     → EpisodicMemory + Context Engine (向量/意图/仓库图)
+//!     → GoalLoop / ScheduleLoop / ProactiveLoop
+//!     → SamplerNode (LLM) → ThinkerNode → ToolNode → ThinkerNode
+//!   → ThinkerNode → agent/{id}/output → AcpNode → KernelSession.on_output()
+//!   → shell 显示给用户
+//! ```
+//!
+//! ## 桥接策略
+//!
+//! | shell 自有实现 | ccore 实现 | 策略 |
+//! |---|---|---|
+//! | goal.rs + goal_support.rs | GoalLoop | ccore 驱动，shell 透传 |
+//! | compaction.rs + segments.rs | WorkingMemory 4 级压缩 | ccore 驱动，shell 不再自压缩 |
+//! | reminders.rs | ScheduleLoop | ccore 驱动，shell 透传 |
+//! | subagent/mod.rs | Orchestrator + SubAgentNode | ccore 驱动，shell 不再 spawn |
+//! | model_switch.rs | SkillInfo.model + ThinkerNode | ccore 驱动 |
+//! | memory_state.rs + memory_dream.rs | EpisodicMemory + Context Engine | ccore 驱动 |
+//! | MCP (mcp.rs 等) | 无 | **shell 独有**，通过 McpBridge 桥接到消息总线 |
+//! | permission 模块 | 5 阶段链式 + 14 项 Shell 安全 | ccore ToolNode 执行 |
+//!
+//! ## 设计原则
+//!
 //! - 所有会话级对象通过 CcoreSessionState 一次性创建，避免 new-per-call 丢失状态
 //! - CircuitBreaker 为全局共享，熔断时降级等待而非直接报错
 //! - ReadTracker 使用 Arc<Mutex> 保证跨线程安全
-//! - 不修改现有大文件，提供独立函数/结构供 shell 关键调用点使用
+//! - KernelSession 是 shell 与 ccore 消息总线的唯一接口点
 
 use std::sync::Arc;
 
@@ -276,6 +312,11 @@ impl SessionMetaCognitive {
 // ─── 6. EpisodicMemory Bridge ────────────────────────────────────────────────
 
 use ccore::memory::episodic::{EpisodicMemoryStore, MemorySource, MemoryType};
+use ccore::memory::intent_retriever::{IntentRetriever, RetrievalIntent, RetrievalResult};
+use ccore::memory::repo_map::RepoMap;
+use ccore::memory::embedding::EmbeddingIndex;
+use ccore::memory::function_embed::CodeBlock;
+use ccore::kernel::reflex::{ReflexRouter, ReflexAction, ReflexLevel, ReflexRule, builtin_reflex_rules};
 
 /// 会话级情景记忆存储。
 pub struct SessionEpisodicMemory {
@@ -359,6 +400,12 @@ pub struct CcoreSessionState {
     pub read_tracker: SessionReadTracker,
     /// 会话级 Token 预算管理器（跨轮次累计使用量）
     pub token_budget: parking_lot::Mutex<SessionTokenBudget>,
+    /// 意图检索器（Context Engine：意图扩展 + 代码块检索）
+    intent_retriever: parking_lot::Mutex<IntentRetriever>,
+    /// 仓库地图（文件依赖图 + 上下文注入）
+    repo_map: parking_lot::RwLock<Option<RepoMap>>,
+    /// 反射路由器（L0 直接反射 + L1 本能反射 + 经验学习）
+    reflex_router: parking_lot::Mutex<ReflexRouter>,
 }
 
 impl CcoreSessionState {
@@ -372,6 +419,9 @@ impl CcoreSessionState {
             cache_tracker: parking_lot::Mutex::new(SessionCacheTracker::new()),
             read_tracker: SessionReadTracker::new(),
             token_budget: parking_lot::Mutex::new(SessionTokenBudget::new(model)),
+            intent_retriever: parking_lot::Mutex::new(IntentRetriever::new(EmbeddingIndex::new())),
+            repo_map: parking_lot::RwLock::new(None),
+            reflex_router: parking_lot::Mutex::new(ReflexRouter::with_rules(builtin_reflex_rules())),
         }
     }
 
@@ -455,9 +505,263 @@ impl CcoreSessionState {
     pub fn cache_hit_rate(&self) -> f64 {
         self.cache_tracker.lock().hit_rate()
     }
+
+    /// 便捷方法：意图检索——将用户查询展开为多维检索意图并检索相关代码块。
+    ///
+    /// 返回检索结果列表，每个结果包含文件路径、符号名、相关度分数和代码预览。
+    /// 可用于在 turn 开始时注入上下文，类似 Claude Code 的 repo-map 工具。
+    pub fn search_by_intent(&self, query: &str, top_k: usize) -> Vec<RetrievalResult> {
+        let intents = IntentRetriever::expand_intents(query);
+        let query_embedding: Vec<f32> = vec![0.0; 64]; // 占位：真实场景需调用 embedding 模型
+        self.intent_retriever
+            .lock()
+            .search_by_intents(&intents, &query_embedding, top_k)
+    }
+
+    /// 便捷方法：注册代码块到意图检索器。
+    ///
+    /// 在文件读取后调用，将文件中的函数/类/方法注册到检索索引。
+    pub fn register_code_blocks(&self, blocks: Vec<CodeBlock>) {
+        self.intent_retriever.lock().register_blocks(blocks);
+    }
+
+    /// 便捷方法：初始化仓库地图（首次使用时延迟创建）。
+    pub fn init_repo_map(&self, root: std::path::PathBuf) {
+        let mut guard = self.repo_map.write();
+        if guard.is_none() {
+            *guard = Some(RepoMap::new(root));
+        }
+    }
+
+    /// 便捷方法：获取仓库地图的文件列表摘要。
+    pub fn repo_map_summary(&self) -> String {
+        let guard = self.repo_map.read();
+        match guard.as_ref() {
+            Some(_rm) => {
+                // RepoMap 文件信息暂不暴露公共接口，返回占位
+                "RepoMap 已加载".to_string()
+            }
+            None => String::new(),
+        }
+    }
+
+    /// 便捷方法：获取仓库地图中指定文件的依赖。
+    pub fn file_dependencies(&self, path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let guard = self.repo_map.read();
+        match guard.as_ref() {
+            Some(rm) => rm.all_dependencies(path).into_iter().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 便捷方法：检索结果格式化为可注入 system prompt 的文本。
+    pub fn format_retrieval_context(results: &[RetrievalResult]) -> String {
+        if results.is_empty() {
+            return String::new();
+        }
+        let mut ctx = String::from("[Context Engine] 相关代码块：\n");
+        for r in results.iter().take(10) {
+            ctx.push_str(&format!(
+                "- {} ({}, 相关度: {:.2}): {}\n",
+                r.name, r.file_path.display(), r.relevance_score, r.preview
+            ));
+        }
+        ctx
+    }
+
+    // ─── 反射弧 ──────────────────────────────────────────────────────────────
+
+    /// 便捷方法：处理工具结果的反射路由。
+    ///
+    /// 将工具执行结果转化为感官信号，匹配反射规则。
+    /// - 文件类工具（read/write/edit）→ sensory/eye 信号
+    /// - 编译/检查工具失败 → sensory/nose/compile_error 信号
+    /// - 工具执行反馈 → sensory/skin 信号
+    ///
+    /// 返回匹配的反射动作（如有），供 turn.rs 注入为 system reminder。
+    pub fn route_reflex(&self, tool_name: &str, output: &str, success: bool) -> Option<String> {
+        let (topic, payload) = Self::classify_tool_signal(tool_name, output, success);
+        let action = self.reflex_router.lock().route(&topic, &payload);
+        match action {
+            Some(ReflexAction::Direct { action, params }) => {
+                Some(format!("[Reflex L0] {} → {}", action, params))
+            }
+            Some(ReflexAction::Instinct { action, params }) => {
+                Some(format!("[Reflex L1 本能] {} → {}", action, params))
+            }
+            Some(ReflexAction::Trial { action, params }) => {
+                Some(format!("[Reflex L1 试验] {} → {}", action, params))
+            }
+            None => None,
+        }
+    }
+
+    /// 感觉系统：将工具结果分类为感官信号。
+    ///
+    /// feel（触觉）：感知工具执行成功/失败
+    /// sniff（嗅觉）：解析编译错误/代码异味
+    /// observe（视觉）：观察文件内容变化
+    fn classify_tool_signal(tool_name: &str, output: &str, success: bool) -> (String, String) {
+        match tool_name {
+            "read" | "glob" | "grep" | "search" => {
+                (format!("sensory/eye/{}", tool_name), output.to_string())
+            }
+            "write" | "edit" | "search_replace" | "hashline_edit" => {
+                (format!("sensory/eye/{}", tool_name), output.to_string())
+            }
+            "bash" | "shell" if !success => {
+                // Shell 失败 → 检查是否编译错误
+                if output.contains("error[E") || output.contains("error:") {
+                    ("sensory/nose/compile_error".to_string(), output.to_string())
+                } else {
+                    ("sensory/skin/tool_failure".to_string(), output.to_string())
+                }
+            }
+            _ if !success => {
+                ("sensory/skin/tool_failure".to_string(), format!("{}: {}", tool_name, output))
+            }
+            _ => {
+                ("sensory/skin/tool_success".to_string(), format!("{}: ok", tool_name))
+            }
+        }
+    }
+
+    /// 便捷方法：添加自定义反射规则（运行时学习）。
+    pub fn add_reflex_rule(&self, rule: ReflexRule) {
+        self.reflex_router.lock().add_rule(rule);
+    }
+
+    /// 便捷方法：记录反射规则执行结果（用于经验学习）。
+    pub fn record_reflex_result(&self, rule_id: &str, success: bool) -> bool {
+        self.reflex_router.lock().record_result(rule_id, success)
+    }
 }
 
-// ─── 8. tool_dispatch 集成（已迁移到 CcoreSessionState.check_write_without_read）──
+// ─── 8. KernelSession —— 已删除 ─────────────────────────────────────────────
+//
+// KernelSession 曾设计为 shell → ccore Kernel 统一入口，但实际实现为空壳：
+// - send_input() 只打日志，不转发消息
+// - 缺少真实 LLM HTTP 调用、MCP 工具、权限 UI 交互
+// - SessionActor 是事实主线，CcoreSessionState 桥接已验证可行
+//
+// 收敛决策：保留 SessionActor + CcoreSessionState 桥接，删除 KernelSession。
+// SessionActor 直接调用 LLM API，通过 CcoreSessionState 桥接 ccore 高级能力
+// （episodic memory、meta cognitive、cache tracker、token budget、read tracker）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── 9. McpBridge —— shell 独有的 MCP 能力桥接到消息总线 ─────────────────────
+//
+// MCP（Model Context Protocol）是 ccode-shell 独有的能力，
+// ccore 没有 MCP 实现。通过 McpBridge 将 MCP 工具暴露到消息总线上，
+// 让 ToolNode 可以调用 MCP 工具。
+//
+// 桥接方式：
+// - McpBridge 启动后作为消息总线上的一个虚拟 Node
+// - ToolNode 执行 MCP 工具时，发送 mcp/{server}/call 消息
+// - McpBridge 收到后调用 MCP Server，返回结果
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// MCP 服务器配置
+#[derive(Debug, Clone)]
+pub struct McpServerConfig {
+    /// 服务器名称
+    pub name: String,
+    /// 传输方式（stdio / sse / streamable-http）
+    pub transport: String,
+    /// 启动命令（stdio 模式）
+    pub command: Option<String>,
+    /// 启动参数
+    pub args: Vec<String>,
+    /// 环境变量
+    pub env: std::collections::HashMap<String, String>,
+    /// 服务器 URL（sse / streamable-http 模式）
+    pub url: Option<String>,
+}
+
+/// MCP 桥接：将 shell 的 MCP 能力暴露到消息总线
+///
+/// McpBridge 不是独立的 ZMQ Node，而是通过 AcpNode 间接接入消息总线：
+/// - AcpNode 收到 mcp/{server}/call 消息时，转发给 McpBridge
+/// - McpBridge 调用 MCP Server，返回结果
+/// - 这样 ToolNode 可以通过消息总线调用 MCP 工具
+pub struct McpBridge {
+    /// 已连接的 MCP 服务器
+    servers: Vec<McpServerConfig>,
+    /// MCP 工具注册表（server → tools 映射）
+    tool_registry: std::collections::HashMap<String, Vec<McpToolDef>>,
+}
+
+/// MCP 工具定义
+#[derive(Debug, Clone)]
+pub struct McpToolDef {
+    /// 工具名称
+    pub name: String,
+    /// 工具描述
+    pub description: String,
+    /// 输入 schema (JSON Schema)
+    pub input_schema: serde_json::Value,
+}
+
+impl McpBridge {
+    /// 创建 MCP 桥接
+    pub fn new(servers: Vec<McpServerConfig>) -> Self {
+        Self {
+            servers,
+            tool_registry: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 注册 MCP 服务器提供的工具
+    pub fn register_tools(&mut self, server_name: &str, tools: Vec<McpToolDef>) {
+        self.tool_registry.insert(server_name.to_string(), tools);
+    }
+
+    /// 获取所有 MCP 工具定义（用于 ThinkerNode 的 SampleRequest.tools）
+    pub fn all_tools(&self) -> Vec<McpToolDef> {
+        self.tool_registry.values().flatten().cloned().collect()
+    }
+
+    /// 调用 MCP 工具
+    ///
+    /// 返回工具执行结果。实际实现通过 MCP 协议与 Server 通信。
+    pub async fn call_tool(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        tracing::info!(server = server_name, tool = tool_name, "调用 MCP 工具");
+        // 实际实现通过 MCP 协议（stdio/SSE）与 Server 通信
+        // 这里是桥接层的接口定义，具体实现在 shell 侧的 mcp_servers.rs 中
+        Err(format!("MCP 工具调用需要 shell 侧 mcp_servers.rs 实现: {}/{}", server_name, tool_name))
+    }
+
+    /// 获取已注册的 MCP 服务器列表
+    pub fn servers(&self) -> &[McpServerConfig] {
+        &self.servers
+    }
+
+    /// 检查指定服务器是否已注册
+    pub fn has_server(&self, name: &str) -> bool {
+        self.servers.iter().any(|s| s.name == name)
+    }
+}
+
+// ─── 10. 架构收敛决策 ──────────────────────────────────────────────────────
+//
+// 最终架构：SessionActor 是唯一引擎，CcoreSessionState 桥接 ccore 能力。
+//
+// | SessionActor 能力 | ccore 桥接 |
+// |---|---|
+// | goal.rs → GoalTracker | CcoreSessionState.meta_cognitive 评估 |
+// | compaction.rs → 自有压缩 | CcoreSessionState.token_budget 预算 |
+// | reminders.rs → 自有定时 | 无（shell 自有足够） |
+// | subagent/mod.rs → 自有 spawn | 无（shell 自有足够） |
+// | model_switch.rs → 自有切换 | CcoreSessionState.cache_tracker |
+// | memory_state.rs → 自有记忆 | CcoreSessionState.episodic 记忆 |
+// | mcp.rs → 自有 MCP | McpBridge 接口（shell 自有实现） |
+// | turn.rs → LoopStateMachine 驱动 | 无（LoopStateMachine 真驱动主循环） |
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

@@ -67,6 +67,7 @@ use crate::message::param::ParamServer;
 use crate::node::{NodeId, NodeType, NodeContext};
 use crate::sampler::token_budget::TokenBudgetManager;
 use crate::retry::circuit_breaker::CircuitBreaker;
+use crate::mcp_server::{McpServerHandle, McpServerConfig, McpTransportKind, McpServer};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Mutex, watch};
 
@@ -85,6 +86,10 @@ pub struct KernelConfig {
     pub health_check_interval_secs: u64,
     /// 工作目录
     pub working_dir: String,
+    /// 是否启用 MCP Server
+    pub mcp_server_enabled: bool,
+    /// MCP Server 传输方式
+    pub mcp_transport: McpTransportKind,
 }
 
 impl Default for KernelConfig {
@@ -99,6 +104,8 @@ impl Default for KernelConfig {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
+            mcp_server_enabled: false,
+            mcp_transport: McpTransportKind::Stdio,
         }
     }
 }
@@ -186,6 +193,14 @@ pub struct Kernel {
     circuit_breaker: Arc<CircuitBreaker>,
     /// 注册通知发送端（Node 注册成功时发送当前注册数量，用于事件驱动等待）
     registration_notify_tx: watch::Sender<usize>,
+    /// MCP Server 句柄（可选，启用时持有）
+    mcp_server: Option<McpServerHandle>,
+    /// MCP Server 工具调用请求接收端（从 MCP Server 经 bus_tx 发来的工具调用请求）
+    mcp_bus_rx: Option<mpsc::Receiver<Message>>,
+    /// MCP Server 工具调用结果发送端（将 ToolNode 执行结果回传给 MCP Server）
+    mcp_bus_tx: Option<mpsc::Sender<Message>>,
+    /// HookDispatcher 桥接（可选，由产品层注入 ccode-hooks 适配器）
+    hook_dispatcher: Option<Arc<dyn crate::tools::hook_bridge::HookDispatcher>>,
 }
 
 impl Kernel {
@@ -227,6 +242,9 @@ impl Kernel {
         // 注册通知 channel（事件驱动：Node 注册时发送当前数量，替代轮询等待）
         let (registration_notify_tx, _registration_notify_rx) = watch::channel(0usize);
 
+        // MCP Server：如果启用则创建消息总线通道（句柄在 run() 中创建）
+        let mcp_server = None;
+
         Self {
             config,
             broker,
@@ -250,6 +268,10 @@ impl Kernel {
             token_budget: Arc::new(std::sync::Mutex::new(TokenBudgetManager::new("claude-3.5-sonnet"))),
             circuit_breaker: Arc::new(CircuitBreaker::new(crate::retry::circuit_breaker::CircuitBreakerConfig::default())),
             registration_notify_tx,
+            mcp_server,
+            mcp_bus_rx: None,
+            mcp_bus_tx: None,
+            hook_dispatcher: None,
         }
     }
 
@@ -258,6 +280,14 @@ impl Kernel {
     /// 产品层从 CcodeConfig 提取 KernelRuntimeConfig 后调用此方法。
     pub fn set_runtime_config(&mut self, config: KernelRuntimeConfig) {
         self.runtime_config = Some(Arc::new(RwLock::new(config)));
+    }
+
+    /// 设置 HookDispatcher 桥接。
+    ///
+    /// 产品层（ccode-shell）在创建 HookDispatcherAdapter 后调用此方法注入，
+    /// Kernel 在 spawn ToolNode 时将适配器传递给 ToolNode。
+    pub fn set_hook_dispatcher(&mut self, dispatcher: Arc<dyn crate::tools::hook_bridge::HookDispatcher>) {
+        self.hook_dispatcher = Some(dispatcher);
     }
 
     /// 获取情景记忆存储
@@ -332,6 +362,29 @@ impl Kernel {
             self.config.working_dir
         );
 
+        // 0. 如果启用 MCP Server，创建并启动
+        if self.config.mcp_server_enabled {
+            let (bus_tx, bus_rx) = tokio::sync::mpsc::channel::<Message>(64);
+
+            let mcp_config = McpServerConfig {
+                transport: self.config.mcp_transport.clone(),
+                name: "ccode-mcp".into(),
+                version: "0.1.0".into(),
+            };
+
+            let mcp_server = McpServer::new(mcp_config, bus_tx.clone());
+            let handle = mcp_server.run();
+
+            tracing::info!("MCP Server 已启动（传输方式：{:?}）", self.config.mcp_transport);
+
+            // 存储 bus_rx 到 Kernel 字段，在主事件循环中处理
+            // 存储 bus_tx 到 Kernel 字段，用于将 ToolNode 结果回传给 MCP Server
+            self.mcp_bus_rx = Some(bus_rx);
+            self.mcp_bus_tx = Some(bus_tx);
+
+            self.mcp_server = Some(handle);
+        }
+
         // 1. 启动 KernelTransport，取出作为独立变量避免借用冲突
         let mut transport = KernelTransport::new(
             &self.config.router_addr,
@@ -350,6 +403,10 @@ impl Kernel {
                 rtcfg,
                 self.episodic_memory.clone(),
             );
+            // 注入 HookDispatcher 桥接（如果产品层已设置）
+            if let Some(dispatcher) = self.hook_dispatcher.take() {
+                launcher.set_hook_dispatcher(dispatcher);
+            }
             match launcher.spawn_initial_set().await {
                 Ok(nodes) => {
                     let start_time = std::time::Instant::now();
@@ -594,6 +651,48 @@ impl Kernel {
                         }
                     }
                 }
+                // MCP Server 工具调用请求：从 bus_rx 接收，路由到 ToolNode
+                mcp_msg = async {
+                    match &mut self.mcp_bus_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<Message>>().await,
+                    }
+                } => {
+                    if let Some(msg) = mcp_msg {
+                        // MCP Server 的工具调用请求（topic: tool/call），
+                        // 转换为 agent/mcp-client/tool_call 格式让 ToolNode 处理
+                        let topic = msg.topic.as_str();
+                        let payload: serde_json::Value = FrameCodec::decode_payload(&msg)
+                            .unwrap_or(serde_json::Value::Null);
+
+                        tracing::debug!(
+                            topic = %topic,
+                            "MCP Server 工具调用请求已接收，路由到 ToolNode"
+                        );
+
+                        // 构造 ToolNode 标准格式的 tool_call 消息
+                        let tool_call_msg = FrameCodec::new_message(
+                            Topic::agent_tool_call("mcp-client"),
+                            "mcp-server",
+                            &payload,
+                        );
+                        match tool_call_msg {
+                            Ok(tool_call_msg) => {
+                                // 路由到订阅了该 topic 的 ToolNode
+                                if let Err(e) = self.route_and_forward(&tool_call_msg, &mut transport).await {
+                                    tracing::warn!("MCP 工具调用路由失败：{}", e);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("构造 MCP 工具调用消息失败：{}", e);
+                            }
+                        }
+                    } else {
+                        // bus_rx 通道已关闭（MCP Server 已停止），清空字段避免 busy-loop
+                        self.mcp_bus_rx = None;
+                        tracing::warn!("MCP Server bus_rx 通道已关闭，停止 MCP 消息路由");
+                    }
+                }
             }
         }
 
@@ -602,6 +701,13 @@ impl Kernel {
             target: "ccore::kernel",
             "graceful shutdown initiated"
         );
+
+        // 关闭 MCP Server
+        if let Some(mcp_handle) = self.mcp_server.take() {
+            mcp_handle.shutdown();
+            tracing::info!("MCP Server 已请求关闭");
+        }
+
         Self::broadcast_shutdown(&mut transport).await;
         transport.shutdown().await;
         tracing::info!(
@@ -991,6 +1097,88 @@ impl Kernel {
                 }
             }
 
+            // cortex/meta_assess — 元认知评估请求（来自 ThinkerNode）
+            "cortex/meta_assess" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
+                let context = payload["context"].as_str().unwrap_or("");
+                let agent_id = payload["agent_id"].as_str().unwrap_or("");
+
+                let meta = self.meta_cognitive();
+                // 构造上下文参数（ThinkerNode 只传 context 字符串，补充为 HashMap）
+                let ctx_map = std::collections::HashMap::from([
+                    ("source".to_string(), "thinker".to_string()),
+                    ("agent_id".to_string(), agent_id.to_string()),
+                ]);
+                let assessment = meta.assess_difficulty(context, &ctx_map);
+
+                // 将 context 拆分为步骤供冲突检测
+                let steps: Vec<String> = context
+                    .split(" | ")
+                    .map(|s| s.to_string())
+                    .collect();
+                let conflicts = meta.detect_conflicts(&steps);
+
+                let result = serde_json::json!({
+                    "difficulty": format!("{:?}", assessment),
+                    "conflicts": conflicts.iter().map(|c| serde_json::json!({
+                        "description": c.description.clone(),
+                    })).collect::<Vec<_>>(),
+                    "suggested_strategy": match assessment {
+                        crate::agent::meta_cognitive::DifficultyLevel::Trivial => "direct",
+                        crate::agent::meta_cognitive::DifficultyLevel::Moderate => "step_by_step",
+                        crate::agent::meta_cognitive::DifficultyLevel::Complex => "decompose",
+                        crate::agent::meta_cognitive::DifficultyLevel::Extreme => "multi_agent",
+                    },
+                });
+
+                // 通过消息总线发送结果回 ThinkerNode
+                if let Ok(result_msg) = FrameCodec::new_message(
+                    Topic::new("cortex/meta_result"),
+                    "kernel",
+                    &result,
+                ) {
+                    if let Err(e) = self.route_and_forward(&result_msg, transport).await {
+                        tracing::warn!("发送元认知评估结果失败：{}", e);
+                    }
+                }
+            }
+
+            // cortex/budget_check — Token 预算和熔断器检查（来自 ThinkerNode）
+            "cortex/budget_check" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
+                let agent_id = payload["agent_id"].as_str().unwrap_or("").to_string();
+
+                let budget_ok = {
+                    let budget = self.token_budget.lock().expect("token_budget lock");
+                    budget.can_fit(1000) // 预估每次调用消耗 1000 token
+                };
+                let circuit_ok = self.circuit_breaker.allow_request();
+
+                if !budget_ok || !circuit_ok {
+                    let reason = if !budget_ok { "Token 预算不足" } else { "熔断器开启" };
+                    tracing::warn!("拒绝 LLM 调用：agent={}, reason={}", agent_id, reason);
+
+                    // 通知 ThinkerNode 拒绝
+                    if let Ok(deny_msg) = FrameCodec::new_message(
+                        Topic::new("cortex/budget_deny"),
+                        "kernel",
+                        &serde_json::json!({ "reason": reason }),
+                    ) {
+                        // 通过控制面路由到订阅了 cortex/budget_deny 的 ThinkerNode
+                        if let Err(e) = self.route_and_forward(&deny_msg, transport).await {
+                            tracing::warn!("发送预算拒绝通知失败：{}", e);
+                        }
+                    }
+
+                    if !circuit_ok {
+                        self.circuit_breaker.record_failure();
+                    }
+                } else {
+                    // 预算充足，记录成功
+                    self.circuit_breaker.record_success();
+                }
+            }
+
             // 反射弧：感官信号 → ReflexRouter → 运动指令
             // 路线 A：ThinkerNode 内置感官处理后，通过 sensory/* topic 通知 Kernel
             t if t.starts_with("sensory/") => {
@@ -1165,6 +1353,19 @@ impl Kernel {
                             }),
                         )?;
                         self.route_and_forward(&l2_msg, transport).await?;
+                    }
+                }
+            }
+
+            // agent/mcp-client/tool_result — MCP Server 工具调用结果回传
+            t if t.starts_with("agent/mcp-client/") && t.ends_with("/tool_result") => {
+                tracing::debug!("MCP Server 工具调用结果收到：{}", topic);
+                // 先正常路由到订阅了此 topic 的 Node
+                self.route_and_forward(&incoming.message, transport).await?;
+                // 通过 mcp_bus_tx 将工具结果回传给 MCP Server handler
+                if let Some(ref bus_tx) = self.mcp_bus_tx {
+                    if let Err(e) = bus_tx.send(incoming.message).await {
+                        tracing::warn!("MCP Server 工具结果回传失败：{}", e);
                     }
                 }
             }

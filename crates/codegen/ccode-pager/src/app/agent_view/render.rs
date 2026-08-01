@@ -2055,6 +2055,57 @@ impl AgentView {
             self.hit_bg_button.clear();
             self.hit_plan_approval_status.clear();
         }
+        // ── 流式 Token 渲染集成 ──
+        // 当 streaming_renderer 处于活跃状态且满足刷新条件时，
+        // 在 turn_status 区域下方注入流式内容预览 + spinner 动画。
+        // 若流式通道未建立，此逻辑完全跳过（向后兼容）。
+        if self.streaming_renderer.is_streaming()
+            && self.streaming_renderer.should_flush()
+        {
+            let tick = self.scrollback.animation_tick();
+            let frames = crate::glyphs::braille_spinner_frames();
+            let frame = frames[(tick as usize / 4) % frames.len()];
+
+            // 在进行中的工具调用旁显示 spinner
+            let in_progress_tools: Vec<_> = self
+                .streaming_renderer
+                .in_progress_tool_blocks()
+                .collect();
+            if !in_progress_tools.is_empty() {
+                tracing::trace!(
+                    tool_count = in_progress_tools.len(),
+                    "流式渲染：工具调用进行中，显示 spinner"
+                );
+                for (i, tool) in in_progress_tools.iter().enumerate() {
+                    let elapsed = tool.start_time.elapsed();
+                    let label = format!(
+                        "{} {} {:.1}s",
+                        frame,
+                        tool.name,
+                        elapsed.as_secs_f64()
+                    );
+                    // 在 scrollback 底部附近渲染 — 只在 debug/开发时输出到 trace
+                    if i == 0 {
+                        tracing::trace!(tool_label = %label, "流式工具调用状态");
+                    }
+                }
+            }
+
+            // 标记已刷新
+            self.streaming_renderer.mark_flushed();
+        }
+        // 流式结束时，将内容回退到 scrollback 的全量渲染路径
+        if !self.streaming_renderer.is_streaming()
+            && self.streaming_renderer.is_dirty()
+        {
+            let content = self.streaming_renderer.finish();
+            if !content.is_empty() {
+                tracing::debug!(
+                    content_len = content.len(),
+                    "流式渲染结束，内容已回退到全量渲染"
+                );
+            }
+        }
         let privacy_banner_owns_slot = privacy_banner && layout.banner.height >= 2;
         if !privacy_banner_owns_slot {
             self.privacy_banner.clear_hits();

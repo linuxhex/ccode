@@ -16,6 +16,7 @@ pub mod checkpoint;
 pub mod compile_feedback;
 pub mod file_transaction;
 pub mod gitignore_filter;
+pub mod hook_bridge;
 pub mod lsp;
 pub mod output_formatter;
 pub mod path_validator;

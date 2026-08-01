@@ -48,9 +48,12 @@ use crate::agent::doom_loop::{DoomLoopDetector, DoomLoopResult, EscapeAction};
 use crate::agent::loop_state::{LoopStateMachine, LoopEvent, LoopAction, ToolExecutionOutcome};
 use crate::agent::orchestrator::Orchestrator;
 use crate::agent::subagent::SubAgentCrashed;
-use crate::memory::working::{WorkingMemory, MessageRole};
+
+use crate::memory::working::{WorkingMemory, WorkingEntry, MessageRole};
 use crate::memory::short_term::ShortTermMemory;
 use crate::memory::window::SlidingWindow;
+use crate::memory::embedding::EmbeddingIndex;
+use crate::memory::intent_retriever::IntentRetriever;
 
 /// 记忆桥接 trait — 连接外部记忆系统（如 ccode-memory）到 ThinkerNode
 ///
@@ -207,6 +210,8 @@ pub struct ThinkerNode {
     cancel_requested: bool,
     /// Agentic 会话是否活跃（input → sampling → tool → re-sample 循环中）
     agentic_session_active: bool,
+    /// 意图检索器（Context Engine 核心：意图扩展 + 代码块检索）
+    intent_retriever: IntentRetriever,
 }
 
 impl ThinkerNode {
@@ -236,6 +241,7 @@ impl ThinkerNode {
             sensory_buffer: Vec::with_capacity(SENSORY_BUFFER_CAPACITY),
             cancel_requested: false,
             agentic_session_active: false,
+            intent_retriever: IntentRetriever::new(EmbeddingIndex::new()),
         }
     }
 
@@ -272,6 +278,22 @@ impl ThinkerNode {
                 token_count,
             );
             tracing::debug!("注入长期记忆：{} 字符", memory.len());
+        }
+
+        // Context Engine：意图扩展 + 代码块检索，注入代码级上下文
+        let intents = IntentRetriever::expand_intents(content);
+        if !intents.is_empty() {
+            // 简单用零向量占位（真实场景需调 embedding 模型生成 query embedding）
+            let query_embedding = vec![0.0f32; 1536];
+            let results = self.intent_retriever.search_by_intents(&intents, &query_embedding, 5);
+            for result in results {
+                let token_count = Self::estimate_tokens(&result.preview);
+                self.working_memory.push_system(
+                    format!("[代码上下文] {} ({}:{}, 相关度:{:.2})", result.name, result.file_path.display(), result.source_intent, result.relevance_score),
+                    token_count,
+                );
+                tracing::debug!("注入代码上下文：{} (score={:.2})", result.name, result.relevance_score);
+            }
         }
 
         self.state = AgentState::Thinking;
@@ -417,6 +439,27 @@ impl ThinkerNode {
         // 感官信号走控制面（经 Kernel ROUTER），确保 Kernel 一定收到
         transport.send_message(&msg).await?;
         Ok(())
+    }
+
+    /// 请求元认知评估（通过消息总线，异步回调）
+    ///
+    /// ThinkerNode 不直接持有 MetaCognitiveController，
+    /// 而是通过 bus 发送 cortex/meta_assess 请求，
+    /// Kernel 收到后评估并将结果通过 cortex/meta_result 返回。
+    async fn request_meta_assessment(&self, context: &str, transport: &NodeTransportHandle) {
+        let msg = FrameCodec::new_message(
+            Topic::new("cortex/meta_assess"),
+            self.id.as_str(),
+            &serde_json::json!({
+                "agent_id": self.id.to_string(),
+                "context": context,
+            }),
+        );
+        if let Ok(msg) = msg {
+            if let Err(e) = transport.send_message(&msg).await {
+                tracing::debug!("发送元认知评估请求失败：{}", e);
+            }
+        }
     }
 
     /// 判断工具是否与编译/检查相关
@@ -806,8 +849,35 @@ impl ThinkerNode {
         }
     }
 
+    /// 请求 Token 预算和熔断器检查（通过消息总线）
+    ///
+    /// 返回 true 表示允许执行，false 表示应跳过（预算不足或熔断器开启）。
+    /// 采用 fire-and-forget 模式：默认放行，如果预算不足 Kernel 会通过
+    /// cortex/budget_deny 通知，ThinkerNode 在 handle_message 中处理拒绝。
+    async fn check_budget_and_circuit(&self, transport: &NodeTransportHandle) -> bool {
+        let msg = FrameCodec::new_message(
+            Topic::new("cortex/budget_check"),
+            self.id.as_str(),
+            &serde_json::json!({
+                "agent_id": self.id.to_string(),
+            }),
+        );
+        if let Ok(msg) = msg {
+            if let Err(e) = transport.send_message(&msg).await {
+                tracing::debug!("发送预算检查请求失败（放行）：{}", e);
+            }
+        }
+        // fire-and-forget 模式：默认放行，如果预算不足 Kernel 会通过 cortex/budget_deny 通知
+        true
+    }
+
     /// 发送采样请求（复用逻辑）
+    ///
+    /// 发送前先通过消息总线请求 Token 预算和熔断器检查。
     async fn send_sample_request(&mut self, transport: &NodeTransportHandle) -> anyhow::Result<()> {
+        // 请求预算和熔断器检查（fire-and-forget，拒绝通过 cortex/budget_deny 异步通知）
+        self.check_budget_and_circuit(transport).await;
+
         self.current_sample_request_id = None;
         AgentMetrics::global().record_loop_count(1);
         self.inference_start = Some(std::time::Instant::now());
@@ -859,6 +929,9 @@ impl Node for ThinkerNode {
                 self.agentic_session_active = true;
                 AgentMetrics::global().record_loop_count(1);
                 self.inference_start = Some(std::time::Instant::now());
+
+                // 请求预算和熔断器检查（fire-and-forget，拒绝通过 cortex/budget_deny 异步通知）
+                self.check_budget_and_circuit(transport).await;
 
                 let request = self.build_sample_request();
                 let sample_msg = FrameCodec::new_message(
@@ -923,6 +996,16 @@ impl Node for ThinkerNode {
                         self.agentic_session_active = false;
                         self.state = AgentState::Idle;
                         self.update_context_window();
+
+                        // 请求元认知评估当前推理质量（异步，结果通过 cortex/meta_result 回传）
+                        let context_summary: String = self.working_memory.entries().iter().rev().take(3)
+                            .filter_map(|e| match e {
+                                WorkingEntry::Hot { content, .. } => Some(content.chars().take(100).collect::<String>()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        self.request_meta_assessment(&context_summary, transport).await;
 
                         // turn 结束：持久化工作记忆到 StateNode
                         self.persist_to_state(transport).await;
@@ -1018,6 +1101,29 @@ impl Node for ThinkerNode {
                 self.handle_motor_adjust(&payload);
             }
 
+            // cortex/budget_deny — Token 预算不足或熔断器开启（来自 Kernel）
+            "cortex/budget_deny" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                let reason = payload["reason"].as_str().unwrap_or("unknown");
+                tracing::warn!("LLM 调用被拒绝：{}", reason);
+                // 通知用户
+                let notice_msg = FrameCodec::new_message(
+                    Topic::agent_output(self.id.as_str()),
+                    self.id.as_str(),
+                    &serde_json::json!({
+                        "channel": "text",
+                        "content": format!("[系统保护] LLM 调用被拒绝：{}", reason),
+                    }),
+                );
+                if let Ok(notice_msg) = notice_msg {
+                    if let Err(e) = transport.publish_data(&notice_msg).await {
+                        tracing::debug!("发送预算拒绝通知失败：{}", e);
+                    }
+                }
+                self.state = AgentState::Idle;
+                self.current_sample_request_id = None;
+            }
+
             // cortex/sensory — L1 本能反射通知（来自 Kernel ReflexRouter）
             "cortex/sensory" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
@@ -1026,6 +1132,44 @@ impl Node for ThinkerNode {
                 let summary = format!("[反射弧L1] 信号={} 动作={}", signal_topic, action);
                 self.working_memory.push_system(&summary, summary.len() as u32 / 3);
                 tracing::info!(signal_topic, action, "Thinker 收到 L1 本能反射通知");
+            }
+
+            // cortex/meta_result — 元认知评估结果（来自 Kernel MetaCognitiveController）
+            "cortex/meta_result" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                if let Some(conflicts) = payload.get("conflicts").and_then(|v| v.as_array()) {
+                    if !conflicts.is_empty() {
+                        tracing::warn!("元认知检测到 {} 个逻辑冲突，注入工作记忆", conflicts.len());
+                        for conflict in conflicts {
+                            if let Some(desc) = conflict["description"].as_str() {
+                                self.working_memory.push_system(
+                                    format!("[元认知警告] {}", desc),
+                                    Self::estimate_tokens(desc),
+                                );
+                            }
+                        }
+                    }
+                }
+                // 如果元认知建议切换策略
+                if let Some(strategy) = payload.get("suggested_strategy").and_then(|v| v.as_str()) {
+                    tracing::info!("元认知建议策略：{}", strategy);
+                    self.working_memory.push_system(
+                        format!("[元认知建议] 考虑切换到 {} 策略", strategy),
+                        Self::estimate_tokens(strategy),
+                    );
+                }
+            }
+
+            // cortex/erl_heuristic — 经验反思学习结果（来自 Kernel ERL）
+            "cortex/erl_heuristic" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                if let Some(heuristic) = payload["heuristic"].as_str() {
+                    tracing::info!("ERL 提取经验教训：{}", heuristic);
+                    self.working_memory.push_system(
+                        format!("[经验教训] {}", heuristic),
+                        Self::estimate_tokens(heuristic),
+                    );
+                }
             }
 
             // tool/register — 收到工具注册消息
@@ -1176,6 +1320,9 @@ impl Node for ThinkerNode {
             format!("agent/{}/cancel", self.id),       // 取消请求（来自 AcpNode/TUINode）
             format!("motor/{}/adjust", self.id),       // 反射弧 motor 指令（来自 Kernel ReflexRouter）
             "cortex/sensory".into(),                   // L1 本能反射通知（来自 Kernel ReflexRouter）
+            "cortex/budget_deny".into(),               // Token 预算拒绝通知
+            "cortex/meta_result".into(),               // 元认知评估结果
+            "cortex/erl_heuristic".into(),             // 经验反思学习结果
             "sampler/*/stream".into(),
             "tool/register".into(),
             "sys/shutdown".into(),

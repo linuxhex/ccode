@@ -91,5 +91,7 @@ pub(super) fn viewer_turn_anchor(turn_start_ms: Option<i64>) -> std::time::Insta
 /// in-flight streamed entry (dead wakes included). Leaves a real turn's
 /// stop-hook stash pending for its own marker rail.
 pub(super) fn finish_wake_turn(agent: &mut AgentView) {
+    // wake turns 不走 mark_turn_finished，需要手动通知流式渲染器结束
+    agent.finish_streaming();
     agent.session.tracker.finish_turn(&mut agent.scrollback);
 }

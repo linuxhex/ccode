@@ -323,6 +323,7 @@ impl AgentView {
             follow_up_pending: HashMap::new(),
             follow_up_pending_order: VecDeque::new(),
             pending_adoption_updates: Vec::new(),
+            streaming_renderer: super::streaming::StreamingRenderer::new(),
         };
         let mode = if crate::appearance::cache::load_simple_mode() {
             InputMode::Simple
@@ -352,9 +353,60 @@ impl AgentView {
     /// fields cannot drift apart at the ~10 termination call sites
     /// across `dispatch.rs` and `event_loop.rs`.
     pub fn mark_turn_finished(&mut self) {
+        // 通知流式渲染器回合结束（若仍在流式状态）
+        if self.streaming_renderer.is_streaming() {
+            tracing::debug!(
+                token_count = self.streaming_renderer.token_count(),
+                "流式渲染器：mark_turn_finished 中发送 Finish"
+            );
+            self.streaming_renderer
+                .handle_event(super::streaming::StreamingEvent::Finish);
+        }
         self.turn_started_at = None;
         self.turn_paused_duration = std::time::Duration::ZERO;
         self.last_active_at = Some(Instant::now());
+    }
+    /// 将 ACP SessionUpdate 转发到流式渲染器。
+    ///
+    /// 在 acp_handler 处理每条 session/update 时调用，
+    /// 将 AgentMessageChunk / ToolCall / ToolCallUpdate 等增量事件
+    /// 转换为 StreamingEvent 并馈送给 StreamingRenderer。
+    /// 若渲染器尚未启动（例如首个 chunk 到达时），自动启动。
+    pub fn feed_streaming_update(&mut self, update: &agent_client_protocol::SessionUpdate) {
+        // 若渲染器尚未启动但收到了 agent 输出，自动启动
+        if !self.streaming_renderer.is_streaming()
+            && matches!(
+                update,
+                agent_client_protocol::SessionUpdate::AgentMessageChunk(_)
+                    | agent_client_protocol::SessionUpdate::AgentThoughtChunk(_)
+            )
+        {
+            self.streaming_renderer.start();
+            tracing::debug!("流式渲染器：收到首个 agent chunk，自动启动");
+        }
+        if let Some(event) =
+            super::streaming::streaming_event_from_acp_update(update)
+        {
+            tracing::trace!(
+                event = ?event,
+                "流式渲染器：馈送 StreamingEvent"
+            );
+            self.streaming_renderer.handle_event(event);
+        }
+    }
+    /// 通知流式渲染器当前回合已结束。
+    ///
+    /// 在 turn completion（成功/取消/失败）时调用，
+    /// 发送 Finish 事件以便渲染器将缓冲内容回退到 scrollback。
+    pub fn finish_streaming(&mut self) {
+        if self.streaming_renderer.is_streaming() {
+            tracing::debug!(
+                token_count = self.streaming_renderer.token_count(),
+                "流式渲染器：回合结束，发送 Finish"
+            );
+            self.streaming_renderer
+                .handle_event(super::streaming::StreamingEvent::Finish);
+        }
     }
     /// Invalidate and clear a minimal `/btw` lifecycle at a session boundary.
     pub(crate) fn clear_minimal_btw_lifecycle(&mut self) {
@@ -460,6 +512,8 @@ impl AgentView {
             self.expect_send_now_cancel = None;
         }
         self.session.start_turn(&mut self.scrollback);
+        // 新回合开始，重置流式渲染器
+        self.streaming_renderer.start();
     }
     /// Adopt the in-flight turn another client is driving, conveyed by the
     /// `session/load` response meta (`ccode.dev/runningPromptId`): enter

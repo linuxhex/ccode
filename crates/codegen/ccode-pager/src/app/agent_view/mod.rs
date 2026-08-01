@@ -175,6 +175,7 @@ mod rewind;
 mod selection;
 mod session;
 mod shell_completion;
+pub mod streaming;
 mod viewer;
 mod workflows_overlay;
 use super::actions;
@@ -1584,6 +1585,9 @@ pub struct AgentView {
         agent_client_protocol::SessionUpdate,
         crate::acp::meta::NotificationMeta,
     )>,
+    /// 流式 Token 渲染器 — 逐 token 增量显示 LLM 响应。
+    /// 当流式通道未建立时，渲染照常走全量刷新路径（向后兼容）。
+    pub streaming_renderer: streaming::StreamingRenderer,
 }
 /// Cap on [`AgentView::self_originated_prompt_ids`]. Only recent ids matter (a
 /// stale post-rewind chunk arrives right after its turn ends), so a small

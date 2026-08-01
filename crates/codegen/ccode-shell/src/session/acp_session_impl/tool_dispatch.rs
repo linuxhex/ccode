@@ -57,6 +57,18 @@ pub(super) async fn dispatch_tool(
             ccore_state.record_read(path);
         }
     }
+    // ccore 融合：反射弧——工具结果路由到 ReflexRouter
+    // 匹配感官信号，触发 L0 直接反射（日志通知）或 L1 本能反射
+    if let Ok(ref tool_result) = result {
+        let output_text = match &tool_result.output {
+            ToolsToolOutput::Text(t) => t.text.clone(),
+            _ => String::new(),
+        };
+        let success = !output_text.starts_with("Error:");
+        if let Some(reflex_msg) = ccore_state.route_reflex(&prepared.tool_name, &output_text, success) {
+            tracing::debug!(tool = %prepared.tool_name, "{}", reflex_msg);
+        }
+    }
     result
 }
 
