@@ -336,6 +336,82 @@ impl ThinkerNode {
         Ok(())
     }
 
+    /// 从 LLM 响应中解析子任务列表
+    ///
+    /// 支持两种格式：
+    /// 1. JSON 数组：[{"description":"...","verification":"..."}]
+    /// 2. 编号列表：1. 任务描述
+    fn parse_subtasks_from_llm_response(&self, text: &str) -> Vec<crate::agent::goal_loop::SubTask> {
+        use crate::agent::goal_loop::{SubTask, SubTaskState};
+
+        // 尝试 JSON 数组格式
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(text) {
+            return arr.iter().filter_map(|item| {
+                let desc = item["description"].as_str()?.to_string();
+                let verification = item["verification"].as_str().unwrap_or("完成").to_string();
+                Some(SubTask {
+                    description: desc,
+                    state: SubTaskState::Pending,
+                    verification,
+                    attempts: 0,
+                    max_retries: 2,
+                })
+            }).collect();
+        }
+
+        // 尝试在文本中查找 JSON 数组（可能被包裹在 markdown code block 中）
+        if let Some(start) = text.find('[') {
+            if let Some(end) = text.rfind(']') {
+                if end > start {
+                    let json_str = &text[start..=end];
+                    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+                        return arr.iter().filter_map(|item| {
+                            let desc = item["description"].as_str()?.to_string();
+                            let verification = item["verification"].as_str().unwrap_or("完成").to_string();
+                            Some(SubTask {
+                                description: desc,
+                                state: SubTaskState::Pending,
+                                verification,
+                                attempts: 0,
+                                max_retries: 2,
+                            })
+                        }).collect();
+                    }
+                }
+            }
+        }
+
+        // 尝试编号列表格式（1. xxx 或 - xxx）
+        let subtasks: Vec<SubTask> = text.lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(|c: char| c.is_ascii_digit()) && trimmed.contains('.')
+                    || trimmed.starts_with("- ")
+            })
+            .filter_map(|line| {
+                let desc = line.trim()
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .trim_start_matches('.')
+                    .trim_start_matches('-')
+                    .trim()
+                    .to_string();
+                if desc.len() > 3 {
+                    Some(SubTask {
+                        description: desc,
+                        state: SubTaskState::Pending,
+                        verification: "完成".to_string(),
+                        attempts: 0,
+                        max_retries: 2,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        subtasks
+    }
+
     // ── 内置感官模块（路线 A：不拆独立进程） ──
 
     /// 听觉（Ear）：处理用户输入
@@ -618,6 +694,7 @@ impl ThinkerNode {
                     tracing::debug!("数据面 PUB 发送 output 失败，回退到控制面：{}", e);
                     transport.send_message(&output_msg).await?;
                 }
+                self.loop_state_machine.record_step("text", &chunk.content);
             }
             StreamChannel::Reasoning => {
                 // 推理链内容，可选展示给用户
@@ -642,6 +719,7 @@ impl ThinkerNode {
 
                 let args_hash = Self::hash_tool_args(&tool_call.arguments);
                 self.doom_loop_detector.record(tool_call.tool_name.clone(), args_hash);
+                self.loop_state_machine.record_step("tool_call", &tool_call.tool_name);
 
                 self.pending_tool_calls.insert(tool_call.tool_call_id.clone(), tool_call);
             }
@@ -658,6 +736,7 @@ impl ThinkerNode {
         self.feel(tool_name, output, success, transport).await;   // 触觉：感知执行结果
         self.observe(tool_name, output, transport).await;          // 视觉：观察文件内容
         // sniff() 在 feel() 中自动触发（当工具失败且为编译相关工具时）
+        self.loop_state_machine.record_step("tool_result", &format!("{}:{}", tool_name, if success { "ok" } else { "fail" }));
 
         let token_count = Self::estimate_tokens(output);
         self.short_term_memory.store(
@@ -1012,6 +1091,22 @@ impl Node for ThinkerNode {
                 let role = payload["role"].as_str().unwrap_or("user");
                 self.listen(content, role); // 内置听觉
 
+                // /goal 命令处理：启动目标驱动循环
+                if content.starts_with("/goal ") {
+                    let goal_description = content.strip_prefix("/goal ").unwrap_or("").to_string();
+                    if !goal_description.is_empty() {
+                        self.start_goal(goal_description);
+                        // 规划阶段：注入提示让 LLM 生成子任务列表
+                        if let Some(ref gl) = self.goal_loop {
+                            let desc = gl.description().to_string();
+                            self.working_memory.push_user(
+                                format!("请将以下目标拆解为可执行的子任务列表（JSON 数组格式，每项包含 description 和 verification 字段）：\n{}", desc),
+                                Self::estimate_tokens(&desc),
+                            );
+                        }
+                    }
+                }
+
                 self.agentic_session_active = true;
                 AgentMetrics::global().record_loop_count(1);
                 self.inference_start = Some(std::time::Instant::now());
@@ -1082,6 +1177,44 @@ impl Node for ThinkerNode {
                         self.agentic_session_active = false;
                         self.state = AgentState::Idle;
                         self.update_context_window();
+
+                        // GoalLoop 规划阶段：尝试从 LLM 响应中解析子任务列表
+                        // 先提取文本并解析子任务，避免与 goal_loop 的可变借用冲突
+                        let goal_planning_subtasks: Option<Vec<crate::agent::goal_loop::SubTask>> = {
+                            if let Some(ref gl) = self.goal_loop {
+                                if gl.state() == crate::agent::goal_loop::GoalState::Planning {
+                                    // 从工作记忆中提取最近的 assistant 消息
+                                    let last_assistant = self.working_memory.entries().iter().rev()
+                                        .find_map(|e| match e {
+                                            WorkingEntry::Hot { role, content, .. } if matches!(role, MessageRole::Assistant) => Some(content.clone()),
+                                            _ => None,
+                                        });
+                                    if let Some(text) = last_assistant {
+                                        // 尝试从文本中提取子任务（JSON 数组或编号列表）
+                                        let subtasks = self.parse_subtasks_from_llm_response(&text);
+                                        if !subtasks.is_empty() {
+                                            Some(subtasks)
+                                        } else {
+                                            tracing::debug!(target: "ccore::goal", "GoalLoop：规划阶段但未解析到子任务，等待下一轮");
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(subtasks) = goal_planning_subtasks {
+                            if let Some(ref mut gl) = self.goal_loop {
+                                let action = gl.on_subtasks_planned(subtasks);
+                                self.process_goal_action(action, transport).await?;
+                                tracing::info!(target: "ccore::goal", "GoalLoop：从 LLM 响应解析到子任务");
+                            }
+                        }
 
                         // GoalLoop：turn 完成后通知目标循环
                         if self.goal_loop.is_some() {
@@ -1170,10 +1303,100 @@ impl Node for ThinkerNode {
                     let all_done = self.handle_tool_result(tool_call_id, &tool_name, output, success, transport).await;
 
                     if all_done {
-                        // 工具执行完毕，回到 sampler 前先跑压缩管道
-                        self.run_compaction_pipeline();
+                        // 工具执行完毕，检查 Doom Loop
+                        let doom_result = self.check_doom_loop();
+                        if doom_result.detected {
+                            tracing::warn!(
+                                "Doom Loop 检测触发：工具 {:?} 重复 {} 次，应用逃脱策略（{} 个动作），已尝试 {} 次",
+                                doom_result.repeated_tool, doom_result.repeat_count, doom_result.escape_actions.len(), self.doom_loop_escape_attempts
+                            );
+                            AgentMetrics::global().record_error("doom_loop");
 
-                        self.send_sample_request(transport).await?;
+                            // 逃脱尝试超过 3 次，强制终止
+                            if self.doom_loop_escape_attempts >= 3 {
+                                tracing::warn!("Doom Loop 逃脱已尝试 {} 次，强制终止循环", self.doom_loop_escape_attempts);
+                                if let Some(loop_event) = LoopEvent::from_doom_loop(&doom_result) {
+                                    let action = self.loop_state_machine.transition(loop_event);
+                                    self.state = self.loop_state_machine.state();
+                                    tracing::info!(
+                                        "LoopStateMachine 状态变迁：action={:?}, state={:?}",
+                                        action, self.state
+                                    );
+                                    if let LoopAction::EndTurn { reason } = action {
+                                        tracing::warn!("LoopStateMachine 判定结束：reason={:?}", reason);
+                                        let notice_msg = FrameCodec::new_message(
+                                            Topic::agent_output(self.id.as_str()),
+                                            self.id.as_str(),
+                                            &serde_json::json!({
+                                                "channel": "text",
+                                                "content": format!("Agent 循环终止：{:?}", reason),
+                                            }),
+                                        )?;
+                                        if let Err(e) = transport.publish_data(&notice_msg).await {
+                                            tracing::debug!("数据面 PUB 发送循环终止通知失败：{}", e);
+                                            transport.send_message(&notice_msg).await?;
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                            }
+
+                            // 应用逃脱动作，然后继续循环给 Agent 逃脱机会
+                            self.doom_loop_escape_attempts += 1;
+
+                            for action in &doom_result.escape_actions {
+                                match action {
+                                    EscapeAction::InjectHint(hint) => {
+                                        // 注入提示到工作记忆作为系统消息
+                                        self.working_memory.push_system(hint.clone(), Self::estimate_tokens(hint));
+                                        tracing::warn!("Doom Loop 逃脱：已注入换策略提示到工作记忆");
+                                    }
+                                    EscapeAction::DisableTool(tool) => {
+                                        // 禁用工具：下一轮生效
+                                        self.disabled_tool_next_round = Some(tool.clone());
+                                        tracing::warn!("Doom Loop 逃脱：下一轮禁用工具 {}", tool);
+                                    }
+                                    EscapeAction::DegradeModel => {
+                                        // 降级模型：reasoning_effort 将由 current_reasoning_effort() 自动拾取
+                                        let level = self.doom_loop_detector.model_degrade_level();
+                                        tracing::warn!(
+                                            "Doom Loop 逃脱：降级模型（reasoning_effort level={}）",
+                                            level
+                                        );
+                                    }
+                                }
+                            }
+
+                            // 通知用户 Doom Loop 逃脱正在尝试
+                            let notice_msg = FrameCodec::new_message(
+                                Topic::agent_output(self.id.as_str()),
+                                self.id.as_str(),
+                                &serde_json::json!({
+                                    "channel": "text",
+                                    "content": format!(
+                                        "检测到工具循环（{} 重复 {} 次），已注入换策略提示、临时禁用该工具并降级模型，正在尝试跳出循环（第 {} 次）。",
+                                        doom_result.repeated_tool.as_deref().unwrap_or("unknown"),
+                                        doom_result.repeat_count,
+                                        self.doom_loop_escape_attempts
+                                    ),
+                                }),
+                            )?;
+                            if let Err(e) = transport.publish_data(&notice_msg).await {
+                                tracing::debug!("数据面 PUB 发送 doom loop 通知失败，回退到控制面：{}", e);
+                                transport.send_message(&notice_msg).await?;
+                            }
+
+                            // 不结束 turn，继续调用 LLM 给 Agent 逃脱循环的机会
+                            self.run_compaction_pipeline();
+                            self.send_sample_request(transport).await?;
+                        } else {
+                            // 未检测到 Doom Loop，重置逃脱尝试计数
+                            self.doom_loop_escape_attempts = 0;
+
+                            // 回到 sampler 前先跑压缩管道
+                            self.run_compaction_pipeline();
+                            self.send_sample_request(transport).await?;
+                        }
                     }
                 } else {
                     tracing::warn!("Thinker {} 收到未知 tool_call_id 的结果：{}", self.id, tool_call_id);
@@ -1322,99 +1545,46 @@ impl Node for ThinkerNode {
                 }
             }
 
+            // cortex/goal_start — 启动目标驱动循环（来自用户 /goal 命令或外部触发）
+            "cortex/goal_start" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                if let Some(description) = payload["description"].as_str() {
+                    self.start_goal(description.to_string());
+                    // 规划阶段：立即注入提示让 LLM 生成子任务列表
+                    if let Some(ref gl) = self.goal_loop {
+                        let desc = gl.description().to_string();
+                        self.working_memory.push_user(
+                            format!("请将以下目标拆解为可执行的子任务列表（JSON 数组格式，每项包含 description 和 verification 字段）：\n{}", desc),
+                            Self::estimate_tokens(&desc),
+                        );
+                    }
+                    // 开始 agentic session 来规划子任务
+                    self.agentic_session_active = true;
+                    self.inference_start = Some(std::time::Instant::now());
+                    self.check_budget_and_circuit(transport).await;
+                    let request = self.build_sample_request();
+                    let sample_msg = FrameCodec::new_message(
+                        Topic::sampler_request(),
+                        self.id.as_str(),
+                        &request,
+                    )?;
+                    if let Err(e) = transport.publish_data(&sample_msg).await {
+                        tracing::debug!("数据面 PUB 发送失败，回退到控制面：{}", e);
+                        transport.send_message(&sample_msg).await?;
+                    }
+                }
+            }
+
+            // cortex/goal_verify_result — 目标验证结果回调（来自 Kernel 或外部验证器）
+            "cortex/goal_verify_result" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                let passed = payload["passed"].as_bool().unwrap_or(false);
+                self.on_goal_verification_result(passed, transport).await?;
+            }
+
             _ => {
                 tracing::debug!("Thinker 收到未处理 topic：{}", topic);
             }
-        }
-
-        // 检查 Doom Loop 并应用逃脱策略
-        let doom_result = self.check_doom_loop();
-        if doom_result.detected {
-            tracing::warn!(
-                "Doom Loop 检测触发：工具 {:?} 重复 {} 次，应用逃脱策略（{} 个动作），已尝试 {} 次",
-                doom_result.repeated_tool, doom_result.repeat_count, doom_result.escape_actions.len(), self.doom_loop_escape_attempts
-            );
-            AgentMetrics::global().record_error("doom_loop");
-
-            // 逃脱尝试超过 3 次，强制终止
-            if self.doom_loop_escape_attempts >= 3 {
-                tracing::warn!("Doom Loop 逃脱已尝试 {} 次，强制终止循环", self.doom_loop_escape_attempts);
-                if let Some(loop_event) = LoopEvent::from_doom_loop(&doom_result) {
-                    let action = self.loop_state_machine.transition(loop_event);
-                    self.state = self.loop_state_machine.state();
-                    tracing::info!(
-                        "LoopStateMachine 状态变迁：action={:?}, state={:?}",
-                        action, self.state
-                    );
-                    if let LoopAction::EndTurn { reason } = action {
-                        tracing::warn!("LoopStateMachine 判定结束：reason={:?}", reason);
-                        let notice_msg = FrameCodec::new_message(
-                            Topic::agent_output(self.id.as_str()),
-                            self.id.as_str(),
-                            &serde_json::json!({
-                                "channel": "text",
-                                "content": format!("Agent 循环终止：{:?}", reason),
-                            }),
-                        )?;
-                        if let Err(e) = transport.publish_data(&notice_msg).await {
-                            tracing::debug!("数据面 PUB 发送循环终止通知失败：{}", e);
-                            transport.send_message(&notice_msg).await?;
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-
-            // 应用逃脱动作，然后继续循环给 Agent 逃脱机会
-            self.doom_loop_escape_attempts += 1;
-
-            for action in &doom_result.escape_actions {
-                match action {
-                    EscapeAction::InjectHint(hint) => {
-                        // 注入提示到工作记忆作为系统消息
-                        self.working_memory.push_system(hint.clone(), Self::estimate_tokens(hint));
-                        tracing::warn!("Doom Loop 逃脱：已注入换策略提示到工作记忆");
-                    }
-                    EscapeAction::DisableTool(tool) => {
-                        // 禁用工具：下一轮生效
-                        self.disabled_tool_next_round = Some(tool.clone());
-                        tracing::warn!("Doom Loop 逃脱：下一轮禁用工具 {}", tool);
-                    }
-                    EscapeAction::DegradeModel => {
-                        // 降级模型：reasoning_effort 将由 current_reasoning_effort() 自动拾取
-                        let level = self.doom_loop_detector.model_degrade_level();
-                        tracing::warn!(
-                            "Doom Loop 逃脱：降级模型（reasoning_effort level={}）",
-                            level
-                        );
-                    }
-                }
-            }
-
-            // 通知用户 Doom Loop 逃脱正在尝试
-            let notice_msg = FrameCodec::new_message(
-                Topic::agent_output(self.id.as_str()),
-                self.id.as_str(),
-                &serde_json::json!({
-                    "channel": "text",
-                    "content": format!(
-                        "检测到工具循环（{} 重复 {} 次），已注入换策略提示、临时禁用该工具并降级模型，正在尝试跳出循环（第 {} 次）。",
-                        doom_result.repeated_tool.as_deref().unwrap_or("unknown"),
-                        doom_result.repeat_count,
-                        self.doom_loop_escape_attempts
-                    ),
-                }),
-            )?;
-            if let Err(e) = transport.publish_data(&notice_msg).await {
-                tracing::debug!("数据面 PUB 发送 doom loop 通知失败，回退到控制面：{}", e);
-                transport.send_message(&notice_msg).await?;
-            }
-
-            // 不结束 turn，继续调用 LLM 给 Agent 逃脱循环的机会
-            self.send_sample_request(transport).await?;
-        } else {
-            // 未检测到 Doom Loop，重置逃脱尝试计数
-            self.doom_loop_escape_attempts = 0;
         }
 
         // 检查是否需要自动压缩（借鉴 Claude Code CompactionPolicy）
@@ -1452,6 +1622,8 @@ impl Node for ThinkerNode {
             "cortex/budget_deny".into(),               // Token 预算拒绝通知
             "cortex/meta_result".into(),               // 元认知评估结果
             "cortex/erl_heuristic".into(),             // 经验反思学习结果
+            "cortex/goal_start".into(),                // 目标驱动循环启动
+            "cortex/goal_verify_result".into(),        // 目标验证结果
             "sampler/*/stream".into(),
             "tool/register".into(),
             "sys/shutdown".into(),
