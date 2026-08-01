@@ -693,6 +693,7 @@ mod tests {
             messages: vec![super::super::provider::ChatMessage {
                 role: "user".into(),
                 content: "Hello".into(),
+                cache_control: None,
             }],
             tools: Vec::new(),
             stream: true,
@@ -701,6 +702,7 @@ mod tests {
             temperature: None,
             system_prompt: None,
             tool_choice: None,
+            prompt_cache_key: None,
         };
 
         let body = provider.build_request_body(&request);
@@ -730,6 +732,7 @@ mod tests {
             messages: vec![super::super::provider::ChatMessage {
                 role: "user".into(),
                 content: "List files".into(),
+                cache_control: None,
             }],
             tools: vec![super::super::provider::ToolDefinition {
                 name: "bash".into(),
@@ -742,6 +745,7 @@ mod tests {
             temperature: Some(0.5),
             system_prompt: Some("You are a helpful assistant.".into()),
             tool_choice: Some(super::super::provider::ToolChoice::Auto),
+            prompt_cache_key: None,
         };
 
         let body = provider.build_request_body(&request);

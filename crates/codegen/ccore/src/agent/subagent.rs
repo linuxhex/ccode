@@ -186,7 +186,7 @@ impl SubAgentNode {
             .working_memory
             .to_chat_messages()
             .into_iter()
-            .map(|(role, content)| ChatMessage { role, content })
+            .map(|(role, content)| ChatMessage { role, content, cache_control: None })
             .collect();
 
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -216,6 +216,7 @@ impl SubAgentNode {
             temperature: None,
             system_prompt: None,
             tool_choice: None,
+            prompt_cache_key: None,
         }
     }
 

@@ -513,6 +513,7 @@ mod tests {
                 super::super::provider::ChatMessage {
                     role: "user".into(),
                     content: "Hello".into(),
+                    cache_control: None,
                 },
             ],
             tools: Vec::new(),
@@ -522,6 +523,7 @@ mod tests {
             temperature: None,
             system_prompt: None,
             tool_choice: None,
+            prompt_cache_key: None,
         };
 
         let body = provider.build_request_body(&request);
@@ -564,6 +566,7 @@ mod tests {
                 super::super::provider::ChatMessage {
                     role: "user".into(),
                     content: "Hello".into(),
+                    cache_control: None,
                 },
             ],
             tools: vec![super::super::provider::ToolDefinition {
@@ -577,6 +580,7 @@ mod tests {
             temperature: None,
             system_prompt: Some("You are a helpful assistant.".into()),
             tool_choice: Some(super::super::provider::ToolChoice::Auto),
+            prompt_cache_key: None,
         };
 
         let body = provider.build_request_body(&request);

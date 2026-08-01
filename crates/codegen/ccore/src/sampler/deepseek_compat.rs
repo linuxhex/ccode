@@ -551,6 +551,7 @@ mod tests {
             messages: vec![super::super::provider::ChatMessage {
                 role: "user".into(),
                 content: "Hello".into(),
+                cache_control: None,
             }],
             tools: Vec::new(),
             stream: true,
@@ -559,6 +560,7 @@ mod tests {
             temperature: None,
             system_prompt: Some("You are a coding assistant.".into()),
             tool_choice: None,
+            prompt_cache_key: None,
         };
 
         let body = provider.build_request_body(&request);

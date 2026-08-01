@@ -32,6 +32,23 @@ pub struct SampleRequest {
     pub system_prompt: Option<String>,
     /// 工具选择策略
     pub tool_choice: Option<ToolChoice>,
+    /// Prompt cache key（复用 API 侧 KV cache）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+}
+
+/// Prompt cache 控制标记
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheControl {
+    /// 缓存类型（当前仅支持 ephemeral）
+    #[serde(rename = "type")]
+    pub cache_type: String,
+}
+
+impl CacheControl {
+    pub fn ephemeral() -> Self {
+        Self { cache_type: "ephemeral".to_string() }
+    }
 }
 
 /// 聊天消息
@@ -39,6 +56,11 @@ pub struct SampleRequest {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// API 侧 prompt cache 断点标记（类似 Claude Code cache_edits）
+    /// 插入在 system prompt 末尾和最近 N 轮对话之前，
+    /// 让 API 复用已计算的前缀 KV cache
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 工具定义

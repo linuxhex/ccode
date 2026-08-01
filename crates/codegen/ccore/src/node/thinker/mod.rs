@@ -68,7 +68,7 @@ use crate::memory::embedding::EmbeddingIndex;
 use crate::memory::intent_retriever::IntentRetriever;
 
 use crate::sampler::provider::{
-    SampleRequest, ChatMessage, StreamChunk, StreamChannel, ToolDefinition as SamplerToolDefinition,
+    SampleRequest, ChatMessage, CacheControl, StreamChunk, StreamChannel, ToolDefinition as SamplerToolDefinition,
 };
 
 /// Thinker Node 实现（仿生架构，路线 A：感官内置）
@@ -191,11 +191,31 @@ impl ThinkerNode {
 
     /// 构建采样请求，发送到 Sampler Node
     fn build_sample_request(&mut self) -> SampleRequest {
-        let messages: Vec<ChatMessage> = self.working_memory
+        let mut messages: Vec<ChatMessage> = self.working_memory
             .to_chat_messages()
             .into_iter()
-            .map(|(role, content)| ChatMessage { role, content })
+            .map(|(role, content)| ChatMessage { role, content, cache_control: None })
             .collect();
+
+        // Prompt cache 断点（借鉴 Claude Code cache_edits）
+        // 在 system prompt 末尾和工具定义之前插入 ephemeral 断点，
+        // 让 API 侧复用前缀 KV cache，减少重复计费
+        if !messages.is_empty() {
+            // 断点 1：system prompt 末尾（最稳定的部分，几乎不变）
+            if let Some(first) = messages.first_mut() {
+                if first.role == "system" {
+                    first.cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+            // 断点 2：最近 2 轮对话之前（较长上下文的中间断点）
+            // 找到倒数第 5 条消息（2 轮 = user + assistant × 2）
+            let mid_idx = messages.len().saturating_sub(5);
+            if mid_idx > 0 {
+                if let Some(msg) = messages.get_mut(mid_idx) {
+                    msg.cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+        }
 
         // Doom Loop 逃脱：若上一轮检测到循环，本轮过滤掉被禁用的工具
         let mut tools = self.config.tools.clone();
@@ -219,6 +239,7 @@ impl ThinkerNode {
             temperature: None,
             system_prompt: None,
             tool_choice: None,
+            prompt_cache_key: Some(self.id.to_string()),  // 同一 agent 的请求共享 cache
         }
     }
 
@@ -1177,5 +1198,45 @@ mod tests {
 
         assert!(thinker.pending_tool_calls.is_empty(), "pending tool calls should be cleared");
         assert!(thinker.cancel_requested, "cancel_requested should be set");
+    }
+
+    #[test]
+    fn test_prompt_cache_breakpoints() {
+        let mut wm = WorkingMemory::new(8000);
+        wm.push_system("You are a coding assistant.".to_string(), 20);
+        wm.push_user("Hello".to_string(), 5);
+        wm.push_assistant("Hi there!".to_string(), 5);
+        wm.push_user("Write a function".to_string(), 10);
+        wm.push_assistant("fn hello() {}".to_string(), 10);
+
+        let messages = wm.to_chat_messages();
+        // system prompt 应在首位
+        assert_eq!(messages[0].0, "system");
+    }
+
+    #[test]
+    fn test_prompt_cache_breakpoints_in_build_sample_request() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+        // 注入足够多的消息以触发两个断点
+        thinker.working_memory.push_system("You are a coding assistant.".to_string(), 20);
+        thinker.working_memory.push_user("Hello".to_string(), 5);
+        thinker.working_memory.push_assistant("Hi there!".to_string(), 5);
+        thinker.working_memory.push_user("Write a function".to_string(), 10);
+        thinker.working_memory.push_assistant("fn hello() {}".to_string(), 10);
+        thinker.working_memory.push_user("Now add tests".to_string(), 10);
+
+        let request = thinker.build_sample_request();
+
+        // 断点 1：首条 system 消息应有 cache_control
+        assert!(request.messages[0].cache_control.is_some(), "首条 system 消息应有 cache_control 断点");
+        let cc = request.messages[0].cache_control.as_ref().unwrap();
+        assert_eq!(cc.cache_type, "ephemeral");
+
+        // 断点 2：倒数第 5 条消息应有 cache_control（messages.len()=6 > 5）
+        // 倒数第 5 条 = index 1
+        assert!(request.messages[1].cache_control.is_some(), "倒数第 5 条消息应有 cache_control 断点");
+
+        // prompt_cache_key 应设置
+        assert!(request.prompt_cache_key.is_some());
     }
 }

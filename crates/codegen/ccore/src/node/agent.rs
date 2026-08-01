@@ -205,7 +205,7 @@ impl AgentNode {
     fn build_sample_request(&mut self) -> SampleRequest {
         // 使用 to_chat_messages_direct 直接构建 ChatMessage，避免中间 Vec<(String,String)> 转换
         let messages: Vec<ChatMessage> = self.working_memory
-            .to_chat_messages_direct(|role, content| ChatMessage { role, content });
+            .to_chat_messages_direct(|role, content| ChatMessage { role, content, cache_control: None });
 
         // Doom Loop 逃脱：若上一轮检测到循环，本轮过滤掉被禁用的工具（仅禁用一轮）
         let mut tools = self.config.tools.clone();
@@ -230,6 +230,7 @@ impl AgentNode {
             temperature: None,
             system_prompt: None,
             tool_choice: None,
+            prompt_cache_key: None,
         }
     }
 

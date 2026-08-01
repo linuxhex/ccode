@@ -444,8 +444,12 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap_or(""))
             .collect();
 
-        // 验证 6 个内置工具全部存在
-        let expected_tools = ["read", "write", "edit", "bash", "glob", "grep"];
+        // 验证 13 个内置工具全部存在
+        let expected_tools = [
+            "read", "write", "edit", "bash", "glob", "grep",
+            "todo_write", "ask_user", "web_search", "web_fetch",
+            "git_status", "list_directory", "create_file",
+        ];
         for expected in &expected_tools {
             assert!(
                 tool_names.contains(expected),
@@ -455,11 +459,11 @@ mod tests {
             );
         }
 
-        // 确保恰好有 6 个工具
+        // 确保恰好有 13 个工具
         assert_eq!(
             tools.len(),
-            6,
-            "应有恰好 6 个内置工具，实际数量：{}",
+            13,
+            "应有恰好 13 个内置工具，实际数量：{}",
             tools.len()
         );
     }
