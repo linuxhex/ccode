@@ -134,7 +134,7 @@ impl NodeLauncher {
         // 注入 HookRegistry（从 hooks 配置目录加载，让 PreToolUse/PostToolUse hook 生效）
         // 全局目录 ~/.ccode/hooks/ 与项目目录 <working_dir>/.ccode/hooks/ 均可选；
         // load_hooks 对缺失目录静默返回空 registry，失败时降级为空 registry + warn
-        {
+        let hook_registry = {
             let global_dir = std::env::var("HOME")
                 .ok()
                 .map(|home| std::path::PathBuf::from(home).join(".ccode").join("hooks"));
@@ -148,8 +148,9 @@ impl NodeLauncher {
             for err in &errors {
                 tracing::warn!(target: "ccore::hooks", error = %err, "Hook 加载失败，已跳过该条目");
             }
-            tool.set_hook_registry(registry);
-        }
+            registry
+        };
+        tool.set_hook_registry(hook_registry.clone());
 
         // 4. Thinker Node
         let thinker_ctx = self.node_context();
@@ -189,6 +190,9 @@ impl NodeLauncher {
                 tracing::warn!(target: "ccore::persistence", error = %e, "状态持久化后端创建失败，持久化已禁用");
             }
         }
+
+        // 注入 Hook 注册表（生命周期钩子：Stop/PreCompact/PostCompact/Subagent）
+        thinker = thinker.with_hook_registry(hook_registry);
 
         // 5. TUI Node
         let tui_ctx = self.node_context();

@@ -83,6 +83,12 @@ use crate::sampler::token_budget::TokenBudgetManager;
 use crate::memory::episodic::EpisodicMemoryStore;
 use crate::agent::meta_cognitive::MetaCognitiveController;
 
+// ── Hook 系统（生命周期钩子：Stop/PreCompact/PostCompact/Subagent） ──
+use ccode_hooks::discovery::HookRegistry;
+use ccode_hooks::dispatcher;
+use ccode_hooks::event::{HookEventEnvelope, HookEventName, HookPayload, SubagentStopPhase};
+use ccode_hooks::runner::RunContext;
+
 /// Thinker Node 实现（仿生架构，路线 A：感官内置）
 ///
 /// 主循环由 LoopStateMachine 驱动（借鉴 Claude Code queryLoop 设计），
@@ -166,6 +172,9 @@ pub struct ThinkerNode {
     episodic_memory: EpisodicMemoryStore,
     /// 元认知控制器：难度评估+策略推荐+冲突检测
     meta_cognitive: MetaCognitiveController,
+    /// Hook 注册表：生命周期钩子（Stop/PreCompact/PostCompact/Subagent）
+    /// 由 Kernel 在启动时注入，None 表示禁用钩子功能
+    hook_registry: Option<HookRegistry>,
     /// 本轮 LLM 调用累计 token 数（input + output），供 turn 结束时汇总
     current_turn_token_usage: (usize, usize),
     /// 本轮使用的工具名列表，供 EpisodicMemory 编码
@@ -235,6 +244,7 @@ impl ThinkerNode {
             token_budget: TokenBudgetManager::new(&model),
             episodic_memory: EpisodicMemoryStore::new(),
             meta_cognitive: MetaCognitiveController::new(),
+            hook_registry: None,
             current_turn_token_usage: (0, 0),
             current_turn_tools: Vec::new(),
         }
@@ -244,6 +254,36 @@ impl ThinkerNode {
     pub fn with_state_persister(mut self, persister: StatePersister) -> Self {
         self.state_persister = Some(persister);
         self
+    }
+
+    /// 注入 Hook 注册表（builder 模式）
+    pub fn with_hook_registry(mut self, registry: HookRegistry) -> Self {
+        self.hook_registry = Some(registry);
+        self
+    }
+
+    /// 构建 Hook 运行上下文
+    fn hook_run_ctx(&self) -> RunContext<'_> {
+        RunContext {
+            session_id: self.id.as_str(),
+            workspace_root: ".",
+        }
+    }
+
+    /// 构建 Hook 事件信封（通用方法）
+    fn hook_event_envelope(&self, event: HookEventName, payload: HookPayload) -> HookEventEnvelope {
+        HookEventEnvelope {
+            hook_event_name: event,
+            session_id: self.id.to_string(),
+            cwd: ".".to_string(),
+            workspace_root: ".".to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            transcript_path: None,
+            client_identifier: None,
+            prompt_id: None,
+            permission_mode: None,
+            payload,
+        }
     }
 
     /// 保存当前状态快照（turn 结束时调用）
@@ -1070,7 +1110,83 @@ impl Node for ThinkerNode {
                         self.current_sample_request_id = None;
                         self.agentic_session_active = false;
                         self.state = AgentState::Idle;
+
+                        // ── Hook: Stop（turn 结束，可阻止停止） ──
+                        if let Some(ref registry) = self.hook_registry {
+                            let last_msg = self.working_memory.entries().iter().rev()
+                                .find(|e| matches!(e, WorkingEntry::Hot { role, .. } if matches!(role, MessageRole::Assistant)))
+                                .map(|e| match e {
+                                    WorkingEntry::Hot { content, .. } => content.as_str(),
+                                    _ => "",
+                                });
+                            let envelope = self.hook_event_envelope(
+                                HookEventName::Stop,
+                                HookPayload::Stop {
+                                    reason: "end_turn".to_string(),
+                                    stop_hook_active: false,
+                                    last_assistant_message: last_msg.map(|s| s.to_string()),
+                                    background_tasks: None,
+                                    session_crons: None,
+                                },
+                            );
+                            let ctx = self.hook_run_ctx();
+                            let stop_result = dispatcher::dispatch_stop(
+                                registry,
+                                HookEventName::Stop,
+                                &envelope,
+                                &ctx,
+                            ).await;
+                            // 如果 Stop hook 提供了额外上下文，注入工作记忆
+                            for context in &stop_result.additional_context {
+                                if !context.is_empty() {
+                                    self.working_memory.push_user(
+                                        context.clone(),
+                                        Self::estimate_tokens(context),
+                                    );
+                                }
+                            }
+                            // 如果 Stop hook 阻止停止（blocks 非空或 wants_continuation），继续循环
+                            if stop_result.wants_continuation() {
+                                tracing::info!(target: "ccore::hooks", "Stop hook 请求继续 turn");
+                                self.agentic_session_active = true;
+                            }
+                        }
+
+                        // ── Hook: PreCompact ──
+                        if let Some(ref registry) = self.hook_registry {
+                            let envelope = self.hook_event_envelope(
+                                HookEventName::PreCompact,
+                                HookPayload::PreCompact {
+                                    source: "auto".to_string(),
+                                },
+                            );
+                            let ctx = self.hook_run_ctx();
+                            let _ = dispatcher::dispatch_non_blocking(
+                                registry,
+                                HookEventName::PreCompact,
+                                &envelope,
+                                &ctx,
+                            ).await;
+                        }
+
                         self.update_context_window();
+
+                        // ── Hook: PostCompact ──
+                        if let Some(ref registry) = self.hook_registry {
+                            let envelope = self.hook_event_envelope(
+                                HookEventName::PostCompact,
+                                HookPayload::PostCompact {
+                                    source: "auto".to_string(),
+                                },
+                            );
+                            let ctx = self.hook_run_ctx();
+                            let _ = dispatcher::dispatch_non_blocking(
+                                registry,
+                                HookEventName::PostCompact,
+                                &envelope,
+                                &ctx,
+                            ).await;
+                        }
 
                         // ── ccore 高级特性：EpisodicMemory 编码 + MetaCognitive 冲突检测 ──
                         // 编码本轮对话到情景记忆（支持跨轮次上下文重建）
@@ -1517,12 +1633,56 @@ impl Node for ThinkerNode {
                     };
                     tracing::warn!("子 Agent 崩溃：{} - {}", crashed.node_id, crashed.error);
                     AgentMetrics::global().record_error("subagent_crashed");
+
+                    // ── Hook: SubagentEnd（崩溃） ──
+                    if let Some(ref registry) = self.hook_registry {
+                        let envelope = self.hook_event_envelope(
+                            HookEventName::SubagentEnd,
+                            HookPayload::SubagentStop {
+                                phase: SubagentStopPhase::Observe,
+                                subagent_id: crashed.node_id.clone(),
+                                subagent_type: "subagent".to_string(),
+                                stop_hook_active: None,
+                                last_assistant_message: None,
+                            },
+                        );
+                        let ctx = self.hook_run_ctx();
+                        let _ = dispatcher::dispatch_stop(
+                            registry,
+                            HookEventName::SubagentEnd,
+                            &envelope,
+                            &ctx,
+                        ).await;
+                    }
+
                     let node_id: NodeId = crashed.node_id.clone().into();
                     self.orchestrator.remove_subagent(&node_id);
                 } else if payload.get("type").and_then(|v| v.as_str()) == Some("completed") {
                     let subagent_id = payload["node_id"].as_str().unwrap_or("");
                     let output = payload["output"].as_str().unwrap_or("");
                     tracing::info!("子 Agent 完成：{}, 输出长度={}", subagent_id, output.len());
+
+                    // ── Hook: SubagentEnd（完成） ──
+                    if let Some(ref registry) = self.hook_registry {
+                        let envelope = self.hook_event_envelope(
+                            HookEventName::SubagentEnd,
+                            HookPayload::SubagentStop {
+                                phase: SubagentStopPhase::Observe,
+                                subagent_id: subagent_id.to_string(),
+                                subagent_type: "subagent".to_string(),
+                                stop_hook_active: None,
+                                last_assistant_message: None,
+                            },
+                        );
+                        let ctx = self.hook_run_ctx();
+                        let _ = dispatcher::dispatch_stop(
+                            registry,
+                            HookEventName::SubagentEnd,
+                            &envelope,
+                            &ctx,
+                        ).await;
+                    }
+
                     let token_count = Self::estimate_tokens(output);
                     self.working_memory.push_user(output.to_string(), token_count);
                     let node_id: NodeId = subagent_id.to_string().into();
