@@ -4,7 +4,7 @@
 //! 1. 订阅 Agent 输出 → 渲染到终端（语法高亮 + diff 着色）
 //! 2. 读取用户输入 → 发送到 Agent input topic（多行输入支持）
 //! 3. 展示工具调用状态卡片（名称/状态/耗时/结果摘要）
-//! 4. 展示 Agent 状态指示器（thinking/outputting/tool_calling）
+//! 4. 展示 Agent 状态指示器（thinking 动画/token 成本/进度动画）
 //!
 //! 渲染基于 ratatui + crossterm 后端
 
@@ -19,10 +19,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Gauge, Paragraph, Wrap},
     Terminal,
 };
 use std::io;
+use std::time::Instant;
 
 use crate::message::frame::FrameCodec;
 use crate::message::Message;
@@ -30,6 +31,7 @@ use crate::message::Topic;
 use crate::node::{Node, NodeId, NodeType, NodeContext};
 use crate::node::transport::NodeTransportHandle;
 
+use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
@@ -43,14 +45,17 @@ pub enum AgentStatus {
     Error,
 }
 
-impl std::fmt::Display for AgentStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl AgentStatus {
+    /// 获取带动画的状态文本（传入 frame_counter 用于旋转动画）
+    fn animated_display(&self, frame: usize) -> String {
+        let spinner = ["◐", "◓", "◑", "◒"];
+        let idx = frame % spinner.len();
         match self {
-            Self::Idle => write!(f, "●"),
-            Self::Thinking => write!(f, "◔ thinking"),
-            Self::Outputting => write!(f, "◉ outputting"),
-            Self::ToolCalling => write!(f, "⚙ tool_calling"),
-            Self::Error => write!(f, "✕ error"),
+            Self::Idle => "● idle".to_string(),
+            Self::Thinking => format!("{} thinking", spinner[idx]),
+            Self::Outputting => format!("◉ outputting"),
+            Self::ToolCalling => format!("⚙ tool_calling"),
+            Self::Error => "✕ error".to_string(),
         }
     }
 }
@@ -61,6 +66,10 @@ struct ToolCard {
     name: String,
     status: ToolStatus,
     result_summary: String,
+    /// 工具开始执行时间（用于进度动画）
+    started_at: Option<Instant>,
+    /// 工具执行耗时
+    elapsed: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,12 +79,12 @@ enum ToolStatus {
     Failed,
 }
 
-impl std::fmt::Display for ToolStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ToolStatus {
+    fn icon(&self) -> &str {
         match self {
-            Self::Running => write!(f, "⏳"),
-            Self::Done => write!(f, "✅"),
-            Self::Failed => write!(f, "❌"),
+            Self::Running => "⏳",
+            Self::Done => "✅",
+            Self::Failed => "❌",
         }
     }
 }
@@ -277,6 +286,15 @@ pub struct TUINode {
     diff_content: String,
     /// 是否显示 diff 区而非输出区
     show_diff: bool,
+    /// 动画帧计数器（每帧 +1，用于 thinking spinner 和进度动画）
+    frame_counter: usize,
+    /// Token 使用统计
+    total_input_tokens: usize,
+    total_output_tokens: usize,
+    /// 预估成本（美元，按 GPT-4o 价格：输入 $2.5/M, 输出 $10/M）
+    estimated_cost: f64,
+    /// 当前 turn 开始时间
+    turn_started: Option<Instant>,
 }
 
 impl TUINode {
@@ -296,6 +314,11 @@ impl TUINode {
             tool_cards: Vec::new(),
             diff_content: String::new(),
             show_diff: false,
+            frame_counter: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            estimated_cost: 0.0,
+            turn_started: None,
         }
     }
 
@@ -343,14 +366,27 @@ impl TUINode {
 
     /// 渲染 TUI 界面
     fn render(&mut self) -> anyhow::Result<()> {
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+
+        // ─── 预计算所有数据（避免在 terminal.draw() 闭包中借用 self） ────
+        let highlighted_lines = self.highlight_output();
+        let diff_lines = self.render_diff();
+        let has_tools = !self.tool_cards.is_empty();
+        let agent_status = self.agent_status.clone();
+        let frame = self.frame_counter;
+        let total_input_tokens = self.total_input_tokens;
+        let total_output_tokens = self.total_output_tokens;
+        let estimated_cost = self.estimated_cost;
+        let turn_started = self.turn_started;
+        let tool_status = self.tool_status.clone();
+        let show_diff = self.show_diff;
+        let scroll_offset = self.scroll_offset;
+        let tool_cards = self.tool_cards.clone();
+
         let terminal = match self.terminal.as_mut() {
             Some(t) => t,
             None => return Ok(()),
         };
-
-        let highlighted_lines = self.highlight_output();
-        let diff_lines = self.render_diff();
-        let has_tools = !self.tool_cards.is_empty();
 
         terminal.draw(|f| {
             let size = f.area();
@@ -371,18 +407,19 @@ impl TUINode {
                 .constraints([
                     Constraint::Length(1),  // 状态栏
                     Constraint::Min(5),     // 输出区
+                    Constraint::Length(1),  // 进度条
                     Constraint::Length(2),  // 输入区
                 ])
                 .split(h_chunks[0]);
 
-            // 状态栏
-            let status_text = Line::from(vec![
+            // ─── 状态栏：品牌 + 动画状态 + token/成本 + 耗时 ───────────────
+            let mut status_spans = vec![
                 Span::styled(" ccode ", Style::default().fg(Color::Black).bg(Color::Cyan)),
                 Span::raw(" "),
                 Span::styled(
-                    self.agent_status.to_string(),
+                    agent_status.animated_display(frame),
                     Style::default()
-                        .fg(match &self.agent_status {
+                        .fg(match &agent_status {
                             AgentStatus::Thinking => Color::Yellow,
                             AgentStatus::Outputting => Color::Green,
                             AgentStatus::ToolCalling => Color::Blue,
@@ -391,97 +428,110 @@ impl TUINode {
                         })
                         .add_modifier(Modifier::BOLD),
                 ),
-                if !self.tool_status.is_empty() {
-                    Span::styled(format!("  {}", self.tool_status), Style::default().fg(Color::DarkGray))
-                } else {
-                    Span::raw("")
-                },
-                if self.show_diff {
-                    Span::styled("  [Tab] 切换diff视图", Style::default().fg(Color::Yellow))
-                } else {
-                    Span::raw("")
-                },
-            ]);
-            let status_bar = Paragraph::new(status_text);
+            ];
+
+            // Token 统计
+            if total_input_tokens > 0 || total_output_tokens > 0 {
+                status_spans.push(Span::styled(
+                    format!("  in:{} out:{}", format_tokens(total_input_tokens), format_tokens(total_output_tokens)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            // 成本
+            if estimated_cost > 0.0 {
+                status_spans.push(Span::styled(
+                    format!("  ${:.4}", estimated_cost),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+
+            // 耗时
+            if let Some(start) = turn_started {
+                let elapsed = start.elapsed();
+                status_spans.push(Span::styled(
+                    format!("  {}s", elapsed.as_secs()),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            // 工具状态
+            if !tool_status.is_empty() {
+                status_spans.push(Span::styled(
+                    format!("  {}", tool_status),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            // diff 切换提示
+            if show_diff {
+                status_spans.push(Span::styled(
+                    "  [Tab] 切换视图",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+
+            let status_bar = Paragraph::new(Line::from(status_spans));
             f.render_widget(status_bar, v_chunks[0]);
 
-            // 输出区 / Diff 区
-            if self.show_diff {
-                let visible = self.apply_scroll_offset(&diff_lines, v_chunks[1].height as usize);
+            // ─── 输出区 / Diff 区 ──────────────────────────────────────────
+            if show_diff {
+                let visible = apply_scroll_offset(&diff_lines, scroll_offset, v_chunks[1].height as usize);
                 let diff_block = Paragraph::new(Text::from(visible))
                     .block(Block::default().borders(Borders::NONE).title(" Diff "))
                     .wrap(Wrap { trim: false });
                 f.render_widget(diff_block, v_chunks[1]);
             } else {
-                let visible = self.apply_scroll_offset(&highlighted_lines, v_chunks[1].height as usize);
+                let visible = apply_scroll_offset(&highlighted_lines, scroll_offset, v_chunks[1].height as usize);
                 let output = Paragraph::new(Text::from(visible))
                     .block(Block::default().borders(Borders::NONE))
                     .wrap(Wrap { trim: false });
                 f.render_widget(output, v_chunks[1]);
             }
 
-            // 输入区
+            // ─── 进度条 ───────────────────────────────────────────────────
+            let running_tools: Vec<&ToolCard> = tool_cards
+                .iter()
+                .filter(|c| c.status == ToolStatus::Running)
+                .collect();
+            if !running_tools.is_empty() {
+                let tool = running_tools.last().unwrap();
+                let elapsed = tool.started_at
+                    .map(|s| s.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                let progress = (elapsed / 60.0).min(1.0); // 60s 为满进度
+                let label = format!(" {} {} ({:.0}s)", tool.status.icon(), tool.name, elapsed);
+                let gauge = Gauge::default()
+                    .block(Block::default().borders(Borders::NONE))
+                    .gauge_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .ratio(progress)
+                    .label(label);
+                f.render_widget(gauge, v_chunks[2]);
+            } else {
+                // 空进度条占位
+                let gauge = Gauge::default()
+                    .block(Block::default().borders(Borders::NONE))
+                    .gauge_style(Style::default().fg(Color::DarkGray))
+                    .ratio(0.0)
+                    .label("");
+                f.render_widget(gauge, v_chunks[2]);
+            }
+
+            // ─── 输入区 ───────────────────────────────────────────────────
             let input_display = Line::from(vec![
                 Span::styled(" > ", Style::default().fg(Color::Cyan)),
                 Span::raw("Enter 发送 | Ctrl+Enter 换行 | Esc 退出 | ↑↓ 历史 | PgUp/PgDn 滚动"),
             ]);
             let input = Paragraph::new(input_display);
-            f.render_widget(input, v_chunks[2]);
+            f.render_widget(input, v_chunks[3]);
 
             // 工具卡片侧边栏
             if has_tools {
-                self.render_tool_cards(f, h_chunks[1]);
+                render_tool_cards_static(f, h_chunks[1], &tool_cards);
             }
         })?;
 
         Ok(())
-    }
-
-    /// 渲染工具卡片侧边栏
-    fn render_tool_cards(&self, f: &mut ratatui::Frame, area: Rect) {
-        let card_count = self.tool_cards.len().min(5);
-        let card_height = 3u16; // 每个卡片 3 行
-        let total_height = (card_count as u16) * (card_height + 1);
-
-        let cards: Vec<Line> = self.tool_cards
-            .iter()
-            .rev()
-            .take(5)
-            .flat_map(|card| {
-                vec![
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{} {}", card.status, card.name),
-                            Style::default()
-                                .fg(match card.status {
-                                    ToolStatus::Running => Color::Yellow,
-                                    ToolStatus::Done => Color::Green,
-                                    ToolStatus::Failed => Color::Red,
-                                })
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]),
-                    Line::from(Span::styled(
-                        if card.result_summary.len() > 25 {
-                            format!("{}...", &card.result_summary[..25])
-                        } else {
-                            card.result_summary.clone()
-                        },
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                    Line::from(Span::raw("")), // 分隔空行
-                ]
-            })
-            .collect();
-
-        let card_block = Block::default()
-            .borders(Borders::LEFT)
-            .title(" 工具 ")
-            .border_style(Style::default().fg(Color::DarkGray));
-        let card_paragraph = Paragraph::new(Text::from(cards))
-            .block(card_block)
-            .wrap(Wrap { trim: true });
-        f.render_widget(card_paragraph, area);
     }
 
     /// 渲染 diff 内容（绿色/红色着色）
@@ -523,13 +573,10 @@ impl TUINode {
                         .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
                     for code_line in &code_lines {
-                        let highlighted = syntect::util::highlight(
-                            code_line,
-                            &self.syntax_set,
-                            syntax,
-                            theme,
-                        );
-                        let spans: Vec<Span> = highlighted
+                        let mut highlighter = HighlightLines::new(syntax, theme);
+                        let ranges = highlighter.highlight_line(code_line, &self.syntax_set)
+                            .unwrap_or_default();
+                        let spans: Vec<Span> = ranges
                             .iter()
                             .map(|(style, text)| {
                                 Span::styled(
@@ -573,13 +620,10 @@ impl TUINode {
                 .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
             for code_line in &code_lines {
-                let highlighted = syntect::util::highlight(
-                    code_line,
-                    &self.syntax_set,
-                    syntax,
-                    theme,
-                );
-                let spans: Vec<Span> = highlighted
+                let mut highlighter = HighlightLines::new(syntax, theme);
+                let ranges = highlighter.highlight_line(code_line, &self.syntax_set)
+                    .unwrap_or_default();
+                let spans: Vec<Span> = ranges
                     .iter()
                     .map(|(style, text)| {
                         Span::styled(
@@ -600,15 +644,82 @@ impl TUINode {
 
         lines
     }
+}
 
-    fn apply_scroll_offset(&self, lines: &[Line<'static>], viewport_height: usize) -> Vec<Line<'static>> {
-        let total_lines = lines.len();
-        if total_lines <= viewport_height {
-            return lines.to_vec();
-        }
-        let start = self.scroll_offset.min(total_lines.saturating_sub(viewport_height));
-        lines[start..].to_vec()
+/// 独立函数：apply_scroll_offset（用于闭包内调用）
+fn apply_scroll_offset(lines: &[Line<'static>], scroll_offset: usize, viewport_height: usize) -> Vec<Line<'static>> {
+    let total_lines = lines.len();
+    if total_lines <= viewport_height {
+        return lines.to_vec();
     }
+    let start = scroll_offset.min(total_lines.saturating_sub(viewport_height));
+    lines[start..].to_vec()
+}
+
+/// 独立函数：渲染工具卡片侧边栏（用于闭包内调用）
+fn render_tool_cards_static(f: &mut ratatui::Frame, area: Rect, tool_cards: &[ToolCard]) {
+    let cards: Vec<Line> = tool_cards
+        .iter()
+        .rev()
+        .take(5)
+        .flat_map(|card| {
+            let elapsed_str = if card.status == ToolStatus::Running {
+                card.started_at
+                    .map(|s| format!(" {:.0}s", s.elapsed().as_secs_f64()))
+                    .unwrap_or_default()
+            } else if let Some(d) = card.elapsed {
+                format!(" {:.1}s", d.as_secs_f64())
+            } else {
+                String::new()
+            };
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!("{} {}{}", card.status.icon(), card.name, elapsed_str),
+                        Style::default()
+                            .fg(match card.status {
+                                ToolStatus::Running => Color::Yellow,
+                                ToolStatus::Done => Color::Green,
+                                ToolStatus::Failed => Color::Red,
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    if card.result_summary.len() > 25 {
+                        format!("{}...", &card.result_summary[..25])
+                    } else {
+                        card.result_summary.clone()
+                    },
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::raw("")),
+            ]
+        })
+        .collect();
+
+    let card_block = Block::default()
+        .borders(Borders::LEFT)
+        .title(" 工具 ")
+        .border_style(Style::default().fg(Color::DarkGray));
+    let card_paragraph = Paragraph::new(Text::from(cards))
+        .block(card_block)
+        .wrap(Wrap { trim: true });
+    f.render_widget(card_paragraph, area);
+}
+
+/// 格式化 token 数量（>1000 时用 k 表示）
+fn format_tokens(n: usize) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// 估算 LLM 调用成本（GPT-4o 价格：输入 $2.5/M, 输出 $10/M tokens）
+fn estimate_cost(input_tokens: usize, output_tokens: usize) -> f64 {
+    (input_tokens as f64) * 2.5 / 1_000_000.0 + (output_tokens as f64) * 10.0 / 1_000_000.0
 }
 
 #[async_trait]
@@ -636,6 +747,10 @@ impl Node for TUINode {
             t if t.ends_with("/output") => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
                 if let Some(content) = payload["content"].as_str() {
+                    // 首次输出时启动 turn 计时
+                    if self.turn_started.is_none() {
+                        self.turn_started = Some(Instant::now());
+                    }
                     self.agent_status = AgentStatus::Outputting;
                     self.output_buffer.push_str(content);
 
@@ -656,15 +771,28 @@ impl Node for TUINode {
                 let success = payload["success"].as_bool().unwrap_or(true);
                 let output = payload["output"].as_str().unwrap_or("");
 
-                // 更新工具卡片
-                let status = if success { ToolStatus::Done } else { ToolStatus::Failed };
-                let summary = output.lines().next().unwrap_or("").to_string();
-                let card = ToolCard {
-                    name: tool_name.to_string(),
-                    status,
-                    result_summary: summary,
+                // 更新对应的运行中工具卡片
+                let _elapsed = if let Some(card) = self.tool_cards.iter_mut().rev()
+                    .find(|c| c.name == tool_name && c.status == ToolStatus::Running) {
+                    let elapsed = card.started_at.map(|s| s.elapsed());
+                    card.status = if success { ToolStatus::Done } else { ToolStatus::Failed };
+                    card.elapsed = elapsed;
+                    card.result_summary = output.lines().next().unwrap_or("").to_string();
+                    card.elapsed
+                } else {
+                    // 没有对应的运行中卡片，新建
+                    let summary = output.lines().next().unwrap_or("").to_string();
+                    let card = ToolCard {
+                        name: tool_name.to_string(),
+                        status: if success { ToolStatus::Done } else { ToolStatus::Failed },
+                        result_summary: summary,
+                        started_at: None,
+                        elapsed: None,
+                    };
+                    self.tool_cards.push(card);
+                    None
                 };
-                self.tool_cards.push(card);
+
                 if self.tool_cards.len() > 10 {
                     self.tool_cards.remove(0);
                 }
@@ -684,12 +812,26 @@ impl Node for TUINode {
                         "outputting" => AgentStatus::Outputting,
                         "tool_calling" => AgentStatus::ToolCalling,
                         "error" => AgentStatus::Error,
+                        "idle" => {
+                            // turn 结束，重置计时
+                            self.turn_started = None;
+                            AgentStatus::Idle
+                        }
                         _ => AgentStatus::Idle,
                     };
                 }
                 if let Some(tool_info) = payload["tool"].as_str() {
                     self.tool_status = tool_info.to_string();
                 }
+                // 追踪 token 使用
+                if let Some(input_tokens) = payload["input_tokens"].as_u64() {
+                    self.total_input_tokens += input_tokens as usize;
+                }
+                if let Some(output_tokens) = payload["output_tokens"].as_u64() {
+                    self.total_output_tokens += output_tokens as usize;
+                }
+                self.estimated_cost = estimate_cost(self.total_input_tokens, self.total_output_tokens);
+
                 if self.terminal.is_some() {
                     self.render()?;
                 }
@@ -699,11 +841,13 @@ impl Node for TUINode {
                 if let Some(tool_name) = payload["tool_name"].as_str() {
                     self.agent_status = AgentStatus::ToolCalling;
                     self.tool_status = format!("{}", tool_name);
-                    // 添加运行中的工具卡片
+                    // 添加运行中的工具卡片（带开始时间）
                     self.tool_cards.push(ToolCard {
                         name: tool_name.to_string(),
                         status: ToolStatus::Running,
                         result_summary: "执行中...".to_string(),
+                        started_at: Some(Instant::now()),
+                        elapsed: None,
                     });
                     if self.terminal.is_some() {
                         self.render()?;

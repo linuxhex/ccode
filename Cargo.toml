@@ -35,7 +35,6 @@ members = [
     "crates/codegen/ccode-mermaid",
     "crates/codegen/ccode-models",
     "crates/codegen/ccode-pager",
-    "crates/codegen/ccode-pager-minimal",
     "crates/codegen/ccode-pager-pty",
     "crates/codegen/ccode-pager-render",
     "crates/codegen/ccode-paths",

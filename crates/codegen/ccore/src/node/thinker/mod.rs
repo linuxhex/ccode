@@ -159,7 +159,7 @@ pub struct ThinkerNode {
     /// 熔断器：5次连续失败后自动断开，防止级联故障
     circuit_breaker: CircuitBreaker,
     /// 读取追踪器：先读后写保护，跨线程安全（Arc<Mutex>）
-    read_tracker: std::sync::Arc<parking_lot::Mutex<ReadTracker>>,
+    read_tracker: std::sync::Arc<std::sync::Mutex<ReadTracker>>,
     /// Token 预算管理器：跨轮次累计使用量，驱动上下文压缩
     token_budget: TokenBudgetManager,
     /// 情景记忆存储：每轮对话编码为情景记忆，支持上下文重建
@@ -175,6 +175,7 @@ pub struct ThinkerNode {
 impl ThinkerNode {
     pub fn new(id: NodeId, mut config: AgentConfig) -> Self {
         let max_tokens = 128_000;
+        let model = config.model.clone();
 
         // 确保 task 工具定义在 config.tools 中（LLM 需要知道可以调用 task 工具）
         let has_task_tool = config.tools.iter().any(|t| t.name == "task");
@@ -230,8 +231,8 @@ impl ThinkerNode {
             state_persister: None,
             // ccore 高级特性初始化（融合自 SessionActor）
             circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
-            read_tracker: std::sync::Arc::new(parking_lot::Mutex::new(ReadTracker::new())),
-            token_budget: TokenBudgetManager::new(&config.model),
+            read_tracker: std::sync::Arc::new(std::sync::Mutex::new(ReadTracker::new())),
+            token_budget: TokenBudgetManager::new(&model),
             episodic_memory: EpisodicMemoryStore::new(),
             meta_cognitive: MetaCognitiveController::new(),
             current_turn_token_usage: (0, 0),
@@ -443,7 +444,7 @@ impl ThinkerNode {
         if matches!(tool_name, "read" | "read_file") {
             // 从 output 解析文件路径（简化：取 output 中的文件路径）
             if let Some(path) = self.extract_read_path(tool_name, output) {
-                self.read_tracker.lock().record_read(&path);
+                self.read_tracker.lock().expect("read_tracker lock poisoned").mark_read(&path);
             }
         }
 
@@ -799,7 +800,7 @@ impl ThinkerNode {
     async fn check_budget_and_circuit(&self, _transport: &NodeTransportHandle) -> bool {
         if !self.circuit_breaker.allow_request() {
             tracing::warn!(target: "ccore::circuit_breaker",
-                state = ?self.circuit_breaker.state(),
+                state = ?self.circuit_breaker.current_state(),
                 "熔断器 Open，阻止 LLM 调用");
             return false;
         }
@@ -1073,7 +1074,7 @@ impl Node for ThinkerNode {
 
                         // ── ccore 高级特性：EpisodicMemory 编码 + MetaCognitive 冲突检测 ──
                         // 编码本轮对话到情景记忆（支持跨轮次上下文重建）
-                        let user_msg = self.working_memory.entries().iter()
+                        let _user_msg = self.working_memory.entries().iter()
                             .find(|e| matches!(e, WorkingEntry::Hot { role, .. } if matches!(role, MessageRole::User)))
                             .map(|e| match e {
                                 WorkingEntry::Hot { content, .. } => content.as_str(),
@@ -1091,15 +1092,15 @@ impl Node for ThinkerNode {
                         let context = format!("tools: {}", tools_used.join(", "));
                         let keywords = tools_used.clone();
                         self.episodic_memory.encode(
-                            crate::memory::episodic::MemoryType::Conversation,
+                            crate::memory::episodic::MemoryType::Episodic,
                             assistant_msg,
                             &context,
                             keywords,
                             crate::memory::episodic::MemorySource {
-                                source_type: "thinker_node".to_string(),
-                                source_id: self.id.to_string(),
+                                session_id: self.id.to_string(),
                                 timestamp: Utc::now().timestamp(),
-                                reliability: 0.8,
+                                message_index: None,
+                                confidence: 0.8,
                             },
                         );
 
