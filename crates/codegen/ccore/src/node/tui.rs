@@ -1,22 +1,22 @@
 //! TUI Node - 终端渲染、用户输入
 //!
 //! TUI Node 的职责：
-//! 1. 订阅 Agent 输出 → 渲染到终端
-//! 2. 读取用户输入 → 发送到 Agent input topic
-//! 3. 展示工具调用状态（等待/执行中/完成）
+//! 1. 订阅 Agent 输出 → 渲染到终端（语法高亮 + diff 着色）
+//! 2. 读取用户输入 → 发送到 Agent input topic（多行输入支持）
+//! 3. 展示工具调用状态卡片（名称/状态/耗时/结果摘要）
 //! 4. 展示 Agent 状态指示器（thinking/outputting/tool_calling）
 //!
 //! 渲染基于 ratatui + crossterm 后端
 
 use async_trait::async_trait;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -55,6 +55,31 @@ impl std::fmt::Display for AgentStatus {
     }
 }
 
+/// 工具执行卡片
+#[derive(Debug, Clone)]
+struct ToolCard {
+    name: String,
+    status: ToolStatus,
+    result_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ToolStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+impl std::fmt::Display for ToolStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => write!(f, "⏳"),
+            Self::Done => write!(f, "✅"),
+            Self::Failed => write!(f, "❌"),
+        }
+    }
+}
+
 /// TUI 专用消息循环
 ///
 /// 与标准 run_node 不同，TUI 需要同时监听消息总线和键盘输入。
@@ -66,7 +91,6 @@ pub async fn run_tui_node(
     let node_id = node.node_id().clone();
     let subscriptions = node.subscriptions();
 
-    // 构建连接信息
     let connect_info = crate::node::transport::NodeConnectInfo {
         router_addr: ctx.router_addr.clone(),
         pub_addr: ctx.pub_addr.clone(),
@@ -79,27 +103,21 @@ pub async fn run_tui_node(
         service_name: None,
     };
 
-    // 连接消息总线
     let mut transport = crate::node::transport::NodeTransport::connect(&connect_info)
     .await?;
 
     let handle = transport.handle().clone();
 
-    // 启动 TUI
     node.start(ctx).await?;
     tracing::info!("TUI Node {} 已启动，进入交互循环", node_id);
 
-    // 输入缓冲区
     let mut input_buffer = String::new();
 
-    // 心跳定时器：每 10 秒发送一次心跳
     let mut heartbeat_timer = tokio::time::interval(std::time::Duration::from_secs(10));
-    heartbeat_timer.tick().await; // 消耗首次立即触发
+    heartbeat_timer.tick().await;
 
-    // 交互循环：同时等待消息和键盘输入
     loop {
         tokio::select! {
-            // 消息总线消息
             msg = transport.recv() => {
                 match msg {
                     Ok(Some(msg)) => {
@@ -109,12 +127,10 @@ pub async fn run_tui_node(
                         if msg.topic.as_str() == "sys/heartbeat" {
                             continue;
                         }
-                        // 收到 sys/spawn 时记录 primary agent ID
                         if msg.topic.as_str() == "sys/spawn" {
                             if node.primary_agent_id.is_none() {
                                 if let Ok(payload) = FrameCodec::decode_payload::<serde_json::Value>(&msg) {
                                     if let Some(node_type) = payload["node_type"].as_str() {
-                                        // 兼容 AgentNode 和 ThinkerNode
                                         if node_type == "agent" || node_type == "thinker" {
                                             if let Some(agent_id) = payload["node_id"].as_str() {
                                                 node.set_primary_agent(agent_id.to_string());
@@ -135,7 +151,6 @@ pub async fn run_tui_node(
                     }
                 }
             }
-            // 定期发送心跳
             _ = heartbeat_timer.tick() => {
                 let heartbeat_msg = FrameCodec::new_message(
                     Topic::sys_heartbeat(),
@@ -146,18 +161,19 @@ pub async fn run_tui_node(
                     tracing::warn!("TUI 心跳发送失败：{}", e);
                 }
             }
-            // 键盘输入
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                // 非阻塞检查键盘输入
                 if event::poll(std::time::Duration::from_millis(0))? {
                     if let Event::Key(key) = event::read()? {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         match key.code {
+                            // Enter 发送消息；Ctrl+Enter 换行（多行输入）
+                            KeyCode::Enter if ctrl => {
+                                input_buffer.push('\n');
+                            }
                             KeyCode::Enter => {
                                 if !input_buffer.is_empty() {
-                                    // 保存到历史
                                     node.input_history.push(input_buffer.clone());
                                     node.history_index = None;
-                                    // 发送输入到 Agent
                                     if let Some(agent_id) = &node.primary_agent_id {
                                         let input_msg = FrameCodec::new_message(
                                             Topic::agent_input(agent_id),
@@ -170,14 +186,12 @@ pub async fn run_tui_node(
                                         handle.send_message(&input_msg).await?;
                                     }
                                     input_buffer.clear();
-                                    // 重新渲染输入区
                                     if node.terminal.is_some() {
                                         node.render()?;
                                     }
                                 }
                             }
                             KeyCode::Up => {
-                                // 历史导航：上一个
                                 if !node.input_history.is_empty() {
                                     let idx = match node.history_index {
                                         Some(i) if i > 0 => i - 1,
@@ -188,7 +202,6 @@ pub async fn run_tui_node(
                                 }
                             }
                             KeyCode::Down => {
-                                // 历史导航：下一个
                                 if let Some(idx) = node.history_index {
                                     if idx + 1 < node.input_history.len() {
                                         input_buffer = node.input_history[idx + 1].clone();
@@ -217,6 +230,12 @@ pub async fn run_tui_node(
                             KeyCode::Backspace => {
                                 input_buffer.pop();
                             }
+                            KeyCode::Tab => {
+                                node.show_diff = !node.show_diff;
+                                if node.terminal.is_some() {
+                                    node.render()?;
+                                }
+                            }
                             KeyCode::Esc => {
                                 tracing::info!("用户按 Esc 退出");
                                 break;
@@ -243,22 +262,21 @@ fn syntect_to_ratatui_color(color: syntect::highlighting::Color) -> Color {
 pub struct TUINode {
     id: NodeId,
     primary_agent_id: Option<String>,
-    /// 当前 Agent 状态
     agent_status: AgentStatus,
-    /// Agent 输出缓冲区
     output_buffer: String,
-    /// 工具调用状态显示
     tool_status: String,
-    /// 终端（lazy init）
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
-    /// 语法高亮引擎
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
-    /// 滚动偏移量（行数）
     scroll_offset: usize,
-    /// 输入历史
     input_history: Vec<String>,
     history_index: Option<usize>,
+    /// 工具执行卡片列表（最近 5 个工具）
+    tool_cards: Vec<ToolCard>,
+    /// 当前 diff 内容（来自 write/edit 工具的输出）
+    diff_content: String,
+    /// 是否显示 diff 区而非输出区
+    show_diff: bool,
 }
 
 impl TUINode {
@@ -275,15 +293,16 @@ impl TUINode {
             scroll_offset: 0,
             input_history: Vec::new(),
             history_index: None,
+            tool_cards: Vec::new(),
+            diff_content: String::new(),
+            show_diff: false,
         }
     }
 
-    /// 设置主 Agent ID（收到 sys/spawn 后更新）
     pub fn set_primary_agent(&mut self, agent_id: String) {
         self.primary_agent_id = Some(agent_id);
     }
 
-    /// 初始化终端
     fn init_terminal(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -294,13 +313,32 @@ impl TUINode {
         Ok(())
     }
 
-    /// 恢复终端
     fn restore_terminal(&mut self) -> anyhow::Result<()> {
         if let Some(mut terminal) = self.terminal.take() {
             disable_raw_mode()?;
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         }
         Ok(())
+    }
+
+    /// 从工具输出中提取 diff 内容
+    fn extract_diff(&mut self, tool_name: &str, output: &str) {
+        // write/edit 工具的输出可能包含 diff
+        if matches!(tool_name, "write" | "edit" | "write_file") {
+            // 检测是否包含 unified diff 格式
+            if output.contains("@@") && (output.contains("---") || output.contains("+++")) {
+                self.diff_content = output.to_string();
+                self.show_diff = true;
+            } else {
+                // 尝试从输出中提取 diff 块
+                if let Some(diff_start) = output.find("```diff") {
+                    if let Some(diff_end) = output[diff_start + 7..].find("```") {
+                        self.diff_content = output[diff_start + 7..diff_start + 7 + diff_end].to_string();
+                        self.show_diff = true;
+                    }
+                }
+            }
+        }
     }
 
     /// 渲染 TUI 界面
@@ -311,19 +349,31 @@ impl TUINode {
         };
 
         let highlighted_lines = self.highlight_output();
+        let diff_lines = self.render_diff();
+        let has_tools = !self.tool_cards.is_empty();
 
         terminal.draw(|f| {
             let size = f.area();
 
-            // 布局：上方状态栏 + 中间输出区 + 下方输入区
-            let chunks = Layout::default()
+            // 水平分割：主区域 + 工具卡片侧边栏
+            let h_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(if has_tools {
+                    vec![Constraint::Min(40), Constraint::Length(28)]
+                } else {
+                    vec![Constraint::Min(40), Constraint::Length(0)]
+                })
+                .split(size);
+
+            // 垂直分割主区域
+            let v_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(1),  // 状态栏
                     Constraint::Min(5),     // 输出区
                     Constraint::Length(2),  // 输入区
                 ])
-                .split(size);
+                .split(h_chunks[0]);
 
             // 状态栏
             let status_text = Line::from(vec![
@@ -346,27 +396,110 @@ impl TUINode {
                 } else {
                     Span::raw("")
                 },
+                if self.show_diff {
+                    Span::styled("  [Tab] 切换diff视图", Style::default().fg(Color::Yellow))
+                } else {
+                    Span::raw("")
+                },
             ]);
             let status_bar = Paragraph::new(status_text);
-            f.render_widget(status_bar, chunks[0]);
+            f.render_widget(status_bar, v_chunks[0]);
 
-            // 输出区：使用语法高亮的行
-            let visible_lines = self.apply_scroll_offset(&highlighted_lines, chunks[1].height as usize);
-            let output = Paragraph::new(Text::from(visible_lines))
-                .block(Block::default().borders(Borders::NONE))
-                .wrap(Wrap { trim: false });
-            f.render_widget(output, chunks[1]);
+            // 输出区 / Diff 区
+            if self.show_diff {
+                let visible = self.apply_scroll_offset(&diff_lines, v_chunks[1].height as usize);
+                let diff_block = Paragraph::new(Text::from(visible))
+                    .block(Block::default().borders(Borders::NONE).title(" Diff "))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(diff_block, v_chunks[1]);
+            } else {
+                let visible = self.apply_scroll_offset(&highlighted_lines, v_chunks[1].height as usize);
+                let output = Paragraph::new(Text::from(visible))
+                    .block(Block::default().borders(Borders::NONE))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(output, v_chunks[1]);
+            }
 
             // 输入区
-            let input_text = Line::from(vec![
+            let input_display = Line::from(vec![
                 Span::styled(" > ", Style::default().fg(Color::Cyan)),
-                Span::raw("Enter 发送 | Esc 退出 | ↑↓ 历史 | PgUp/PgDn 滚动"),
+                Span::raw("Enter 发送 | Ctrl+Enter 换行 | Esc 退出 | ↑↓ 历史 | PgUp/PgDn 滚动"),
             ]);
-            let input = Paragraph::new(input_text);
-            f.render_widget(input, chunks[2]);
+            let input = Paragraph::new(input_display);
+            f.render_widget(input, v_chunks[2]);
+
+            // 工具卡片侧边栏
+            if has_tools {
+                self.render_tool_cards(f, h_chunks[1]);
+            }
         })?;
 
         Ok(())
+    }
+
+    /// 渲染工具卡片侧边栏
+    fn render_tool_cards(&self, f: &mut ratatui::Frame, area: Rect) {
+        let card_count = self.tool_cards.len().min(5);
+        let card_height = 3u16; // 每个卡片 3 行
+        let total_height = (card_count as u16) * (card_height + 1);
+
+        let cards: Vec<Line> = self.tool_cards
+            .iter()
+            .rev()
+            .take(5)
+            .flat_map(|card| {
+                vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{} {}", card.status, card.name),
+                            Style::default()
+                                .fg(match card.status {
+                                    ToolStatus::Running => Color::Yellow,
+                                    ToolStatus::Done => Color::Green,
+                                    ToolStatus::Failed => Color::Red,
+                                })
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(Span::styled(
+                        if card.result_summary.len() > 25 {
+                            format!("{}...", &card.result_summary[..25])
+                        } else {
+                            card.result_summary.clone()
+                        },
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(Span::raw("")), // 分隔空行
+                ]
+            })
+            .collect();
+
+        let card_block = Block::default()
+            .borders(Borders::LEFT)
+            .title(" 工具 ")
+            .border_style(Style::default().fg(Color::DarkGray));
+        let card_paragraph = Paragraph::new(Text::from(cards))
+            .block(card_block)
+            .wrap(Wrap { trim: true });
+        f.render_widget(card_paragraph, area);
+    }
+
+    /// 渲染 diff 内容（绿色/红色着色）
+    fn render_diff(&self) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for raw_line in self.diff_content.lines() {
+            let span = if raw_line.starts_with("+++") || raw_line.starts_with("+") && !raw_line.starts_with("+++") {
+                Span::styled(raw_line.to_string(), Style::default().fg(Color::Green))
+            } else if raw_line.starts_with("---") || raw_line.starts_with("-") && !raw_line.starts_with("---") {
+                Span::styled(raw_line.to_string(), Style::default().fg(Color::Red))
+            } else if raw_line.starts_with("@@") {
+                Span::styled(raw_line.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw(raw_line.to_string())
+            };
+            lines.push(Line::from(span));
+        }
+        lines
     }
 
     /// 语法高亮：解析输出缓冲区，对代码块进行着色
@@ -383,7 +516,6 @@ impl TUINode {
 
             if trimmed.starts_with("```") {
                 if in_code_block {
-                    // 代码块结束：高亮并输出
                     let lang = code_lang.take().unwrap_or_default();
                     let syntax = self.syntax_set
                         .find_syntax_by_extension(&lang)
@@ -418,10 +550,8 @@ impl TUINode {
                     code_lines.clear();
                     in_code_block = false;
                 } else {
-                    // 代码块开始
                     in_code_block = true;
                     code_lang = Some(trimmed[3..].trim().to_string());
-                    // 渲染代码块标记行
                     lines.push(Line::from(Span::styled(
                         raw_line.to_string(),
                         Style::default().fg(Color::DarkGray),
@@ -430,16 +560,16 @@ impl TUINode {
             } else if in_code_block {
                 code_lines.push(raw_line.to_string());
             } else {
-                // 普通文本行
                 lines.push(Line::from(Span::raw(raw_line.to_string())));
             }
         }
 
-        // 未闭合的代码块：仍然高亮
+        // 未闭合的代码块
         if in_code_block && !code_lines.is_empty() {
             let lang = code_lang.unwrap_or_default();
             let syntax = self.syntax_set
-                .find_syntax_by_token(&lang)
+                .find_syntax_by_extension(&lang)
+                .or_else(|| self.syntax_set.find_syntax_by_token(&lang))
                 .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
             for code_line in &code_lines {
@@ -471,7 +601,6 @@ impl TUINode {
         lines
     }
 
-    /// 应用滚动偏移量
     fn apply_scroll_offset(&self, lines: &[Line<'static>], viewport_height: usize) -> Vec<Line<'static>> {
         let total_lines = lines.len();
         if total_lines <= viewport_height {
@@ -494,7 +623,6 @@ impl Node for TUINode {
 
     async fn start(&mut self, _ctx: NodeContext) -> anyhow::Result<()> {
         tracing::info!("TUI Node 启动：{}", self.id);
-        // 初始化终端（在非 headless 模式下）
         if std::env::var("CCODE_HEADLESS").is_err() {
             if let Err(e) = self.init_terminal() {
                 tracing::warn!("终端初始化失败（headless 模式？）：{}", e);
@@ -506,13 +634,11 @@ impl Node for TUINode {
     async fn handle_message(&mut self, msg: Message, _transport: &NodeTransportHandle) -> anyhow::Result<()> {
         match msg.topic.as_str() {
             t if t.ends_with("/output") => {
-                // 渲染 agent 输出到终端
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
                 if let Some(content) = payload["content"].as_str() {
                     self.agent_status = AgentStatus::Outputting;
                     self.output_buffer.push_str(content);
 
-                    // 非终端模式直接 stdout 输出
                     if self.terminal.is_none() {
                         print!("{}", content);
                         use std::io::Write;
@@ -524,8 +650,33 @@ impl Node for TUINode {
                     }
                 }
             }
+            t if t.ends_with("/tool_result") => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                let tool_name = payload["tool_name"].as_str().unwrap_or("unknown");
+                let success = payload["success"].as_bool().unwrap_or(true);
+                let output = payload["output"].as_str().unwrap_or("");
+
+                // 更新工具卡片
+                let status = if success { ToolStatus::Done } else { ToolStatus::Failed };
+                let summary = output.lines().next().unwrap_or("").to_string();
+                let card = ToolCard {
+                    name: tool_name.to_string(),
+                    status,
+                    result_summary: summary,
+                };
+                self.tool_cards.push(card);
+                if self.tool_cards.len() > 10 {
+                    self.tool_cards.remove(0);
+                }
+
+                // 提取 diff 内容
+                self.extract_diff(tool_name, output);
+
+                if self.terminal.is_some() {
+                    self.render()?;
+                }
+            }
             t if t.ends_with("/event") => {
-                // 更新状态显示
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
                 if let Some(state) = payload["state"].as_str() {
                     self.agent_status = match state {
@@ -547,7 +698,13 @@ impl Node for TUINode {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
                 if let Some(tool_name) = payload["tool_name"].as_str() {
                     self.agent_status = AgentStatus::ToolCalling;
-                    self.tool_status = format!("执行工具：{}", tool_name);
+                    self.tool_status = format!("{}", tool_name);
+                    // 添加运行中的工具卡片
+                    self.tool_cards.push(ToolCard {
+                        name: tool_name.to_string(),
+                        status: ToolStatus::Running,
+                        result_summary: "执行中...".to_string(),
+                    });
                     if self.terminal.is_some() {
                         self.render()?;
                     }
@@ -567,10 +724,12 @@ impl Node for TUINode {
             subs.push(format!("agent/{}/output", agent_id));
             subs.push(format!("agent/{}/event", agent_id));
             subs.push(format!("agent/{}/tool_call", agent_id));
+            subs.push(format!("agent/{}/tool_result", agent_id));
         } else {
             subs.push("agent/*/output".into());
             subs.push("agent/*/event".into());
             subs.push("agent/*/tool_call".into());
+            subs.push("agent/*/tool_result".into());
         }
         subs
     }
