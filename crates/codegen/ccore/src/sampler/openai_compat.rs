@@ -122,28 +122,28 @@ impl OpenAICompatProvider {
         body
     }
 
-    /// 解析 SSE 行，提取 data 部分并转换为 StreamChunk
-    fn parse_sse_line(request_id: &str, line: &str) -> Option<Result<StreamChunk>> {
-        let line = line.trim();
+    /// 解析 SSE 事件数据，转换为 StreamChunk 列表
+    ///
+    /// 支持多行 data 聚合后的完整 JSON 解析，并处理单个 delta 中的多个 tool_call
+    fn parse_sse_data(request_id: &str, data: &str) -> Vec<Result<StreamChunk>> {
+        let mut results = Vec::new();
+        let data = data.trim();
 
-        // 跳过空行和注释
-        if line.is_empty() || line.starts_with(':') {
-            return None;
+        if data.is_empty() || data.starts_with(':') {
+            return results;
         }
-
-        // 提取 data: 后的内容
-        let data = line.strip_prefix("data: ")?;
 
         // 流结束标记
         if data == "[DONE]" {
-            return None;
+            return results;
         }
 
         // 解析 JSON
         let chunk: OpenAIStreamChunk = match serde_json::from_str(data) {
             Ok(c) => c,
             Err(e) => {
-                return Some(Err(anyhow!("SSE chunk JSON 解析失败：{}", e)));
+                results.push(Err(anyhow!("SSE chunk JSON 解析失败：{}", e)));
+                return results;
             }
         };
 
@@ -171,14 +171,17 @@ impl OpenAICompatProvider {
         );
 
         // 提取第一个 choice 的 delta
-        let choice = chunk.choices.first()?;
+        let choice = match chunk.choices.first() {
+            Some(c) => c,
+            None => return results,
+        };
 
         // 转换 delta 为 StreamChunk
         let delta = &choice.delta;
 
         if let Some(content) = &delta.content {
             if !content.is_empty() {
-                return Some(Ok(StreamChunk {
+                results.push(Ok(StreamChunk {
                     request_id: request_id.to_string(),
                     channel: StreamChannel::Text,
                     content: content.clone(),
@@ -191,7 +194,7 @@ impl OpenAICompatProvider {
         // 推理内容（某些模型支持）
         if let Some(reasoning_content) = &delta.reasoning_content {
             if !reasoning_content.is_empty() {
-                return Some(Ok(StreamChunk {
+                results.push(Ok(StreamChunk {
                     request_id: request_id.to_string(),
                     channel: StreamChannel::Reasoning,
                     content: reasoning_content.clone(),
@@ -201,7 +204,7 @@ impl OpenAICompatProvider {
             }
         }
 
-        // 工具调用
+        // 工具调用：处理 delta 中的所有 tool_call（而非只取第一个）
         if let Some(tool_calls) = &delta.tool_calls {
             for tc in tool_calls {
                 let tool_call_id = tc.id.clone().unwrap_or_default();
@@ -215,7 +218,7 @@ impl OpenAICompatProvider {
                     .unwrap_or_default();
 
                 if !tool_name.is_empty() {
-                    return Some(Ok(StreamChunk {
+                    results.push(Ok(StreamChunk {
                         request_id: request_id.to_string(),
                         channel: StreamChannel::ToolCall,
                         content: arguments.clone(),
@@ -230,7 +233,7 @@ impl OpenAICompatProvider {
             }
         }
 
-        None
+        results
     }
 }
 
@@ -375,10 +378,13 @@ impl Provider for OpenAICompatProvider {
         // 将 response body 转为字节流，然后按 SSE 行解析
         let byte_stream = response.bytes_stream();
 
-        // 使用 buffer + 行分割解析 SSE
+        // 使用 SSE 解析器状态机解析（支持多行 data 聚合）
+        // OpenAI SSE 格式：
+        //   data: {...}
+        //   （空行分隔事件，多行 data 用 \n 连接后整体解析）
         let rid = request_id.clone();
         let stream = byte_stream
-            .scan(String::new(), move |buffer, chunk_result| {
+            .scan(SseParserState::default(), move |state, chunk_result| {
                 // 检查取消信号
                 if cancel.is_cancelled() {
                     return std::future::ready(None);
@@ -391,17 +397,28 @@ impl Provider for OpenAICompatProvider {
                     }
                 };
 
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                state.buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                 let mut results = Vec::new();
 
-                // 按行分割
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer.drain(..=pos);
+                // 按行分割，累积 data 行，空行触发解析
+                while let Some(pos) = state.buffer.find('\n') {
+                    let line = state.buffer[..pos].trim().to_string();
+                    state.buffer.drain(..=pos);
 
-                    if let Some(chunk) = Self::parse_sse_line(&rid, &line) {
-                        results.push(chunk);
+                    if let Some(stripped) = line.strip_prefix("data: ") {
+                        // 多行 data 追加而非覆盖（SSE 规范允许 data 跨多行，用 \n 连接）
+                        if !state.current_data.is_empty() {
+                            state.current_data.push('\n');
+                        }
+                        state.current_data.push_str(stripped);
+                    } else if line.is_empty() {
+                        // 空行表示事件结束，此时解析聚合后的完整 data
+                        if !state.current_data.is_empty() {
+                            let chunks = Self::parse_sse_data(&rid, &state.current_data);
+                            results.extend(chunks);
+                        }
+                        state.current_data.clear();
                     }
                 }
 
@@ -461,16 +478,24 @@ impl Provider for OpenAICompatProvider {
     }
 }
 
+/// SSE 解析器状态（OpenAI 格式：仅需 buffer + 聚合 data）
+#[derive(Default)]
+struct SseParserState {
+    /// 行缓冲区
+    buffer: String,
+    /// 当前事件聚合后的完整 data（多行 data 用 \n 连接）
+    current_data: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_parse_sse_text_chunk() {
-        let line = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let chunk = OpenAICompatProvider::parse_sse_line("req-1", line)
-            .unwrap()
-            .unwrap();
+        let data = r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
+        let chunks = OpenAICompatProvider::parse_sse_data("req-1", data);
+        let chunk = chunks.into_iter().next().unwrap().unwrap();
         assert_eq!(chunk.request_id, "req-1");
         assert!(matches!(chunk.channel, StreamChannel::Text));
         assert_eq!(chunk.content, "Hello");
@@ -479,16 +504,15 @@ mod tests {
 
     #[test]
     fn test_parse_sse_done() {
-        let line = "data: [DONE]";
-        assert!(OpenAICompatProvider::parse_sse_line("req-1", line).is_none());
+        let chunks = OpenAICompatProvider::parse_sse_data("req-1", "[DONE]");
+        assert!(chunks.is_empty());
     }
 
     #[test]
     fn test_parse_sse_tool_call() {
-        let line = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]},"finish_reason":null}]}"#;
-        let chunk = OpenAICompatProvider::parse_sse_line("req-1", line)
-            .unwrap()
-            .unwrap();
+        let data = r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]},"finish_reason":null}]}"#;
+        let chunks = OpenAICompatProvider::parse_sse_data("req-1", data);
+        let chunk = chunks.into_iter().next().unwrap().unwrap();
         assert!(matches!(chunk.channel, StreamChannel::ToolCall));
         assert!(chunk.tool_call.is_some());
         let tc = chunk.tool_call.unwrap();
@@ -524,6 +548,7 @@ mod tests {
             system_prompt: None,
             tool_choice: None,
             prompt_cache_key: None,
+            goal_verify: false,
         };
 
         let body = provider.build_request_body(&request);
@@ -533,19 +558,19 @@ mod tests {
 
     #[test]
     fn test_parse_sse_reasoning_chunk() {
-        let line = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"Let me think..."},"finish_reason":null}]}"#;
-        let chunk = OpenAICompatProvider::parse_sse_line("req-1", line)
-            .unwrap()
-            .unwrap();
+        let data = r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"Let me think..."},"finish_reason":null}]}"#;
+        let chunks = OpenAICompatProvider::parse_sse_data("req-1", data);
+        let chunk = chunks.into_iter().next().unwrap().unwrap();
         assert!(matches!(chunk.channel, StreamChannel::Reasoning));
         assert_eq!(chunk.content, "Let me think...");
     }
 
     #[test]
     fn test_parse_sse_chunk_with_usage() {
-        let line = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#;
-        // delta content is empty, so this should return None (no content to emit)
-        assert!(OpenAICompatProvider::parse_sse_line("req-1", line).is_none());
+        let data = r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#;
+        // delta content 为空，不产生 StreamChunk（usage 仅记录日志不单独发送）
+        let chunks = OpenAICompatProvider::parse_sse_data("req-1", data);
+        assert!(chunks.is_empty());
     }
 
     #[test]
@@ -581,6 +606,7 @@ mod tests {
             system_prompt: Some("You are a helpful assistant.".into()),
             tool_choice: Some(super::super::provider::ToolChoice::Auto),
             prompt_cache_key: None,
+            goal_verify: false,
         };
 
         let body = provider.build_request_body(&request);

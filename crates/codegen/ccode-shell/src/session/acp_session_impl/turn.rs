@@ -879,7 +879,7 @@ impl SessionActor {
         let turn_timer = std::time::Instant::now();
 
         // Agent 主循环状态机：驱动循环决策
-        let mut loop_sm = ccode_agent::loop_state::LoopStateMachine::new();
+        let mut loop_sm = ccore::agent::loop_state::LoopStateMachine::new();
 
         let result = {
             let mut round_trace = trace_gcs_config;
@@ -916,7 +916,7 @@ impl SessionActor {
                     if refusal.is_some() {
                         // 模型拒绝：状态机转换到 Done
                         loop_sm.transition(
-                            ccode_agent::loop_state::LoopEvent::LLMResponse {
+                            ccore::agent::loop_state::LoopEvent::LLMResponse {
                                 stop_reason: "end_turn".to_string(),
                                 token_used: 0,
                                 tool_calls: tools_called.iter().map(|n| (String::new(), n.clone(), serde_json::Value::Null)).collect(),
@@ -926,7 +926,7 @@ impl SessionActor {
                         // 正常完成：检查连续失败熔断
                         if loop_sm.consecutive_failures() >= 3 {
                             loop_sm.transition(
-                                ccode_agent::loop_state::LoopEvent::ConsecutiveFailures {
+                                ccore::agent::loop_state::LoopEvent::ConsecutiveFailures {
                                     count: loop_sm.consecutive_failures(),
                                 },
                             )
@@ -938,7 +938,7 @@ impl SessionActor {
                                 "tool_use".to_string()
                             };
                             loop_sm.transition(
-                                ccode_agent::loop_state::LoopEvent::LLMResponse {
+                                ccore::agent::loop_state::LoopEvent::LLMResponse {
                                     stop_reason,
                                     token_used: 0,
                                     tool_calls: tools_called.iter().map(|n| (String::new(), n.clone(), serde_json::Value::Null)).collect(),
@@ -949,7 +949,7 @@ impl SessionActor {
                 } else {
                     // 非正常完成（错误等），让状态机处理
                     loop_sm.transition(
-                        ccode_agent::loop_state::LoopEvent::LLMResponse {
+                        ccore::agent::loop_state::LoopEvent::LLMResponse {
                             stop_reason: "end_turn".to_string(),
                             token_used: 0,
                             tool_calls: vec![],
@@ -965,12 +965,12 @@ impl SessionActor {
 
                 // ── 状态机驱动决策：根据 LoopAction 决定下一步 ──
                 match loop_action {
-                    ccode_agent::loop_state::LoopAction::EndTurn { reason } => {
+                    ccore::agent::loop_state::LoopAction::EndTurn { reason } => {
                         tracing::info!(
                             done_reason = ?reason,
                             "agent loop: state machine decided to end turn"
                         );
-                        if matches!(reason, ccode_agent::loop_state::DoneReason::ModelRefusal) {
+                        if matches!(reason, ccore::agent::loop_state::DoneReason::ModelRefusal) {
                             self.auto_pause_goal_if_active_with_message(
                                 crate::session::goal_tracker::GoalPauseReason::Infra,
                                 "The model provider refused this goal round. Use /goal resume to retry."
@@ -980,16 +980,16 @@ impl SessionActor {
                         }
                         break round;
                     }
-                    ccode_agent::loop_state::LoopAction::CallLLM => {
+                    ccore::agent::loop_state::LoopAction::CallLLM => {
                         // 继续循环，调用 LLM
                     }
-                    ccode_agent::loop_state::LoopAction::ExecuteTool { .. } => {
+                    ccore::agent::loop_state::LoopAction::ExecuteTool { .. } => {
                         // 继续循环，执行工具
                     }
-                    ccode_agent::loop_state::LoopAction::WaitForPermission { .. } => {
+                    ccore::agent::loop_state::LoopAction::WaitForPermission { .. } => {
                         // 继续循环，等待权限
                     }
-                    ccode_agent::loop_state::LoopAction::ContinueLoop => {
+                    ccore::agent::loop_state::LoopAction::ContinueLoop => {
                         // 继续循环
                     }
                 }

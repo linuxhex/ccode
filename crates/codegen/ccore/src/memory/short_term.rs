@@ -79,11 +79,16 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// L1 短期记忆（会话级）
 pub struct ShortTermMemory {
-    /// 完整对话历史
+    /// 完整对话历史（有上限，超限淘汰最旧条目）
     entries: Vec<ShortTermEntry>,
+    /// 最大条目数（防止长会话内存泄漏）
+    max_entries: usize,
     /// 当前轮次
     current_turn: u32,
 }
+
+/// 默认容量上限：500 条（足够覆盖常规会话深度，超出时淘汰最旧条目）
+const DEFAULT_MAX_ENTRIES: usize = 500;
 
 impl Default for ShortTermMemory {
     fn default() -> Self {
@@ -95,11 +100,25 @@ impl ShortTermMemory {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            max_entries: DEFAULT_MAX_ENTRIES,
             current_turn: 0,
         }
     }
 
-    /// 存入新消息（永不丢弃）
+    /// 设置最大容量上限
+    pub fn with_max_entries(mut self, max: usize) -> Self {
+        self.max_entries = max;
+        self
+    }
+
+    /// 超限时淘汰最旧条目
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() >= self.max_entries {
+            self.entries.remove(0);
+        }
+    }
+
+    /// 存入新消息
     pub fn store(
         &mut self,
         role: String,
@@ -107,6 +126,7 @@ impl ShortTermMemory {
         token_count: u32,
         is_tool_call: bool,
     ) -> String {
+        self.evict_if_needed();
         self.current_turn += 1;
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -136,6 +156,7 @@ impl ShortTermMemory {
         token_count: u32,
         tool_name: String,
     ) -> String {
+        self.evict_if_needed();
         self.current_turn += 1;
         let id = uuid::Uuid::new_v4().to_string();
         let embedding = pseudo_vector_from_text(&content);

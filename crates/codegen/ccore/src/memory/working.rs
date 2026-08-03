@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 use super::embedding::{EmbeddingIndex, EmbeddingVector};
 use super::mmr::mmr_select;
 
+use ccode_compaction::micro_compact::{micro_compact_messages, MicroCompactable, MicroCompactConfig};
+
 /// LLM 摘要客户端 trait
 ///
 /// 抽象 LLM 调用能力，使 WorkingMemory 不直接依赖消息总线。
@@ -233,6 +235,9 @@ pub enum WorkingEntry {
         role: MessageRole,
         content: String,
         token_count: u32,
+        /// 创建时间（用于微压缩的年龄判断；不参与序列化）
+        #[serde(skip, default = "default_created_at")]
+        created_at: std::time::Instant,
     },
     /// 温消息：压缩摘要
     Warm {
@@ -248,6 +253,11 @@ pub enum WorkingEntry {
     },
 }
 
+/// 为反序列化的 Hot 条目提供默认的创建时间（视为"新条目"）
+fn default_created_at() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
 impl WorkingEntry {
     /// 获取此条目占用的 token 数
     pub fn token_count(&self) -> u32 {
@@ -261,6 +271,67 @@ impl WorkingEntry {
     /// 是否为冷消息
     pub fn is_cold(&self) -> bool {
         matches!(self, Self::Cold { .. })
+    }
+}
+
+// ============================================================================
+// MicroCompactable 实现 — 接入 ccode-compaction 的微压缩层
+// ============================================================================
+
+impl MicroCompactable for WorkingEntry {
+    fn created_at(&self) -> std::time::Instant {
+        match self {
+            // Hot 条目返回真实创建时间，用于年龄判断
+            Self::Hot { created_at, .. } => *created_at,
+            // Warm/Cold 已是压缩态，视为"新鲜"（不会被微压缩处理）
+            _ => std::time::Instant::now(),
+        }
+    }
+
+    fn is_tool_result(&self) -> bool {
+        // ccore 约定：工具结果存为 Hot + role=User
+        matches!(self, Self::Hot { role: MessageRole::User, .. })
+    }
+
+    fn tool_name(&self) -> Option<&str> {
+        // WorkingEntry 不存工具名。为让 micro_compact_messages 能按年龄处理
+        // Hot User 条目（工具结果），返回一个在 COMPACTABLE_TOOLS 白名单中的
+        // 名字作为务实降级。这样超龄的工具结果会被清除，新条目保持原样。
+        if matches!(self, Self::Hot { role: MessageRole::User, .. }) {
+            Some("FileRead")
+        } else {
+            None
+        }
+    }
+
+    fn content(&self) -> &str {
+        match self {
+            Self::Hot { content, .. } => content.as_str(),
+            Self::Warm { summary, .. } => summary.as_str(),
+            Self::Cold { placeholder, .. } => placeholder.as_str(),
+        }
+    }
+
+    fn with_content(&self, new_content: String) -> Self {
+        match self {
+            Self::Hot {
+                role,
+                token_count,
+                created_at,
+                ..
+            } => {
+                // 按新内容长度粗估 token（~4 字符/token），至少 1
+                let new_tokens = (new_content.len() as u32 / 4).max(1);
+                Self::Hot {
+                    role: *role,
+                    content: new_content,
+                    token_count: new_tokens.min(*token_count),
+                    created_at: *created_at,
+                }
+            }
+            // Warm/Cold 不参与微压缩内容替换，原样返回
+            _ => self.clone(),
+        }
     }
 }
 
@@ -365,6 +436,7 @@ impl WorkingMemory {
             role,
             content,
             token_count,
+            created_at: std::time::Instant::now(),
         });
     }
 
@@ -462,25 +534,6 @@ impl WorkingMemory {
         self.compact_with_policy(&self.compaction_policy.clone())
     }
 
-    /// 异步压缩（使用 LLM 智能摘要）
-    ///
-    /// 使用默认策略执行压缩，尝试使用 LLM 生成智能摘要。
-    /// 如果没有提供 summarizer 或 LLM 调用失败，回退到截断方式。
-    ///
-    /// # Arguments
-    /// * `summarizer` - 可选的 LLM 摘要回调函数
-    ///
-    /// # Returns
-    /// 压缩结果，包含压缩前后的 token 数和被压缩的条目数
-    pub async fn compact_async<F, Fut>(&mut self, summarizer: Option<F>) -> CompactionResult
-    where
-        F: Fn(&str) -> Fut,
-        Fut: std::future::Future<Output = Result<String, anyhow::Error>>,
-    {
-        self.compact_with_policy_async(&self.compaction_policy.clone(), summarizer)
-            .await
-    }
-
     /// 使用指定策略执行压缩（同步版本，4 级策略 + stable prefix 保护）
     ///
     /// 策略（根据 token 使用率自动选择级别）：
@@ -566,6 +619,7 @@ impl WorkingMemory {
                 role: MessageRole::User,
                 content,
                 token_count,
+                created_at,
             } = &entry
             {
                 if *token_count > threshold {
@@ -584,6 +638,7 @@ impl WorkingMemory {
                         role: MessageRole::User,
                         content: snipped,
                         token_count: snipped_tokens,
+                        created_at: *created_at,
                     };
                     entries_compacted += 1;
                 } else {
@@ -603,50 +658,35 @@ impl WorkingMemory {
         }
     }
 
-    /// Level 2: MicroCompact — 单条消息首尾截断
+    /// Level 2: MicroCompact — 按年龄清除超龄工具结果
     ///
-    /// 对前缀之后的 Hot 条目，保留首尾各 retain_ratio/2 的内容。
-    fn compact_micro(&mut self, policy: &CompactionPolicy, prefix_end: usize) -> CompactionResult {
+    /// 委托给 `ccode_compaction::micro_compact_messages`：对前缀之后的条目，
+    /// 超过 `max_age` 的可压缩工具结果会被替换为清除标记或截断摘要。
+    /// 相比原先的首尾截断，此实现按时间年龄清除，更贴近 Claude Code 的微压缩语义。
+    fn compact_micro(&mut self, _policy: &CompactionPolicy, prefix_end: usize) -> CompactionResult {
         let tokens_before = self.used_tokens_cached;
-        let mut entries_compacted = 0usize;
-        let retain = policy.micro_compact_retain_ratio;
+        let config = MicroCompactConfig::default();
+        let now = std::time::Instant::now();
 
-        for i in prefix_end..self.entries.len() {
-            let entry = std::mem::replace(&mut self.entries[i], WorkingEntry::Cold {
-                placeholder: String::new(),
-                source_range: (i, i),
-                token_count: 0,
-            });
+        let prefix_len = prefix_end.min(self.entries.len());
+        let mut all_entries = std::mem::take(&mut self.entries);
+        // split_off 之后 all_entries 保留前 prefix_len 条，rest 是剩余部分
+        let rest = all_entries.split_off(prefix_len);
 
-            if let WorkingEntry::Hot {
-                role,
-                content,
-                token_count,
-            } = &entry
-            {
-                // 保留首尾各 retain/2 的内容
-                let head_chars = (content.chars().count() as f64 * retain / 2.0) as usize;
-                let tail_chars = head_chars;
-                let total_chars = content.chars().count();
+        // 记录原始内容用于统计变更数
+        let old_contents: Vec<String> =
+            rest.iter().map(|e| e.content().to_string()).collect();
 
-                if total_chars > head_chars * 2 + 20 {
-                    let head: String = content.chars().take(head_chars).collect();
-                    let tail: String = content.chars().skip(total_chars - tail_chars).collect();
-                    let micro = format!("{}\n[...已微压缩...]\n{}", head, tail);
-                    let micro_tokens = ((*token_count as f64) * retain) as u32;
-                    self.entries[i] = WorkingEntry::Hot {
-                        role: *role,
-                        content: micro,
-                        token_count: micro_tokens.max(1),
-                    };
-                    entries_compacted += 1;
-                } else {
-                    self.entries[i] = entry;
-                }
-            } else {
-                self.entries[i] = entry;
-            }
-        }
+        let compacted_rest = micro_compact_messages::<WorkingEntry>(&rest, &config, now);
+
+        let entries_compacted = old_contents
+            .iter()
+            .zip(compacted_rest.iter())
+            .filter(|(old, new)| old.as_str() != new.content())
+            .count();
+
+        all_entries.extend(compacted_rest);
+        self.entries = all_entries;
 
         self.recalc_used_tokens();
         CompactionResult {
@@ -727,118 +767,6 @@ impl WorkingMemory {
                 entries_compacted += 1;
             } else {
                 self.entries[i] = entry;
-            }
-        }
-
-        self.recalc_used_tokens();
-
-        CompactionResult {
-            tokens_before,
-            tokens_after: self.used_tokens_cached,
-            entries_compacted,
-            compacted_range: (compacted_start, compacted_end),
-        }
-    }
-
-    /// 使用指定策略执行压缩（异步版本，支持 LLM 智能摘要）
-    ///
-    /// # Arguments
-    /// * `policy` - 压缩策略
-    /// * `summarizer` - 可选的 LLM 摘要回调函数，如果为 None 则回退到截断
-    ///
-    /// # Strategy
-    /// 1. 找到最旧的连续 Hot 条目块（排除最近 4 条保持 Hot）
-    /// 2. 如果提供了 summarizer：
-    ///    - 使用 LLM 生成智能摘要
-    ///    - 失败时回退到截断
-    /// 3. 如果没有提供 summarizer：
-    ///    - 使用截断方式（fallback）
-    /// 4. 将已有的 Warm→Cold（占位符替换）
-    pub async fn compact_with_policy_async<F, Fut>(
-        &mut self,
-        _policy: &CompactionPolicy,
-        summarizer: Option<F>,
-    ) -> CompactionResult
-    where
-        F: Fn(&str) -> Fut,
-        Fut: std::future::Future<Output = Result<String, anyhow::Error>>,
-    {
-        let tokens_before = self.used_tokens_cached;
-        let total = self.entries.len();
-
-        // 保持最近的条目为 Hot 的安全边界
-        let keep_hot_recent = 4;
-
-        if total <= keep_hot_recent {
-            return CompactionResult {
-                tokens_before,
-                tokens_after: tokens_before,
-                entries_compacted: 0,
-                compacted_range: (0, 0),
-            };
-        }
-
-        // 第一步：将已有的 Warm 条目降级为 Cold
-        for entry in &mut self.entries {
-            if let WorkingEntry::Warm {
-                summary,
-                token_count,
-                source_range,
-            } = entry
-            {
-                let placeholder = format!("[冷缓存] {}", &summary[..summary.len().min(40)]);
-                let cold_tokens = (*token_count / 4).max(1);
-                *entry = WorkingEntry::Cold {
-                    placeholder,
-                    source_range: *source_range,
-                    token_count: cold_tokens,
-                };
-            }
-        }
-
-        // 第二步：将较旧的 Hot 条目降级为 Warm（保留最近 keep_hot_recent 条为 Hot）
-        let hot_cutoff = total.saturating_sub(keep_hot_recent);
-        let mut compacted_start = total;
-        let mut compacted_end = 0;
-        let mut entries_compacted = 0usize;
-
-        for i in 0..hot_cutoff {
-            if let WorkingEntry::Hot {
-                content,
-                token_count,
-                ..
-            } = &self.entries[i]
-            {
-                let content = content.clone();
-                let token_count = *token_count;
-
-                // 尝试使用 LLM 摘要，失败则回退到截断
-                let summary = if let Some(ref summarizer_fn) = summarizer {
-                    match summarizer_fn(&content).await {
-                        Ok(llm_summary) => llm_summary,
-                        Err(_) => {
-                            // LLM 摘要失败，回退到截断
-                            let truncate_len = (content.len() / 2).max(1);
-                            format!("[已压缩] {}...", &content[..truncate_len])
-                        }
-                    }
-                } else {
-                    // 没有提供 summarizer，使用截断
-                    let truncate_len = (content.len() / 2).max(1);
-                    format!("[已压缩] {}...", &content[..truncate_len])
-                };
-
-                let warm_tokens = (token_count / 2).max(1);
-
-                self.entries[i] = WorkingEntry::Warm {
-                    summary,
-                    token_count: warm_tokens,
-                    source_range: (i, i),
-                };
-
-                compacted_start = compacted_start.min(i);
-                compacted_end = compacted_end.max(i);
-                entries_compacted += 1;
             }
         }
 

@@ -13,12 +13,13 @@ dashboard = []
 
 [dependencies]
 # 异步运行时
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
 futures = { workspace = true }
 
 # TUI 渲染
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+syntect = { workspace = true }
 
 # 消息总线 - 纯 Rust ZMTP 实现
 zeromq = { version = "0.4", features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }

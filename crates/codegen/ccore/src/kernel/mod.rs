@@ -48,7 +48,6 @@ use std::time::Duration;
 use crate::config::CcodeConfig;
 use crate::config::provider::ProviderConfig;
 use crate::config::watcher::ConfigWatcher;
-use crate::kernel::self_healing::SelfHealingManager;
 use crate::kernel::autonomic::AutonomicNervousSystem;
 use crate::kernel::reflex::{ReflexRouter, ReflexAction, ReflexLevel, ReflexRule, builtin_reflex_rules};
 use crate::kernel::experience::{ExperienceLog, ExperienceEntry};
@@ -90,6 +89,8 @@ pub struct KernelConfig {
     pub mcp_server_enabled: bool,
     /// MCP Server 传输方式
     pub mcp_transport: McpTransportKind,
+    /// 启动时自动发送的 prompt（None = 交互模式，Some = headless 模式）
+    pub startup_prompt: Option<String>,
 }
 
 impl Default for KernelConfig {
@@ -106,6 +107,7 @@ impl Default for KernelConfig {
                 .into(),
             mcp_server_enabled: false,
             mcp_transport: McpTransportKind::Stdio,
+            startup_prompt: None,
         }
     }
 }
@@ -147,9 +149,8 @@ impl From<&CcodeConfig> for KernelRuntimeConfig {
 /// - `param_server`: ROS 风格的参数服务器
 /// - `runtime_config`: Kernel 运行时配置（providers/model/permission，从产品配置提取）
 /// - `reflex_router`: 反射路由器（脊髓反射弧：感官信号 → 运动指令）
-/// - `autonomic`: 自主神经系统（心跳监控 + 并发限流 + 内存池，已接管 self_healing 职责）
+/// - `autonomic`: 自主神经系统（心跳监控 + 并发限流 + 内存池）
 /// - `experience_log`: 经历日志（闭环学习：记录反射弧执行结果，提取可学习模式）
-/// - `self_healing`: （向后兼容保留，已由 autonomic 接管）
 /// - `config_watcher`: 配置文件监听器（热更新）
 pub struct Kernel {
     config: KernelConfig,
@@ -167,9 +168,6 @@ pub struct Kernel {
     autonomic: Arc<AutonomicNervousSystem>,
     /// 经历日志（闭环学习：记录反射弧执行结果，提取可学习模式）
     experience_log: Arc<Mutex<ExperienceLog>>,
-    /// Agent 自愈管理器（向后兼容保留，已由 autonomic 接管）
-    #[allow(dead_code)]
-    self_healing: Option<Arc<SelfHealingManager>>,
     /// 配置文件监听器（保持存活以维持 watch，不主动读取）
     #[allow(dead_code)]
     config_watcher: Option<ConfigWatcher>,
@@ -197,10 +195,6 @@ pub struct Kernel {
     registration_notify_tx: watch::Sender<usize>,
     /// MCP Server 句柄（可选，启用时持有）
     mcp_server: Option<McpServerHandle>,
-    /// MCP Server 工具调用请求接收端（从 MCP Server 经 bus_tx 发来的工具调用请求）
-    mcp_bus_rx: Option<mpsc::Receiver<Message>>,
-    /// MCP Server 工具调用结果发送端（将 ToolNode 执行结果回传给 MCP Server）
-    mcp_bus_tx: Option<mpsc::Sender<Message>>,
     /// HookDispatcher 桥接（可选，由产品层注入 ccode-hooks 适配器）
     hook_dispatcher: Option<Arc<dyn crate::tools::hook_bridge::HookDispatcher>>,
 }
@@ -215,7 +209,7 @@ impl Kernel {
             config.pub_addr.clone(),
         );
 
-        // 初始化自主神经系统（接管原 SelfHealingManager 的心跳监控职责）
+        // 初始化自主神经系统（心跳监控 + 并发限流 + 内存池）
         let autonomic = Arc::new(AutonomicNervousSystem::new(
             config.heartbeat_timeout_secs,
             3,
@@ -260,7 +254,6 @@ impl Kernel {
             reflex_router,
             autonomic,
             experience_log,
-            self_healing: None, // 向后兼容保留，已由 autonomic 接管
             config_watcher,
             config_event_rx,
             episodic_memory: Arc::new(EpisodicMemoryStore::new()),
@@ -271,8 +264,6 @@ impl Kernel {
             circuit_breaker: Arc::new(CircuitBreaker::new(crate::retry::circuit_breaker::CircuitBreakerConfig::default())),
             registration_notify_tx,
             mcp_server,
-            mcp_bus_rx: None,
-            mcp_bus_tx: None,
             hook_dispatcher: None,
         }
     }
@@ -366,23 +357,16 @@ impl Kernel {
 
         // 0. 如果启用 MCP Server，创建并启动
         if self.config.mcp_server_enabled {
-            let (bus_tx, bus_rx) = tokio::sync::mpsc::channel::<Message>(64);
-
             let mcp_config = McpServerConfig {
                 transport: self.config.mcp_transport.clone(),
                 name: "ccode-mcp".into(),
                 version: "0.1.0".into(),
             };
 
-            let mcp_server = McpServer::new(mcp_config, bus_tx.clone());
+            let mcp_server = McpServer::new(mcp_config);
             let handle = mcp_server.run();
 
             tracing::info!("MCP Server 已启动（传输方式：{:?}）", self.config.mcp_transport);
-
-            // 存储 bus_rx 到 Kernel 字段，在主事件循环中处理
-            // 存储 bus_tx 到 Kernel 字段，用于将 ToolNode 结果回传给 MCP Server
-            self.mcp_bus_rx = Some(bus_rx);
-            self.mcp_bus_tx = Some(bus_tx);
 
             self.mcp_server = Some(handle);
         }
@@ -488,6 +472,36 @@ impl Kernel {
                                 tracing::warn!("广播 spawn 事件失败：{}", e);
                             } else {
                                 tracing::debug!("广播 spawn 事件：{} ({:?})", desc.id, desc.node_type);
+                            }
+                        }
+
+                        // 发送 startup prompt 到 ThinkerNode（如果配置了）
+                        if let Some(ref prompt) = self.config.startup_prompt {
+                            // 找到 ThinkerNode 的 ID
+                            if let Some(thinker_desc) = nodes.iter().find(|n| n.node_type == crate::node::NodeType::Thinker) {
+                                let thinker_id = &thinker_desc.id;
+                                tracing::info!(
+                                    "发送 startup prompt 到 ThinkerNode {}：{} bytes",
+                                    thinker_id, prompt.len()
+                                );
+                                let prompt_msg = FrameCodec::new_message(
+                                    crate::message::Topic::agent_input(thinker_id.as_str()),
+                                    "kernel",
+                                    &serde_json::json!({
+                                        "content": prompt,
+                                        "role": "user",
+                                    }),
+                                );
+                                if let Ok(msg) = prompt_msg {
+                                    let frames = FrameCodec::encode(&msg).map(|v| v.into_iter().map(Bytes::from).collect::<Vec<_>>()).unwrap_or_default();
+                                    if !frames.is_empty() {
+                                        if let Err(e) = transport.broadcast(frames).await {
+                                            tracing::warn!("发送 startup prompt 失败：{}", e);
+                                        }
+                                    }
+                                }
+                            } else {
+                                tracing::warn!("未找到 ThinkerNode，无法发送 startup prompt");
                             }
                         }
                     } else {
@@ -651,48 +665,6 @@ impl Kernel {
                             config_monitoring_active = false;
                             tracing::warn!("配置变更通知通道已关闭，停止配置变更广播");
                         }
-                    }
-                }
-                // MCP Server 工具调用请求：从 bus_rx 接收，路由到 ToolNode
-                mcp_msg = async {
-                    match &mut self.mcp_bus_rx {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending::<Option<Message>>().await,
-                    }
-                } => {
-                    if let Some(msg) = mcp_msg {
-                        // MCP Server 的工具调用请求（topic: tool/call），
-                        // 转换为 agent/mcp-client/tool_call 格式让 ToolNode 处理
-                        let topic = msg.topic.as_str();
-                        let payload: serde_json::Value = FrameCodec::decode_payload(&msg)
-                            .unwrap_or(serde_json::Value::Null);
-
-                        tracing::debug!(
-                            topic = %topic,
-                            "MCP Server 工具调用请求已接收，路由到 ToolNode"
-                        );
-
-                        // 构造 ToolNode 标准格式的 tool_call 消息
-                        let tool_call_msg = FrameCodec::new_message(
-                            Topic::agent_tool_call("mcp-client"),
-                            "mcp-server",
-                            &payload,
-                        );
-                        match tool_call_msg {
-                            Ok(tool_call_msg) => {
-                                // 路由到订阅了该 topic 的 ToolNode
-                                if let Err(e) = self.route_and_forward(&tool_call_msg, &mut transport).await {
-                                    tracing::warn!("MCP 工具调用路由失败：{}", e);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("构造 MCP 工具调用消息失败：{}", e);
-                            }
-                        }
-                    } else {
-                        // bus_rx 通道已关闭（MCP Server 已停止），清空字段避免 busy-loop
-                        self.mcp_bus_rx = None;
-                        tracing::warn!("MCP Server bus_rx 通道已关闭，停止 MCP 消息路由");
                     }
                 }
             }
@@ -1359,19 +1331,6 @@ impl Kernel {
                 }
             }
 
-            // agent/mcp-client/tool_result — MCP Server 工具调用结果回传
-            t if t.starts_with("agent/mcp-client/") && t.ends_with("/tool_result") => {
-                tracing::debug!("MCP Server 工具调用结果收到：{}", topic);
-                // 先正常路由到订阅了此 topic 的 Node
-                self.route_and_forward(&incoming.message, transport).await?;
-                // 通过 mcp_bus_tx 将工具结果回传给 MCP Server handler
-                if let Some(ref bus_tx) = self.mcp_bus_tx {
-                    if let Err(e) = bus_tx.send(incoming.message).await {
-                        tracing::warn!("MCP Server 工具结果回传失败：{}", e);
-                    }
-                }
-            }
-
             // cortex/erl_trajectory — ERL 轨迹提取请求（来自 ThinkerNode turn 结束）
             "cortex/erl_trajectory" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
@@ -1907,30 +1866,6 @@ impl Kernel {
         self.registry.len()
     }
 
-    /// 启动记忆文件监听器
-    ///
-    /// 创建 MemoryWatcher 监听 ~/.ccode/memory/ 下的 MEMORY.md 文件变化，
-    /// 返回事件接收端，供调用方在事件循环中消费。
-    /// 如果不需要消费事件，可以忽略返回值（监听器仍会运行并记录变更）。
-    pub async fn start_memory_watcher(&mut self) -> Option<tokio::sync::mpsc::Receiver<crate::memory::watcher::MemoryWatchEvent>> {
-        let watch_path = crate::memory::storage::MemoryStorage::with_default_root(
-            &self.config.working_dir,
-        ).root().clone();
-
-        let mut watcher = crate::memory::watcher::MemoryWatcher::new(watch_path);
-        let event_rx = watcher.take_event_rx();
-
-        match watcher.start().await {
-            Ok(()) => {
-                tracing::info!("MemoryWatcher 已启动，监听记忆文件变更");
-                event_rx
-            }
-            Err(e) => {
-                tracing::warn!("MemoryWatcher 启动失败：{}", e);
-                None
-            }
-        }
-    }
 }
 
 /// 解析 NodeType 字符串

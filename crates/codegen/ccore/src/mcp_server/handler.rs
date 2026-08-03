@@ -97,7 +97,7 @@ impl JsonRpcResponse {
 /// 返回 Ok(Some(response)) 表示需要发送响应，
 /// 返回 Ok(None) 表示通知类消息（无需响应），
 /// 返回 Err 表示处理过程中发生错误。
-pub fn handle_request(
+pub async fn handle_request(
     request_str: &str,
     registry: &McpToolRegistry,
     server_name: &str,
@@ -146,7 +146,7 @@ pub fn handle_request(
         "tools/call" => {
             // tools/call 需要异步处理，这里做同步部分（参数校验），
             // 实际调用在 event_loop 中处理
-            handle_tools_call(request.id, &request.params, registry)
+            handle_tools_call(request.id, &request.params, registry).await
         }
         "ping" => handle_ping(request.id),
         _ => JsonRpcResponse::error(
@@ -232,9 +232,9 @@ fn handle_tools_list(
 /// 处理 tools/call 请求
 ///
 /// 查找工具并直接执行，返回执行结果。
-/// 内置工具（read/write/edit/bash/glob/grep）同步执行，
+/// 内置工具（read/write/edit/bash/glob/grep）异步执行，
 /// 未知工具返回错误。
-fn handle_tools_call(
+async fn handle_tools_call(
     id: Option<Value>,
     params: &Option<Value>,
     registry: &McpToolRegistry,
@@ -280,7 +280,7 @@ fn handle_tools_call(
     }
 
     // 直接执行内置工具
-    match registry.execute_tool(tool_name, &arguments) {
+    match registry.execute_tool(tool_name, &arguments).await {
         Ok(result) => JsonRpcResponse::success(id, result),
         Err(e) => JsonRpcResponse::error(
             id,
@@ -308,15 +308,14 @@ mod tests {
 
     /// 创建测试用的工具注册表
     fn create_test_registry() -> McpToolRegistry {
-        let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        McpToolRegistry::new(tx)
+        McpToolRegistry::new()
     }
 
-    #[test]
-    fn test_initialize() {
+    #[tokio::test]
+    async fn test_initialize() {
         let registry = create_test_registry();
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+        let result = handle_request(request, &registry, "test-server", "1.0.0").await.unwrap();
 
         assert!(result.is_some());
         let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
@@ -326,11 +325,11 @@ mod tests {
         assert_eq!(response["result"]["serverInfo"]["version"], "1.0.0");
     }
 
-    #[test]
-    fn test_tools_list() {
+    #[tokio::test]
+    async fn test_tools_list() {
         let registry = create_test_registry();
         let request = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
-        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+        let result = handle_request(request, &registry, "test-server", "1.0.0").await.unwrap();
 
         assert!(result.is_some());
         let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
@@ -339,42 +338,42 @@ mod tests {
         assert!(tools.len() >= 6);
     }
 
-    #[test]
-    fn test_method_not_found() {
+    #[tokio::test]
+    async fn test_method_not_found() {
         let registry = create_test_registry();
         let request = r#"{"jsonrpc":"2.0","id":3,"method":"nonexistent"}"#;
-        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+        let result = handle_request(request, &registry, "test-server", "1.0.0").await.unwrap();
 
         assert!(result.is_some());
         let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(response["error"]["code"], METHOD_NOT_FOUND);
     }
 
-    #[test]
-    fn test_parse_error() {
+    #[tokio::test]
+    async fn test_parse_error() {
         let registry = create_test_registry();
         let request = r#"invalid json"#;
-        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+        let result = handle_request(request, &registry, "test-server", "1.0.0").await.unwrap();
 
         assert!(result.is_some());
         let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(response["error"]["code"], PARSE_ERROR);
     }
 
-    #[test]
-    fn test_notification_no_response() {
+    #[tokio::test]
+    async fn test_notification_no_response() {
         let registry = create_test_registry();
         // 通知类消息（无 id）不应返回响应
         let request = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+        let result = handle_request(request, &registry, "test-server", "1.0.0").await.unwrap();
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_ping() {
+    #[tokio::test]
+    async fn test_ping() {
         let registry = create_test_registry();
         let request = r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#;
-        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+        let result = handle_request(request, &registry, "test-server", "1.0.0").await.unwrap();
 
         assert!(result.is_some());
         let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
@@ -382,11 +381,11 @@ mod tests {
         assert!(response["result"].is_object());
     }
 
-    #[test]
-    fn test_tools_call_missing_name() {
+    #[tokio::test]
+    async fn test_tools_call_missing_name() {
         let registry = create_test_registry();
         let request = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"arguments":{}}}"#;
-        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+        let result = handle_request(request, &registry, "test-server", "1.0.0").await.unwrap();
 
         assert!(result.is_some());
         let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
@@ -394,13 +393,13 @@ mod tests {
     }
 
     /// 集成测试：完整的 MCP 流程（initialize → tools/list → tools/call 未知工具 → 期望错误）
-    #[test]
-    fn test_full_mcp_flow() {
+    #[tokio::test]
+    async fn test_full_mcp_flow() {
         let registry = create_test_registry();
 
         // 第一步：initialize
         let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-        let init_result = handle_request(init_req, &registry, "test-server", "1.0.0").unwrap();
+        let init_result = handle_request(init_req, &registry, "test-server", "1.0.0").await.unwrap();
         assert!(init_result.is_some(), "initialize 应返回响应");
         let init_resp: Value = serde_json::from_str(&init_result.unwrap()).unwrap();
         assert_eq!(init_resp["jsonrpc"], "2.0");
@@ -410,7 +409,7 @@ mod tests {
 
         // 第二步：tools/list
         let list_req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
-        let list_result = handle_request(list_req, &registry, "test-server", "1.0.0").unwrap();
+        let list_result = handle_request(list_req, &registry, "test-server", "1.0.0").await.unwrap();
         assert!(list_result.is_some(), "tools/list 应返回响应");
         let list_resp: Value = serde_json::from_str(&list_result.unwrap()).unwrap();
         assert_eq!(list_resp["id"], 2);
@@ -419,7 +418,7 @@ mod tests {
 
         // 第三步：tools/call 调用不存在的工具，期望返回错误
         let call_req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}"#;
-        let call_result = handle_request(call_req, &registry, "test-server", "1.0.0").unwrap();
+        let call_result = handle_request(call_req, &registry, "test-server", "1.0.0").await.unwrap();
         assert!(call_result.is_some(), "tools/call 应返回响应");
         let call_resp: Value = serde_json::from_str(&call_result.unwrap()).unwrap();
         assert_eq!(call_resp["id"], 3);
@@ -427,12 +426,12 @@ mod tests {
         assert_eq!(call_resp["error"]["code"], INVALID_PARAMS);
     }
 
-    /// 集成测试：验证 tools/list 返回所有 6 个内置工具（read/write/edit/bash/glob/grep）
-    #[test]
-    fn test_tools_list_contains_all_builtin() {
+    /// 集成测试：验证 tools/list 返回所有 12 个内置工具
+    #[tokio::test]
+    async fn test_tools_list_contains_all_builtin() {
         let registry = create_test_registry();
         let request = r#"{"jsonrpc":"2.0","id":10,"method":"tools/list"}"#;
-        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+        let result = handle_request(request, &registry, "test-server", "1.0.0").await.unwrap();
 
         assert!(result.is_some());
         let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
@@ -444,10 +443,10 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap_or(""))
             .collect();
 
-        // 验证 13 个内置工具全部存在
+        // 验证 12 个内置工具全部存在
         let expected_tools = [
             "read", "write", "edit", "bash", "glob", "grep",
-            "todo_write", "ask_user", "web_search", "web_fetch",
+            "todo_write", "web_search", "web_fetch",
             "git_status", "list_directory", "create_file",
         ];
         for expected in &expected_tools {
@@ -459,21 +458,21 @@ mod tests {
             );
         }
 
-        // 确保恰好有 13 个工具
+        // 确保恰好有 12 个工具
         assert_eq!(
             tools.len(),
-            13,
-            "应有恰好 13 个内置工具，实际数量：{}",
+            12,
+            "应有恰好 12 个内置工具，实际数量：{}",
             tools.len()
         );
     }
 
     /// 集成测试：调用未知工具返回 INVALID_PARAMS 错误（非 METHOD_NOT_FOUND）
-    #[test]
-    fn test_tools_call_unknown_tool() {
+    #[tokio::test]
+    async fn test_tools_call_unknown_tool() {
         let registry = create_test_registry();
         let request = r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}"#;
-        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+        let result = handle_request(request, &registry, "test-server", "1.0.0").await.unwrap();
 
         assert!(result.is_some());
         let response: Value = serde_json::from_str(&result.unwrap()).unwrap();
@@ -495,11 +494,11 @@ mod tests {
     }
 
     /// 集成测试：ping 请求返回空对象（pong）
-    #[test]
-    fn test_ping_returns_pong() {
+    #[tokio::test]
+    async fn test_ping_returns_pong() {
         let registry = create_test_registry();
         let request = r#"{"jsonrpc":"2.0","id":30,"method":"ping"}"#;
-        let result = handle_request(request, &registry, "test-server", "1.0.0").unwrap();
+        let result = handle_request(request, &registry, "test-server", "1.0.0").await.unwrap();
 
         assert!(result.is_some(), "ping 应返回响应");
         let response: Value = serde_json::from_str(&result.unwrap()).unwrap();

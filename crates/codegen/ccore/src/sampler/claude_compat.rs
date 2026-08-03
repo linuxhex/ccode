@@ -129,7 +129,8 @@ impl ClaudeCompatProvider {
         event_type: &str,
         data: &str,
         // 状态：当前正在处理的工具调用（content_block_start 时创建，content_block_stop 时清空）
-        active_tool: &mut Option<ActiveToolCall>,
+        // 按 content block index 键控，支持并行 tool_call
+        active_tools: &mut std::collections::HashMap<usize, ActiveToolCall>,
     ) -> Vec<Result<StreamChunk>> {
         let mut results = Vec::new();
 
@@ -165,7 +166,7 @@ impl ClaudeCompatProvider {
                     }
                     "input_json_delta" => {
                         // 工具调用参数增量
-                        if let Some(tool) = active_tool {
+                        if let Some(tool) = active_tools.get(&delta.index) {
                             results.push(Ok(StreamChunk {
                                 request_id: request_id.to_string(),
                                 channel: StreamChannel::ToolCall,
@@ -205,8 +206,8 @@ impl ClaudeCompatProvider {
                 };
 
                 if block_start.content_block.r#type == "tool_use" {
-                    // 记录当前活跃的工具调用
-                    *active_tool = Some(ActiveToolCall {
+                    // 记录当前活跃的工具调用（按 content block index 键控）
+                    active_tools.insert(block_start.index, ActiveToolCall {
                         tool_call_id: block_start.content_block.id,
                         tool_name: block_start.content_block.name,
                     });
@@ -215,8 +216,15 @@ impl ClaudeCompatProvider {
                 }
             }
             "content_block_stop" => {
-                // 内容块结束 - 清除活跃工具调用
-                *active_tool = None;
+                // 内容块结束 - 从活跃工具调用表中移除对应 index
+                let block_stop: ClaudeContentBlockStop = match serde_json::from_str(data) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        results.push(Err(anyhow!("content_block_stop JSON 解析失败：{}", e)));
+                        return results;
+                    }
+                };
+                active_tools.remove(&block_stop.index);
             }
             "message_start" => {
                 // 消息开始 - 包含初始 usage 信息
@@ -309,6 +317,7 @@ struct ActiveToolCall {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct ClaudeContentBlockDelta {
+    index: usize,
     delta: ClaudeDelta,
 }
 
@@ -332,7 +341,15 @@ struct ClaudeDelta {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct ClaudeContentBlockStart {
+    index: usize,
     content_block: ClaudeContentBlock,
+}
+
+/// content_block_stop 事件
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ClaudeContentBlockStop {
+    index: usize,
 }
 
 /// 内容块
@@ -517,24 +534,24 @@ impl Provider for ClaudeCompatProvider {
                         if let Some(stripped) = line.strip_prefix("event: ") {
                             state.current_event = stripped.to_string();
                         } else if let Some(stripped) = line.strip_prefix("data: ") {
-                            state.current_data = stripped.to_string();
-
-                            // event + data 都已收到，解析事件
-                            if !state.current_event.is_empty() {
+                            // 多行 data 追加而非覆盖（SSE 规范允许 data 跨多行，用 \n 连接）
+                            if !state.current_data.is_empty() {
+                                state.current_data.push('\n');
+                            }
+                            state.current_data.push_str(stripped);
+                        } else if line.is_empty() {
+                            // 空行表示事件结束，此时解析
+                            if !state.current_event.is_empty() && !state.current_data.is_empty() {
                                 let chunks = Self::parse_sse_event(
                                     &rid,
                                     &state.current_event,
                                     &state.current_data,
-                                    &mut state.active_tool,
+                                    &mut state.active_tools,
                                 );
                                 results.extend(chunks);
-                                state.current_event.clear();
-                                state.current_data.clear();
                             }
-                        } else if line.is_empty() {
-                        // 空行表示事件结束，重置状态
-                        state.current_event.clear();
-                        state.current_data.clear();
+                            state.current_event.clear();
+                            state.current_data.clear();
                         }
                     }
 
@@ -614,8 +631,8 @@ struct SseParserState {
     current_event: String,
     /// 当前事件数据
     current_data: String,
-    /// 当前活跃的工具调用
-    active_tool: Option<ActiveToolCall>,
+    /// 当前活跃的工具调用（按 content block index 键控，支持并行 tool_call）
+    active_tools: std::collections::HashMap<usize, ActiveToolCall>,
 }
 
 #[cfg(test)]
@@ -624,9 +641,9 @@ mod tests {
 
     #[test]
     fn test_parse_text_delta() {
-        let mut active_tool = None;
+        let mut active_tools = std::collections::HashMap::new();
         let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
-        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "content_block_delta", data, &mut active_tool);
+        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "content_block_delta", data, &mut active_tools);
         assert_eq!(chunks.len(), 1);
         let chunk = chunks[0].as_ref().unwrap();
         assert_eq!(chunk.request_id, "req-1");
@@ -637,25 +654,26 @@ mod tests {
 
     #[test]
     fn test_parse_tool_use_start() {
-        let mut active_tool = None;
+        let mut active_tools = std::collections::HashMap::new();
         let data = r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_abc","name":"bash"}}"#;
-        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "content_block_start", data, &mut active_tool);
+        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "content_block_start", data, &mut active_tools);
         // content_block_start 不产生 StreamChunk，但应记录活跃工具调用
         assert!(chunks.is_empty());
-        assert!(active_tool.is_some());
-        let tool = active_tool.unwrap();
+        assert!(active_tools.len() == 1);
+        let tool = active_tools.values().next().unwrap();
         assert_eq!(tool.tool_call_id, "toolu_abc");
         assert_eq!(tool.tool_name, "bash");
     }
 
     #[test]
     fn test_parse_input_json_delta() {
-        let mut active_tool = Some(ActiveToolCall {
+        let mut active_tools = std::collections::HashMap::new();
+        active_tools.insert(1, ActiveToolCall {
             tool_call_id: "toolu_abc".into(),
             tool_name: "bash".into(),
         });
         let data = r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}"#;
-        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "content_block_delta", data, &mut active_tool);
+        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "content_block_delta", data, &mut active_tools);
         assert_eq!(chunks.len(), 1);
         let chunk = chunks[0].as_ref().unwrap();
         assert!(matches!(chunk.channel, StreamChannel::ToolCall));
@@ -666,9 +684,9 @@ mod tests {
 
     #[test]
     fn test_parse_thinking_delta() {
-        let mut active_tool = None;
+        let mut active_tools = std::collections::HashMap::new();
         let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think..."}}"#;
-        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "content_block_delta", data, &mut active_tool);
+        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "content_block_delta", data, &mut active_tools);
         assert_eq!(chunks.len(), 1);
         let chunk = chunks[0].as_ref().unwrap();
         assert!(matches!(chunk.channel, StreamChannel::Reasoning));
@@ -703,6 +721,7 @@ mod tests {
             system_prompt: None,
             tool_choice: None,
             prompt_cache_key: None,
+            goal_verify: false,
         };
 
         let body = provider.build_request_body(&request);
@@ -746,6 +765,7 @@ mod tests {
             system_prompt: Some("You are a helpful assistant.".into()),
             tool_choice: Some(super::super::provider::ToolChoice::Auto),
             prompt_cache_key: None,
+            goal_verify: false,
         };
 
         let body = provider.build_request_body(&request);
@@ -764,9 +784,9 @@ mod tests {
 
     #[test]
     fn test_parse_message_start_with_usage() {
-        let mut active_tool = None;
+        let mut active_tools = std::collections::HashMap::new();
         let data = r#"{"type":"message_start","message":{"id":"msg_abc","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-20250514","stop_reason":null,"usage":{"input_tokens":25,"output_tokens":0}}}"#;
-        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "message_start", data, &mut active_tool);
+        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "message_start", data, &mut active_tools);
         assert_eq!(chunks.len(), 1);
         let chunk = chunks[0].as_ref().unwrap();
         assert!(chunk.usage.is_some());
@@ -777,9 +797,9 @@ mod tests {
 
     #[test]
     fn test_parse_message_delta_with_usage() {
-        let mut active_tool = None;
+        let mut active_tools = std::collections::HashMap::new();
         let data = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}"#;
-        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "message_delta", data, &mut active_tool);
+        let chunks = ClaudeCompatProvider::parse_sse_event("req-1", "message_delta", data, &mut active_tools);
         assert_eq!(chunks.len(), 1);
         let chunk = chunks[0].as_ref().unwrap();
         assert!(chunk.usage.is_some());

@@ -1,14 +1,12 @@
-//! 压缩管道 — 5 层压缩（Budget → Snip → MicroCompact → Collapse → Auto）
+//! 压缩管道 — 4 层压缩（Budget → Snip → MicroCompact → Auto）
 
 use super::*;
 
-/// 压缩管道配置（驱动 5 层压缩：Budget → Snip → MicroCompact → Collapse → Auto）
+/// 压缩管道配置（驱动 4 层压缩：Budget → Snip → MicroCompact → Auto）
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
     /// 微压缩阈值：超过此消息数时触发微压缩
     pub microcompact_threshold: usize,
-    /// 上下文折叠阈值：token 占用率超过此百分比时触发
-    pub collapse_threshold_percent: u32,
     /// 自动压缩阈值：token 占用率超过此百分比时触发全量压缩
     pub auto_compact_threshold_percent: u32,
     /// 保留最近 K 轮不压缩（热区）
@@ -19,7 +17,6 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             microcompact_threshold: 20,
-            collapse_threshold_percent: 85,
             auto_compact_threshold_percent: 95,
             keep_recent: 5,
         }
@@ -41,7 +38,7 @@ impl ThinkerNode {
             .enumerate()
             .map(|(idx, e)| {
                 let (role, content, token_count) = match e {
-                    crate::memory::working::WorkingEntry::Hot { role, content, token_count } => {
+                    crate::memory::working::WorkingEntry::Hot { role, content, token_count, .. } => {
                         (format!("{:?}", role), content.clone(), *token_count)
                     }
                     crate::memory::working::WorkingEntry::Warm { summary, token_count, .. } => {
@@ -79,12 +76,11 @@ impl ThinkerNode {
         );
     }
 
-    /// 运行 5 层压缩管道（在每次回到 sampler 前调用）
+    /// 运行压缩管道（在每次回到 sampler 前调用）
     ///
     /// 管道顺序：
     /// 1. MicroCompact：清除旧工具结果（按消息数阈值）
-    /// 2. Context Collapse：LLM 摘要压缩早期轮次（按 token 占用率）
-    /// 3. Auto Compact：全量压缩（最后手段）
+    /// 2. Auto Compact：全量压缩（最后手段）
     pub(crate) fn run_compaction_pipeline(&mut self) {
         let current_tokens = self.working_memory.used_tokens();
         let max_tokens = self.working_memory.max_tokens();
@@ -107,33 +103,7 @@ impl ThinkerNode {
             );
         }
 
-        // 重新计算占用率（MicroCompact 可能已释放空间）
-        let current_tokens = self.working_memory.used_tokens();
-        let usage_percent = if max_tokens > 0 {
-            (current_tokens * 100) / max_tokens
-        } else {
-            0
-        };
-
-        // 层 2：Context Collapse — LLM 摘要（需要外部 sampler，此处标记）
-        if usage_percent > self.compaction_config.collapse_threshold_percent
-            && !self.context_collapse_active
-        {
-            tracing::info!(
-                "压缩管道 L2 Context Collapse 触发：usage={}%>{}%",
-                usage_percent, self.compaction_config.collapse_threshold_percent
-            );
-            self.context_collapse_active = true;
-            // 通过 working_memory 的 compact 做本地摘要（不依赖外部 LLM）
-            let result = self.working_memory.compact();
-            self.context_collapse_active = false;
-            tracing::info!(
-                "压缩管道 L2 Context Collapse 完成：tokens {}→{}",
-                result.tokens_before, result.tokens_after
-            );
-        }
-
-        // 层 3：Auto Compact — 最后手段
+        // 层 2：Auto Compact — 最后手段
         let current_tokens = self.working_memory.used_tokens();
         let usage_percent = if max_tokens > 0 {
             (current_tokens * 100) / max_tokens
@@ -142,12 +112,12 @@ impl ThinkerNode {
         };
         if usage_percent > self.compaction_config.auto_compact_threshold_percent {
             tracing::warn!(
-                "压缩管道 L3 Auto Compact 触发：usage={}%>{}%，强制压缩",
+                "压缩管道 L2 Auto Compact 触发：usage={}%>{}%，强制压缩",
                 usage_percent, self.compaction_config.auto_compact_threshold_percent
             );
             let result = self.working_memory.compact();
             tracing::info!(
-                "压缩管道 L3 Auto Compact 完成：tokens {}→{}",
+                "压缩管道 L2 Auto Compact 完成：tokens {}→{}",
                 result.tokens_before, result.tokens_after
             );
         }

@@ -14,7 +14,6 @@
 //! |------|------|------|------|
 //! | 代码块解析 | `function_embed` | TinyEmbed | 按函数/类粒度切分代码并嵌入 |
 //! | 意图检索 | `intent_retriever` | Retriever-XL | LLM 意图展开 + 多维度查询 + 依赖链扩展 |
-//! | 向量存储 | `vector_store` | VectorFS | 持久化 + 增量更新 + 双层缓存 |
 //! | 依赖图 | `repo_map` | - | 文件级 import 依赖图 + 影响分析 |
 //! | 向量索引 | `embedding` | - | O(n log k) TopK 搜索 + MMR 多样性 |
 //!
@@ -31,19 +30,12 @@
 
 pub mod working;
 pub mod short_term;
-pub mod long_term;
 pub mod heat;
 pub mod window;
-pub mod dream;
-pub mod recall;
 pub mod embedding;
 pub mod mmr;
-pub mod chunker;
 pub mod storage;
-pub mod watcher;
 pub mod episodic;
-pub mod summarizer;
 pub mod repo_map;
 pub mod function_embed;
 pub mod intent_retriever;
-pub mod vector_store;

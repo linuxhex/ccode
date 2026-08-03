@@ -97,8 +97,6 @@ struct GitHubApiRepo {
     license: Option<GitHubApiLicense>,
     /// 最近更新时间
     updated_at: Option<String>,
-    /// 仓库 HTML URL
-    html_url: Option<String>,
 }
 
 /// GitHub API license 信息
@@ -118,11 +116,6 @@ struct GitHubApiTextMatch {
 // ───────────────────────────────────────────────────────────────────────────
 // 工具实现
 // ───────────────────────────────────────────────────────────────────────────
-
-/// 默认排序方式
-fn default_sort() -> String {
-    "stars".into()
-}
 
 /// 默认返回数量
 fn default_limit() -> usize {

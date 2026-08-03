@@ -561,6 +561,7 @@ mod tests {
             system_prompt: Some("You are a coding assistant.".into()),
             tool_choice: None,
             prompt_cache_key: None,
+            goal_verify: false,
         };
 
         let body = provider.build_request_body(&request);

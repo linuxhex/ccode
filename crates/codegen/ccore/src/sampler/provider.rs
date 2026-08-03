@@ -35,6 +35,10 @@ pub struct SampleRequest {
     /// Prompt cache key（复用 API 侧 KV cache）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// 是否为 GoalLoop 子任务验证请求（SamplerNode 识别后走验证闭环，
+    /// 流式收集完整响应并解析 JSON，结果发到 cortex/goal_verify_result）
+    #[serde(default)]
+    pub goal_verify: bool,
 }
 
 /// Prompt cache 控制标记

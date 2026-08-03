@@ -175,4 +175,12 @@ impl DoomLoopDetector {
     pub fn reset(&mut self) {
         self.history.clear();
     }
+
+    /// 重置模型降级等级（逃脱成功后调用，恢复原级推理强度）
+    ///
+    /// 与 `reset()` 区别：`reset()` 清空历史签名（用于全新会话），
+    /// `reset_degrade_level()` 仅恢复降级等级，保留检测历史。
+    pub fn reset_degrade_level(&mut self) {
+        self.model_degrade_level = 0;
+    }
 }

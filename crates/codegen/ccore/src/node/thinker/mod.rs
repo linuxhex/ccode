@@ -46,6 +46,10 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use chrono::Utc;
 
 use crate::message::frame::FrameCodec;
 use crate::message::Message;
@@ -57,7 +61,10 @@ use crate::node::transport::NodeTransportHandle;
 use crate::agent::{AgentConfig, AgentState};
 use crate::agent::doom_loop::{DoomLoopDetector, DoomLoopResult, EscapeAction};
 use crate::agent::loop_state::{LoopStateMachine, LoopEvent, LoopAction, ToolExecutionOutcome};
+use crate::persistence::state::StatePersister;
 use crate::agent::goal_loop::{GoalLoop, GoalAction};
+use crate::agent::schedule_loop::{ScheduleLoop, ScheduleAction, ScheduleState};
+use crate::agent::proactive_loop::{ProactiveLoop, ProactiveSpec, ProactiveAction, ProactiveState};
 use crate::agent::orchestrator::Orchestrator;
 use crate::agent::subagent::SubAgentCrashed;
 
@@ -70,6 +77,11 @@ use crate::memory::intent_retriever::IntentRetriever;
 use crate::sampler::provider::{
     SampleRequest, ChatMessage, CacheControl, StreamChunk, StreamChannel, ToolDefinition as SamplerToolDefinition,
 };
+use crate::retry::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use crate::tools::read_tracker::ReadTracker;
+use crate::sampler::token_budget::TokenBudgetManager;
+use crate::memory::episodic::EpisodicMemoryStore;
+use crate::agent::meta_cognitive::MetaCognitiveController;
 
 /// Thinker Node 实现（仿生架构，路线 A：感官内置）
 ///
@@ -100,8 +112,6 @@ pub struct ThinkerNode {
     compaction_config: CompactionConfig,
     /// 上次微压缩的消息数（避免重复压缩）
     last_microcompact_count: usize,
-    /// 上下文折叠是否激活
-    context_collapse_active: bool,
     /// 记忆桥接（连接 ccode-memory 等外部记忆系统）
     memory_bridge: Box<dyn MemoryBridge>,
     /// 等待中的工具调用（tool_call_id → PendingToolCall）
@@ -112,21 +122,28 @@ pub struct ThinkerNode {
     current_sample_request_id: Option<String>,
     /// 当前推理周期的开始时间
     inference_start: Option<std::time::Instant>,
-    /// 已使用的 token 数
-    #[allow(dead_code)]
-    tokens_used: u32,
     /// 已执行轮次
     turns_executed: u32,
     /// 感官信号缓冲（最近 20 条，内置处理）
     sensory_buffer: Vec<SensorySignal>,
     /// 取消请求标志（收到 agent/{id}/cancel 后设置）
     cancel_requested: bool,
+    /// 当前 turn 内是否发生过工具失败（供 GoalLoop on_turn_complete 判定成功）
+    turn_had_tool_failure: bool,
     /// Agentic 会话是否活跃（input → sampling → tool → re-sample 循环中）
     agentic_session_active: bool,
     /// 意图检索器（Context Engine 核心：意图扩展 + 代码块检索）
     intent_retriever: IntentRetriever,
     /// Goal Loop（目标驱动循环，/goal 命令触发）
     goal_loop: Option<GoalLoop>,
+    /// Schedule Loop（定时循环，/schedule 命令触发）
+    schedule_loop: Option<ScheduleLoop>,
+    /// Proactive Loop（主动扫描循环，/proactive on 启用）
+    proactive_loop: ProactiveLoop,
+    /// Schedule tick task 活跃标志（false 时 spawn 的定时 task 退出）
+    schedule_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Proactive tick task 活跃标志
+    proactive_active: Arc<std::sync::atomic::AtomicBool>,
     /// Doom Loop 逃脱尝试次数（超过 3 次才真正终止）
     doom_loop_escape_attempts: u32,
     /// 项目上下文（CCODE.md，会话开始时注入）
@@ -135,6 +152,24 @@ pub struct ThinkerNode {
     budget_denied: bool,
     /// 强制结束 turn 标志（LoopStateMachine 判定 EndTurn 后设置，阻止继续采样）
     force_end_turn: bool,
+    /// 状态持久化器（运行时注入，turn 结束时保存快照，None 表示禁用持久化）
+    state_persister: Option<StatePersister>,
+
+    // ── ccore 高级特性（融合自 SessionActor，ThinkerNode 唯一 Agent Loop） ──
+    /// 熔断器：5次连续失败后自动断开，防止级联故障
+    circuit_breaker: CircuitBreaker,
+    /// 读取追踪器：先读后写保护，跨线程安全（Arc<Mutex>）
+    read_tracker: std::sync::Arc<parking_lot::Mutex<ReadTracker>>,
+    /// Token 预算管理器：跨轮次累计使用量，驱动上下文压缩
+    token_budget: TokenBudgetManager,
+    /// 情景记忆存储：每轮对话编码为情景记忆，支持上下文重建
+    episodic_memory: EpisodicMemoryStore,
+    /// 元认知控制器：难度评估+策略推荐+冲突检测
+    meta_cognitive: MetaCognitiveController,
+    /// 本轮 LLM 调用累计 token 数（input + output），供 turn 结束时汇总
+    current_turn_token_usage: (usize, usize),
+    /// 本轮使用的工具名列表，供 EpisodicMemory 编码
+    current_turn_tools: Vec<String>,
 }
 
 impl ThinkerNode {
@@ -171,24 +206,100 @@ impl ThinkerNode {
             sliding_window: SlidingWindow::new(max_tokens),
             compaction_config: CompactionConfig::default(),
             last_microcompact_count: 0,
-            context_collapse_active: false,
             memory_bridge: Box::new(memory_bridge::NoopMemoryBridge),
             config,
             pending_tool_calls: HashMap::new(),
             pending_tool_results: HashMap::new(),
             current_sample_request_id: None,
             inference_start: None,
-            tokens_used: 0,
             turns_executed: 0,
             sensory_buffer: Vec::with_capacity(sensory::SENSORY_BUFFER_CAPACITY),
             cancel_requested: false,
+            turn_had_tool_failure: false,
             agentic_session_active: false,
             intent_retriever: IntentRetriever::new(EmbeddingIndex::new()),
             goal_loop: None,
+            schedule_loop: None,
+            proactive_loop: ProactiveLoop::new(ProactiveSpec::default()),
+            schedule_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            proactive_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             doom_loop_escape_attempts: 0,
             project_context: crate::tools::project_context::ProjectContext::default(),
             budget_denied: false,
             force_end_turn: false,
+            state_persister: None,
+            // ccore 高级特性初始化（融合自 SessionActor）
+            circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
+            read_tracker: std::sync::Arc::new(parking_lot::Mutex::new(ReadTracker::new())),
+            token_budget: TokenBudgetManager::new(&config.model),
+            episodic_memory: EpisodicMemoryStore::new(),
+            meta_cognitive: MetaCognitiveController::new(),
+            current_turn_token_usage: (0, 0),
+            current_turn_tools: Vec::new(),
+        }
+    }
+
+    /// 注入状态持久化器（builder 模式，FileStorage::new 是 async 故运行时注入）
+    pub fn with_state_persister(mut self, persister: StatePersister) -> Self {
+        self.state_persister = Some(persister);
+        self
+    }
+
+    /// 保存当前状态快照（turn 结束时调用）
+    ///
+    /// 将 LoopStateMachine + GoalLoop 状态序列化并持久化。
+    /// 持久化失败仅记录日志，不影响主流程。
+    pub async fn save_state_snapshot(&self) {
+        // 先构建快照（借用 self），释放借用后再调用 persister（避免跨 await 持有借用）
+        let snapshot = {
+            let mut snap = self.loop_state_machine.to_snapshot();
+            if let Some(ref gl) = self.goal_loop {
+                snap.goal = Some(gl.to_snapshot());
+            }
+            snap
+        };
+        if let Some(ref persister) = self.state_persister {
+            if let Err(e) = persister.save_state(&snapshot).await {
+                tracing::warn!(target: "ccore::persistence", error = %e, "保存状态快照失败");
+            }
+        }
+    }
+
+    /// 从持久化恢复状态（启动时调用）
+    ///
+    /// 返回 true 表示成功加载并恢复状态，false 表示无快照或未注入持久化器。
+    pub async fn restore_state(&mut self) -> bool {
+        // 在块内加载快照（借用 self.state_persister），释放后再 &mut self 恢复
+        let snapshot = {
+            let Some(ref persister) = self.state_persister else {
+                return false;
+            };
+            match persister.load_state().await {
+                Ok(Some(s)) => Some(s),
+                Ok(None) => return false,
+                Err(e) => {
+                    tracing::warn!(target: "ccore::persistence", error = %e, "加载状态快照失败");
+                    return false;
+                }
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            self.loop_state_machine.restore_from_snapshot(&snapshot);
+            if let Some(ref goal_snap) = snapshot.goal {
+                match self.goal_loop.as_mut() {
+                    Some(gl) => gl.restore_from_snapshot(goal_snap),
+                    None => {
+                        // goal_loop 不存在（ThinkerNode::new 初始化为 None），从快照创建
+                        let mut gl = GoalLoop::new(goal_snap.spec.clone());
+                        gl.restore_from_snapshot(goal_snap);
+                        self.goal_loop = Some(gl);
+                    }
+                }
+            }
+            tracing::info!(target: "ccore::persistence", "状态快照已恢复");
+            true
+        } else {
+            false
         }
     }
 
@@ -259,6 +370,7 @@ impl ThinkerNode {
             system_prompt: None,
             tool_choice: None,
             prompt_cache_key: Some(self.id.to_string()),  // 同一 agent 的请求共享 cache
+            goal_verify: false,
         }
     }
 
@@ -320,6 +432,20 @@ impl ThinkerNode {
     /// 处理工具调用结果，返回 true 表示所有工具调用已完成，应重新采样
     async fn handle_tool_result(&mut self, tool_call_id: &str, tool_name: &str, output: &str, success: bool, transport: &NodeTransportHandle) -> bool {
         self.pending_tool_results.remove(tool_call_id);
+        if !success {
+            self.turn_had_tool_failure = true;
+        }
+
+        // 记录本轮使用的工具（供 EpisodicMemory 编码）
+        self.current_turn_tools.push(tool_name.to_string());
+
+        // ReadTracker：记录文件读取（read 类工具）
+        if matches!(tool_name, "read" | "read_file") {
+            // 从 output 解析文件路径（简化：取 output 中的文件路径）
+            if let Some(path) = self.extract_read_path(tool_name, output) {
+                self.read_tracker.lock().record_read(&path);
+            }
+        }
 
         // 内置感官处理（路线 A 核心：不经过独立器官 Node）
         // 同时向 Kernel 发送感官信号，让反射弧和经验学习有输入
@@ -367,6 +493,25 @@ impl ThinkerNode {
             true
         } else {
             false
+        }
+    }
+
+    /// 从工具输出中解析读取的文件路径（供 ReadTracker 使用）
+    fn extract_read_path(&self, tool_name: &str, _output: &str) -> Option<String> {
+        // 简化实现：从工具名称推断路径
+        // 实际路径在 tool_call 的 arguments 中，这里从 output 中提取
+        // 对于 read 工具，output 通常包含文件路径信息
+        match tool_name {
+            "read" | "read_file" => {
+                // 尝试从 output 第一行提取路径
+                let first_line = _output.lines().next().unwrap_or("");
+                if first_line.starts_with('/') || first_line.starts_with('.') {
+                    Some(first_line.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -490,29 +635,173 @@ impl ThinkerNode {
         }
     }
 
+    /// 解析 /schedule 参数："<description> <interval_secs>"，无秒数则默认 300s
+    fn parse_schedule_args(args: &str) -> Option<(String, u64)> {
+        let args = args.trim();
+        if args.is_empty() {
+            return None;
+        }
+        if let Some(pos) = args.rfind(' ') {
+            if let Ok(secs) = args[pos + 1..].parse::<u64>() {
+                let desc = args[..pos].trim().to_string();
+                if !desc.is_empty() {
+                    return Some((desc, secs));
+                }
+            }
+        }
+        Some((args.to_string(), 300))
+    }
+
+    /// 启动 Schedule Loop 定时 tick task（每 5s 检查是否到执行时间）
+    fn spawn_schedule_tick(&self, transport: &NodeTransportHandle) {
+        let transport_clone = transport.clone();
+        let agent_id = self.id.to_string();
+        let active = self.schedule_active.clone();
+        tokio::spawn(async move {
+            while active.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if !active.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Ok(msg) = FrameCodec::new_message(
+                    Topic::new("cortex/schedule_tick"),
+                    &agent_id,
+                    &serde_json::json!({}),
+                ) {
+                    let _ = transport_clone.send_message(&msg).await;
+                }
+            }
+        });
+    }
+
+    /// 启动 Proactive Loop 定时 tick task（每 30s 检查是否闲置超时）
+    fn spawn_proactive_tick(&self, transport: &NodeTransportHandle) {
+        let transport_clone = transport.clone();
+        let agent_id = self.id.to_string();
+        let active = self.proactive_active.clone();
+        tokio::spawn(async move {
+            while active.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if !active.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Ok(msg) = FrameCodec::new_message(
+                    Topic::new("cortex/proactive_tick"),
+                    &agent_id,
+                    &serde_json::json!({}),
+                ) {
+                    let _ = transport_clone.send_message(&msg).await;
+                }
+            }
+        });
+    }
+
+    /// 处理 ScheduleAction：Execute 注入 working_memory 并返回 true（继续 turn）
+    async fn process_schedule_action(
+        &mut self,
+        action: ScheduleAction,
+        _transport: &NodeTransportHandle,
+    ) -> anyhow::Result<bool> {
+        match action {
+            ScheduleAction::Execute { description } => {
+                let prompt = format!("[定时任务] {}", description);
+                self.working_memory.push_user(prompt.clone(), Self::estimate_tokens(&prompt));
+                Ok(true)
+            }
+            ScheduleAction::Wait { until_next } => {
+                tracing::info!(
+                    target: "ccore::schedule",
+                    until_next_secs = until_next.as_secs(),
+                    "等待下次定时执行"
+                );
+                Ok(false)
+            }
+            ScheduleAction::ScheduleComplete { reason, total_executions, total_successes } => {
+                tracing::info!(
+                    target: "ccore::schedule",
+                    ?reason, total_executions, total_successes,
+                    "定时任务结束"
+                );
+                self.schedule_active.store(false, Ordering::SeqCst);
+                self.schedule_loop = None;
+                Ok(false)
+            }
+        }
+    }
+
+    /// 处理 ProactiveAction：StartScan/RepairIssue 注入 working_memory 并返回 true
+    async fn process_proactive_action(
+        &mut self,
+        action: ProactiveAction,
+        _transport: &NodeTransportHandle,
+    ) -> anyhow::Result<bool> {
+        match action {
+            ProactiveAction::StartScan { scan_types } => {
+                let types_str = scan_types
+                    .iter()
+                    .map(|t| format!("{:?}", t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let prompt = format!(
+                    "[主动扫描] 请扫描当前项目的代码质量问题（{}），发现问题后直接修复。",
+                    types_str
+                );
+                self.working_memory.push_user(prompt.clone(), Self::estimate_tokens(&prompt));
+                Ok(true)
+            }
+            ProactiveAction::ContinueWaiting { remaining } => {
+                tracing::debug!(
+                    target: "ccore::proactive",
+                    remaining_secs = remaining.as_secs(),
+                    "未到闲置阈值，继续等待"
+                );
+                Ok(false)
+            }
+            ProactiveAction::ScanComplete { issues_found, issues_fixed } => {
+                tracing::info!(
+                    target: "ccore::proactive",
+                    issues_found, issues_fixed,
+                    "主动扫描完成"
+                );
+                Ok(false)
+            }
+            ProactiveAction::RepairIssue { issue } => {
+                let prompt = format!(
+                    "[主动修复] {:?}（{}）：{}\n建议修复方案：{}",
+                    issue.scan_type,
+                    issue.file_path.as_deref().unwrap_or("未知文件"),
+                    issue.description,
+                    issue.suggested_fix
+                );
+                self.working_memory.push_user(prompt.clone(), Self::estimate_tokens(&prompt));
+                Ok(true)
+            }
+            ProactiveAction::AllRepairsComplete { total_issues, fixed, failed } => {
+                tracing::info!(
+                    target: "ccore::proactive",
+                    total_issues, fixed, failed,
+                    "所有主动修复完成"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// 请求 Token 预算和熔断器检查（通过消息总线）
     ///
     /// 返回 true 表示允许执行，false 表示应跳过（预算不足或熔断器开启）。
     /// 如果已被 Kernel 拒绝（budget_denied=true），立即返回 false。
     /// 同时发送 fire-and-forget 到 Kernel 进行持续预算追踪。
-    async fn check_budget_and_circuit(&self, transport: &NodeTransportHandle) -> bool {
-        // 如果已被 Kernel 拒绝，立即阻止
-        if self.budget_denied {
-            tracing::warn!("Token 预算已被拒绝，阻止 LLM 调用");
+    /// 电路门控检查（替代旧 fire-and-forget check_budget_and_circuit）。
+    ///
+    /// 使用本地 CircuitBreaker 直接判定，不再依赖异步消息通知。
+    /// 熔断状态为 Open 时阻止 LLM 调用，等待恢复超时后降级放行。
+    async fn check_budget_and_circuit(&self, _transport: &NodeTransportHandle) -> bool {
+        if !self.circuit_breaker.allow_request() {
+            tracing::warn!(target: "ccore::circuit_breaker",
+                state = ?self.circuit_breaker.state(),
+                "熔断器 Open，阻止 LLM 调用");
             return false;
-        }
-        // 请求 Kernel 检查（fire-and-forget，结果通过 cortex/budget_deny 异步通知）
-        let msg = FrameCodec::new_message(
-            Topic::new("cortex/budget_check"),
-            self.id.as_str(),
-            &serde_json::json!({
-                "agent_id": self.id.to_string(),
-            }),
-        );
-        if let Ok(msg) = msg {
-            if let Err(e) = transport.send_message(&msg).await {
-                tracing::debug!("发送预算检查请求失败（放行）：{}", e);
-            }
         }
         true
     }
@@ -577,6 +866,12 @@ impl Node for ThinkerNode {
                 // 新 turn 开始，重置预算拒绝和强制结束标志
                 self.budget_denied = false;
                 self.force_end_turn = false;
+                self.turn_had_tool_failure = false;
+                // 重置循环状态机并记录任务描述（供 ERL trajectory 提取）
+                self.loop_state_machine.reset();
+                if !content.is_empty() {
+                    self.loop_state_machine.set_task_description(content.to_string());
+                }
 
                 self.listen(content, role); // 内置听觉
 
@@ -598,6 +893,9 @@ impl Node for ThinkerNode {
                     }
                 }
 
+                // Proactive Loop：用户输入时更新活跃时间（避免活跃时触发扫描）
+                self.proactive_loop.on_user_active();
+
                 // /goal 命令处理：启动目标驱动循环
                 if content.starts_with("/goal ") {
                     let goal_description = content.strip_prefix("/goal ").unwrap_or("").to_string();
@@ -612,6 +910,50 @@ impl Node for ThinkerNode {
                             );
                         }
                     }
+                }
+
+                // /schedule 命令处理：启动/取消定时循环
+                if content.starts_with("/schedule ") {
+                    let args = content.strip_prefix("/schedule ").unwrap_or("").trim();
+                    if args == "cancel" || args == "stop" {
+                        self.schedule_active.store(false, Ordering::SeqCst);
+                        if let Some(mut sl) = self.schedule_loop.take() {
+                            let _ = sl.cancel();
+                        }
+                        tracing::info!(target: "ccore::schedule", "定时任务已取消");
+                        return Ok(());
+                    } else if let Some((desc, secs)) = Self::parse_schedule_args(args) {
+                        self.schedule_loop = Some(ScheduleLoop::from_description(desc, secs));
+                        self.schedule_active.store(true, Ordering::SeqCst);
+                        self.spawn_schedule_tick(transport);
+                        // 立即首次执行（注入 working_memory 后继续走 agentic turn）
+                        if let Some(ref mut sl) = self.schedule_loop {
+                            let action = sl.on_timer_fired();
+                            if !self.process_schedule_action(action, transport).await? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
+                // /proactive 命令处理：启用/禁用主动扫描（配置命令，不触发 turn）
+                if content.starts_with("/proactive ") {
+                    let args = content.strip_prefix("/proactive ").unwrap_or("").trim();
+                    match args {
+                        "on" | "enable" => {
+                            self.proactive_loop.set_enabled(true);
+                            self.proactive_active.store(true, Ordering::SeqCst);
+                            self.spawn_proactive_tick(transport);
+                            tracing::info!(target: "ccore::proactive", "主动扫描已启用");
+                        }
+                        "off" | "disable" => {
+                            self.proactive_loop.set_enabled(false);
+                            self.proactive_active.store(false, Ordering::SeqCst);
+                            tracing::info!(target: "ccore::proactive", "主动扫描已禁用");
+                        }
+                        _ => {}
+                    }
+                    return Ok(());
                 }
 
                 self.agentic_session_active = true;
@@ -650,6 +992,50 @@ impl Node for ThinkerNode {
                             .record_inference_latency(start.elapsed().as_millis() as f64);
                     }
 
+                    // 记录熔断器成功（LLM 调用成功）
+                    self.circuit_breaker.record_success();
+
+                    // TokenBudget 累计：记录本次 LLM 调用的 token 使用量
+                    let input_tokens = raw_value
+                        .get("usage")
+                        .and_then(|u| u.get("input_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let output_tokens = raw_value
+                        .get("usage")
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    self.current_turn_token_usage = (input_tokens, output_tokens);
+                    self.token_budget.record_usage(input_tokens, output_tokens);
+
+                    // 喂入 LLMResponse 事件驱动状态机（修复伪驱动问题）
+                    // —— 使 turn_count 递增、done_reason 正确设置，供 ERL trajectory 提取
+                    let llm_token_used = raw_value
+                        .get("usage")
+                        .and_then(|u| u.get("total_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let has_tool_calls = !self.pending_tool_calls.is_empty();
+                    let llm_stop_reason = if has_tool_calls { "tool_use" } else { "end_turn" };
+                    // 收集本轮工具调用列表（id, name, input）供状态机记录
+                    let llm_tool_calls: Vec<(String, String, serde_json::Value)> = self
+                        .pending_tool_calls
+                        .iter()
+                        .map(|(id, tc)| (id.clone(), tc.tool_name.clone(), tc.arguments.clone()))
+                        .collect();
+                    let llm_action = self.loop_state_machine.transition(LoopEvent::LLMResponse {
+                        stop_reason: llm_stop_reason.to_string(),
+                        token_used: llm_token_used,
+                        tool_calls: llm_tool_calls,
+                    });
+                    self.state = self.loop_state_machine.state();
+                    if let LoopAction::EndTurn { reason } = &llm_action {
+                        tracing::debug!(target: "ccore::loop", reason = ?reason, "LoopStateMachine 记录 turn 完成");
+                        // turn 结束时持久化状态快照（支持会话中断后恢复）
+                        self.save_state_snapshot().await;
+                    }
+
                     if !self.pending_tool_calls.is_empty() {
                         self.state = AgentState::ToolCalling;
                         let tool_calls: Vec<(String, PendingToolCall)> =
@@ -684,6 +1070,59 @@ impl Node for ThinkerNode {
                         self.agentic_session_active = false;
                         self.state = AgentState::Idle;
                         self.update_context_window();
+
+                        // ── ccore 高级特性：EpisodicMemory 编码 + MetaCognitive 冲突检测 ──
+                        // 编码本轮对话到情景记忆（支持跨轮次上下文重建）
+                        let user_msg = self.working_memory.entries().iter()
+                            .find(|e| matches!(e, WorkingEntry::Hot { role, .. } if matches!(role, MessageRole::User)))
+                            .map(|e| match e {
+                                WorkingEntry::Hot { content, .. } => content.as_str(),
+                                _ => "",
+                            })
+                            .unwrap_or("");
+                        let assistant_msg = self.working_memory.entries().iter().rev()
+                            .find(|e| matches!(e, WorkingEntry::Hot { role, .. } if matches!(role, MessageRole::Assistant)))
+                            .map(|e| match e {
+                                WorkingEntry::Hot { content, .. } => content.as_str(),
+                                _ => "",
+                            })
+                            .unwrap_or("");
+                        let tools_used = std::mem::take(&mut self.current_turn_tools);
+                        let context = format!("tools: {}", tools_used.join(", "));
+                        let keywords = tools_used.clone();
+                        self.episodic_memory.encode(
+                            crate::memory::episodic::MemoryType::Conversation,
+                            assistant_msg,
+                            &context,
+                            keywords,
+                            crate::memory::episodic::MemorySource {
+                                source_type: "thinker_node".to_string(),
+                                source_id: self.id.to_string(),
+                                timestamp: Utc::now().timestamp(),
+                                reliability: 0.8,
+                            },
+                        );
+
+                        // 元认知冲突检测：如果连续失败，推荐策略变更
+                        let errors: Vec<String> = if self.turn_had_tool_failure {
+                            vec!["工具执行失败".to_string()]
+                        } else {
+                            vec![]
+                        };
+                        let conflicts = self.meta_cognitive.detect_conflicts(&errors);
+                        if !conflicts.is_empty() {
+                            tracing::info!(target: "ccore::meta_cognitive",
+                                conflict_count = conflicts.len(),
+                                "元认知检测到冲突，推荐策略调整");
+                            // 注入提醒到工作记忆（供下一轮 LLM 参考）
+                            for c in &conflicts {
+                                tracing::debug!(target: "ccore::meta_cognitive",
+                                    conflict = ?c, "冲突详情");
+                            }
+                        }
+
+                        // 重置本轮 token 统计
+                        self.current_turn_token_usage = (0, 0);
 
                         // GoalLoop 规划阶段：尝试从 LLM 响应中解析子任务列表
                         // 先提取文本并解析子任务，避免与 goal_loop 的可变借用冲突
@@ -724,11 +1163,35 @@ impl Node for ThinkerNode {
                         }
 
                         // GoalLoop：turn 完成后通知目标循环
+                        // success 判定：未取消且本轮无工具失败
                         if self.goal_loop.is_some() {
-                            let success = !self.cancel_requested;
+                            let success = !self.cancel_requested && !self.turn_had_tool_failure;
                             if let Some(ref mut gl) = self.goal_loop {
                                 let action = gl.on_turn_complete(success);
                                 self.process_goal_action(action, transport).await?;
+                            }
+                        }
+
+                        // ScheduleLoop：定时任务 turn 完成后回调
+                        if let Some(ref mut sl) = self.schedule_loop {
+                            if sl.state() == ScheduleState::Executing {
+                                let success = !self.cancel_requested && !self.turn_had_tool_failure;
+                                let action = sl.on_execution_complete(success);
+                                let _ = self.process_schedule_action(action, transport).await?;
+                            }
+                        }
+
+                        // ProactiveLoop：扫描/修复 turn 完成后回调
+                        {
+                            let st = self.proactive_loop.state();
+                            if st == ProactiveState::Scanning {
+                                // 扫描 turn 完成（暂不解析结构化 issues，走空列表）
+                                let action = self.proactive_loop.on_scan_complete(vec![]);
+                                let _ = self.process_proactive_action(action, transport).await?;
+                            } else if st == ProactiveState::Repairing {
+                                let success = !self.cancel_requested && !self.turn_had_tool_failure;
+                                let action = self.proactive_loop.on_repair_complete(success);
+                                let _ = self.process_proactive_action(action, transport).await?;
                             }
                         }
 
@@ -779,6 +1242,7 @@ impl Node for ThinkerNode {
                     );
                     self.inference_start = None;
                     AgentMetrics::global().record_error("sampler_error");
+                    self.circuit_breaker.record_failure();
                     self.current_sample_request_id = None;
                     self.state = AgentState::Error;
                     return Ok(());
@@ -905,8 +1369,10 @@ impl Node for ThinkerNode {
                             self.run_compaction_pipeline();
                             self.send_sample_request(transport).await?;
                         } else {
-                            // 未检测到 Doom Loop，重置逃脱尝试计数
+                            // 未检测到 Doom Loop，说明已成功跳出循环：
+                            // 重置逃脱尝试计数和模型降级等级（恢复原级推理强度）
                             self.doom_loop_escape_attempts = 0;
+                            self.doom_loop_detector.reset_degrade_level();
 
                             // 回到 sampler 前先跑压缩管道
                             self.run_compaction_pipeline();
@@ -1100,6 +1566,34 @@ impl Node for ThinkerNode {
                 self.on_goal_verification_result(passed, transport).await?;
             }
 
+            // cortex/schedule_tick — Schedule Loop 定时唤醒（来自 spawn 的 tick task）
+            "cortex/schedule_tick" => {
+                if let Some(ref mut sl) = self.schedule_loop {
+                    if sl.should_execute_now() {
+                        let action = sl.on_timer_fired();
+                        if self.process_schedule_action(action, transport).await? {
+                            self.agentic_session_active = true;
+                            self.inference_start = Some(std::time::Instant::now());
+                            self.check_budget_and_circuit(transport).await;
+                            self.send_sample_request(transport).await?;
+                        }
+                    }
+                }
+            }
+
+            // cortex/proactive_tick — Proactive Loop 闲置扫描触发（来自 spawn 的 tick task）
+            "cortex/proactive_tick" => {
+                if self.proactive_loop.should_scan() {
+                    let action = self.proactive_loop.on_start_scan();
+                    if self.process_proactive_action(action, transport).await? {
+                        self.agentic_session_active = true;
+                        self.inference_start = Some(std::time::Instant::now());
+                        self.check_budget_and_circuit(transport).await;
+                        self.send_sample_request(transport).await?;
+                    }
+                }
+            }
+
             _ => {
                 tracing::debug!("Thinker 收到未处理 topic：{}", topic);
             }
@@ -1142,6 +1636,8 @@ impl Node for ThinkerNode {
             "cortex/erl_heuristic".into(),             // 经验反思学习结果
             "cortex/goal_start".into(),                // 目标驱动循环启动
             "cortex/goal_verify_result".into(),        // 目标验证结果
+            "cortex/schedule_tick".into(),             // Schedule Loop 定时唤醒
+            "cortex/proactive_tick".into(),            // Proactive Loop 闲置扫描触发
             "sampler/*/stream".into(),
             "tool/register".into(),
             "sys/shutdown".into(),

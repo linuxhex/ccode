@@ -30,6 +30,9 @@ use crate::message::Topic;
 use crate::node::{Node, NodeId, NodeType, NodeContext};
 use crate::node::transport::NodeTransportHandle;
 
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+
 /// Agent 状态显示
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentStatus {
@@ -151,6 +154,9 @@ pub async fn run_tui_node(
                         match key.code {
                             KeyCode::Enter => {
                                 if !input_buffer.is_empty() {
+                                    // 保存到历史
+                                    node.input_history.push(input_buffer.clone());
+                                    node.history_index = None;
                                     // 发送输入到 Agent
                                     if let Some(agent_id) = &node.primary_agent_id {
                                         let input_msg = FrameCodec::new_message(
@@ -168,6 +174,41 @@ pub async fn run_tui_node(
                                     if node.terminal.is_some() {
                                         node.render()?;
                                     }
+                                }
+                            }
+                            KeyCode::Up => {
+                                // 历史导航：上一个
+                                if !node.input_history.is_empty() {
+                                    let idx = match node.history_index {
+                                        Some(i) if i > 0 => i - 1,
+                                        _ => node.input_history.len() - 1,
+                                    };
+                                    input_buffer = node.input_history[idx].clone();
+                                    node.history_index = Some(idx);
+                                }
+                            }
+                            KeyCode::Down => {
+                                // 历史导航：下一个
+                                if let Some(idx) = node.history_index {
+                                    if idx + 1 < node.input_history.len() {
+                                        input_buffer = node.input_history[idx + 1].clone();
+                                        node.history_index = Some(idx + 1);
+                                    } else {
+                                        input_buffer.clear();
+                                        node.history_index = None;
+                                    }
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                node.scroll_offset = node.scroll_offset.saturating_add(10);
+                                if node.terminal.is_some() {
+                                    node.render()?;
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                node.scroll_offset = node.scroll_offset.saturating_sub(10);
+                                if node.terminal.is_some() {
+                                    node.render()?;
                                 }
                             }
                             KeyCode::Char(c) => {
@@ -193,6 +234,12 @@ pub async fn run_tui_node(
     tracing::info!("TUI Node {} 已停止", node_id);
     Ok(())
 }
+
+/// 将 syntect 颜色转为 ratatui Color
+fn syntect_to_ratatui_color(color: syntect::highlighting::Color) -> Color {
+    Color::Rgb(color.r, color.g, color.b)
+}
+
 pub struct TUINode {
     id: NodeId,
     primary_agent_id: Option<String>,
@@ -204,6 +251,14 @@ pub struct TUINode {
     tool_status: String,
     /// 终端（lazy init）
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    /// 语法高亮引擎
+    syntax_set: SyntaxSet,
+    theme_set: ThemeSet,
+    /// 滚动偏移量（行数）
+    scroll_offset: usize,
+    /// 输入历史
+    input_history: Vec<String>,
+    history_index: Option<usize>,
 }
 
 impl TUINode {
@@ -215,6 +270,11 @@ impl TUINode {
             output_buffer: String::new(),
             tool_status: String::new(),
             terminal: None,
+            syntax_set: SyntaxSet::load_defaults_newlines(),
+            theme_set: ThemeSet::load_defaults(),
+            scroll_offset: 0,
+            input_history: Vec::new(),
+            history_index: None,
         }
     }
 
@@ -249,6 +309,8 @@ impl TUINode {
             Some(t) => t,
             None => return Ok(()),
         };
+
+        let highlighted_lines = self.highlight_output();
 
         terminal.draw(|f| {
             let size = f.area();
@@ -288,9 +350,9 @@ impl TUINode {
             let status_bar = Paragraph::new(status_text);
             f.render_widget(status_bar, chunks[0]);
 
-            // 输出区
-            let output_text = Text::from(self.output_buffer.clone());
-            let output = Paragraph::new(output_text)
+            // 输出区：使用语法高亮的行
+            let visible_lines = self.apply_scroll_offset(&highlighted_lines, chunks[1].height as usize);
+            let output = Paragraph::new(Text::from(visible_lines))
                 .block(Block::default().borders(Borders::NONE))
                 .wrap(Wrap { trim: false });
             f.render_widget(output, chunks[1]);
@@ -298,13 +360,125 @@ impl TUINode {
             // 输入区
             let input_text = Line::from(vec![
                 Span::styled(" > ", Style::default().fg(Color::Cyan)),
-                Span::raw("按 Enter 发送消息，Esc 退出"),
+                Span::raw("Enter 发送 | Esc 退出 | ↑↓ 历史 | PgUp/PgDn 滚动"),
             ]);
             let input = Paragraph::new(input_text);
             f.render_widget(input, chunks[2]);
         })?;
 
         Ok(())
+    }
+
+    /// 语法高亮：解析输出缓冲区，对代码块进行着色
+    fn highlight_output(&self) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut in_code_block = false;
+        let mut code_lang: Option<String> = None;
+        let mut code_lines: Vec<String> = Vec::new();
+
+        let theme = &self.theme_set.themes["base16-ocean.dark"];
+
+        for raw_line in self.output_buffer.lines() {
+            let trimmed = raw_line.trim();
+
+            if trimmed.starts_with("```") {
+                if in_code_block {
+                    // 代码块结束：高亮并输出
+                    let lang = code_lang.take().unwrap_or_default();
+                    let syntax = self.syntax_set
+                        .find_syntax_by_extension(&lang)
+                        .or_else(|| self.syntax_set.find_syntax_by_token(&lang))
+                        .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+
+                    for code_line in &code_lines {
+                        let highlighted = syntect::util::highlight(
+                            code_line,
+                            &self.syntax_set,
+                            syntax,
+                            theme,
+                        );
+                        let spans: Vec<Span> = highlighted
+                            .iter()
+                            .map(|(style, text)| {
+                                Span::styled(
+                                    text.to_string(),
+                                    Style::default()
+                                        .fg(syntect_to_ratatui_color(style.foreground))
+                                        .bg(syntect_to_ratatui_color(style.background))
+                                        .add_modifier(if style.font_style.contains(syntect::highlighting::FontStyle::BOLD) {
+                                            Modifier::BOLD
+                                        } else {
+                                            Modifier::empty()
+                                        }),
+                                )
+                            })
+                            .collect();
+                        lines.push(Line::from(spans));
+                    }
+                    code_lines.clear();
+                    in_code_block = false;
+                } else {
+                    // 代码块开始
+                    in_code_block = true;
+                    code_lang = Some(trimmed[3..].trim().to_string());
+                    // 渲染代码块标记行
+                    lines.push(Line::from(Span::styled(
+                        raw_line.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            } else if in_code_block {
+                code_lines.push(raw_line.to_string());
+            } else {
+                // 普通文本行
+                lines.push(Line::from(Span::raw(raw_line.to_string())));
+            }
+        }
+
+        // 未闭合的代码块：仍然高亮
+        if in_code_block && !code_lines.is_empty() {
+            let lang = code_lang.unwrap_or_default();
+            let syntax = self.syntax_set
+                .find_syntax_by_token(&lang)
+                .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+
+            for code_line in &code_lines {
+                let highlighted = syntect::util::highlight(
+                    code_line,
+                    &self.syntax_set,
+                    syntax,
+                    theme,
+                );
+                let spans: Vec<Span> = highlighted
+                    .iter()
+                    .map(|(style, text)| {
+                        Span::styled(
+                            text.to_string(),
+                            Style::default()
+                                .fg(syntect_to_ratatui_color(style.foreground))
+                                .add_modifier(if style.font_style.contains(syntect::highlighting::FontStyle::BOLD) {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                        )
+                    })
+                    .collect();
+                lines.push(Line::from(spans));
+            }
+        }
+
+        lines
+    }
+
+    /// 应用滚动偏移量
+    fn apply_scroll_offset(&self, lines: &[Line<'static>], viewport_height: usize) -> Vec<Line<'static>> {
+        let total_lines = lines.len();
+        if total_lines <= viewport_height {
+            return lines.to_vec();
+        }
+        let start = self.scroll_offset.min(total_lines.saturating_sub(viewport_height));
+        lines[start..].to_vec()
     }
 }
 

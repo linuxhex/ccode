@@ -2,14 +2,12 @@
 //!
 //! 所有 Mutex/RwLock 必须按以下顺序获取：
 //! 1. READ_TRACKER    - tools/read_tracker.rs
-//! 2. GITIGNORE       - tools/builtin.rs  
+//! 2. GITIGNORE       - tools/builtin.rs
 //! 3. BASH_CACHE      - tools/builtin.rs
 //! 4. PERMISSION_CHECKER - tools/bridge.rs
-//! 5. DreamLock       - memory/dream.rs
-//! 6. ConnectionPool  - sampler/pool.rs
 //!
 //! 违反此顺序可能导致死锁！
-//! 
+//!
 //! 检测方法：运行 `RUST_LOG=ccore::lock=debug` 查看锁获取顺序
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -47,11 +45,9 @@ pub(crate) mod checker {
     pub fn check_order(lock_name: &'static str) {
         const ORDER: &[&str] = &[
             "READ_TRACKER",
-            "GITIGNORE", 
+            "GITIGNORE",
             "BASH_CACHE",
             "PERMISSION_CHECKER",
-            "DreamLock",
-            "ConnectionPool",
         ];
         
         HELD_LOCKS.with(|held| {

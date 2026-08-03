@@ -81,11 +81,6 @@ fn main() -> anyhow::Result<()> {
     // 构建配置
     let config = load_config(&args)?;
 
-    // Headless 模式参数
-    if let Some(prompt) = &args.prompt {
-        tracing::info!("Headless 模式：prompt={:?} bytes", prompt.len());
-    }
-
     if args.ffi_mode {
         // FFI 模式：通过动态库启动
         let config_json = serde_json::to_string(&config)?;
@@ -104,6 +99,7 @@ fn main() -> anyhow::Result<()> {
                 router_addr: args.router_addr.clone(),
                 pub_addr: args.pub_addr.clone(),
                 working_dir: args.work_dir.clone().unwrap_or_else(|| ".".into()),
+                startup_prompt: args.prompt.clone(),
                 ..Default::default()
             };
             let mut kernel = ccore::kernel::Kernel::new(kernel_config);

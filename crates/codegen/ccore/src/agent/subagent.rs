@@ -217,6 +217,7 @@ impl SubAgentNode {
             system_prompt: None,
             tool_choice: None,
             prompt_cache_key: None,
+            goal_verify: false,
         }
     }
 
@@ -720,6 +721,8 @@ pub enum SubAgentError {
     AllFailed,
     #[error("Subagent {0} failed: {1}")]
     SubagentFailed(String, String),
+    #[error("spawn_with_result not implemented: subagent spawn is handled by the Orchestrator/Kernel path, not this stub")]
+    NotImplemented,
 }
 
 /// 结果聚合器（超越 Claude Code 的简单等待）
@@ -952,36 +955,13 @@ impl SubAgentManager {
 
     /// Spawn 子 Agent 并返回 receiver
     ///
-    /// 注意：这是一个模板方法，实际的 spawn 逻辑需要由调用者实现
+    /// 注意：此方法未实现，子 Agent 的实际 spawn 由 Kernel/Orchestrator 路径处理。
+    /// 返回 Err 而非空壳 receiver，避免调用方永久阻塞导致死锁。
     pub fn spawn_with_result(
         &mut self,
         _task: SubAgentTask,
     ) -> Result<(String, tokio::sync::oneshot::Receiver<SubAgentResult>), SubAgentError> {
-        let subagent_id = format!("subagent_{}", uuid::Uuid::new_v4());
-        let (_tx, rx) = tokio::sync::oneshot::channel();
-
-        // 增加活跃计数
-        self.active_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // 在实际实现中，这里应该：
-        // 1. 创建 SubAgentDefinition
-        // 2. 创建 SubAgentNode
-        // 3. 启动 SubAgentNode
-        // 4. 在任务完成后通过 tx 发送结果
-        //
-        // 示例框架：
-        // let definition = SubAgentDefinition {
-        //     agent_type: AgentType::default(),
-        //     model: None,
-        //     task_description: task.description,
-        //     max_turns: task.max_turns,
-        //     allowed_tools: task.allowed_tools,
-        // };
-        //
-        // spawn_and_execute(definition, tx);
-
-        Ok((subagent_id, rx))
+        Err(SubAgentError::NotImplemented)
     }
 
     /// 获取当前活跃的子 Agent 数量
@@ -1209,8 +1189,9 @@ mod tests {
             timeout_secs: 60,
         };
 
-        let (id, _rx) = manager.spawn_with_result(task).unwrap();
-        assert!(id.starts_with("subagent_"));
+        // spawn_with_result 是 stub：返回 NotImplemented 错误，避免空壳 receiver 导致调用方死锁
+        let result = manager.spawn_with_result(task);
+        assert!(matches!(result, Err(SubAgentError::NotImplemented)));
     }
 
     #[test]

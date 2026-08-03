@@ -142,19 +142,21 @@ impl PermissionChecker {
 
     /// 检查工具权限
     pub fn check(&self, tool_name: &str, args: &serde_json::Value) -> PermissionDecision {
+        // 统一归一化为小写，避免 LLM 发送 "Bash"/"Read" 等大小写变体导致权限静默失效
+        let tool_name = tool_name.to_lowercase();
         match self.mode {
             PermissionMode::AllowAll => PermissionDecision::Allow,
             PermissionMode::DenyAll => PermissionDecision::Deny,
             PermissionMode::ReadOnly => {
                 // 只读模式：只允许只读工具
-                let level = self.get_permission_level(tool_name);
+                let level = self.get_permission_level(&tool_name);
                 match level {
                     PermissionLevel::Safe => PermissionDecision::Allow,
                     PermissionLevel::Dangerous => PermissionDecision::Deny,
                 }
             }
             PermissionMode::AskUser => {
-                let level = self.get_permission_level(tool_name);
+                let level = self.get_permission_level(&tool_name);
                 match level {
                     PermissionLevel::Safe => PermissionDecision::Allow,
                     PermissionLevel::Dangerous => {
@@ -175,7 +177,7 @@ impl PermissionChecker {
                             }
                         }
                         // 安全检查通过，检查是否已经批准过类似操作
-                        let key = self.approval_key(tool_name, args);
+                        let key = self.approval_key(&tool_name, args);
                         if self.approved.contains(&key) {
                             PermissionDecision::Allow
                         } else {
@@ -189,7 +191,8 @@ impl PermissionChecker {
 
     /// 批准操作（用户确认后调用）
     pub fn approve(&mut self, tool_name: &str, args: &serde_json::Value) {
-        let key = self.approval_key(tool_name, args);
+        let tool_name = tool_name.to_lowercase();
+        let key = self.approval_key(&tool_name, args);
         self.approved.insert(key);
     }
 
@@ -208,11 +211,18 @@ impl PermissionChecker {
     }
 
     /// 生成批准缓存键
+    ///
+    /// 参考 Claude Code 的权限模型：用户批准的是精确命令，而非命令前缀。
+    /// - bash：用完整命令字符串的哈希作为键，避免首词缓存导致 `rm file` 批准后 `rm -rf /` 被自动放行
+    /// - write/edit：按文件路径缓存（路径相同即视为同类操作）
     fn approval_key(&self, tool_name: &str, args: &serde_json::Value) -> String {
         if tool_name == "bash" {
             if let Some(cmd) = args["command"].as_str() {
-                let first_word = cmd.split_whitespace().next().unwrap_or(cmd);
-                return format!("bash:{}", first_word);
+                // 用完整命令的哈希作为缓存键：相同命令复用批准，不同命令需重新确认
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(cmd, &mut hasher);
+                let hash = std::hash::Hasher::finish(&hasher);
+                return format!("bash:{:016x}", hash);
             }
         }
         if tool_name == "write" || tool_name == "write_file" || tool_name == "edit" || tool_name == "search_replace" {

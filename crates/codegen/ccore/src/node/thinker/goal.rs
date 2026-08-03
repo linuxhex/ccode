@@ -59,16 +59,6 @@ impl ThinkerNode {
                     // 不再重试时，继续循环让 GoalLoop 前进到下一个子任务
                 }
             }
-            GoalAction::PlanSubTasks => {
-                // 规划阶段：注入提示让 LLM 生成子任务列表
-                if let Some(ref gl) = self.goal_loop {
-                    let desc = gl.description().to_string();
-                    self.working_memory.push_user(
-                        format!("请将以下目标拆解为可执行的子任务列表：\n{}", desc),
-                        Self::estimate_tokens(&desc),
-                    );
-                }
-            }
         }
         Ok(())
     }

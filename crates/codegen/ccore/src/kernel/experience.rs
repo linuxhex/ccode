@@ -262,28 +262,6 @@ Output patterns as JSON array:
             Err(_) => Vec::new(),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // 与 auto_extract 的集成
-    // -----------------------------------------------------------------------
-
-    /// 将经验条目转换为可提取知识的消息列表
-    ///
-    /// 将最近的失败经历转换为消息，供 KnowledgeExtractor 提取。
-    pub fn failed_experiences_as_messages(&self, n: usize) -> Vec<String> {
-        self.entries
-            .iter()
-            .rev()
-            .filter(|e| !e.result)
-            .take(n)
-            .map(|e| {
-                format!(
-                    "Signal: {} | Topic: {} | Action: {} | Result: FAILED",
-                    e.signal, e.signal_topic, e.action
-                )
-            })
-            .collect()
-    }
 }
 
 impl Default for ExperienceLog {
@@ -535,53 +513,6 @@ Here are the patterns:
         let rules = ExperienceLog::parse_pattern_extraction_response(&response);
         assert_eq!(rules.len(), 1);
         assert!(rules[0].pattern_hint.len() <= 100);
-    }
-
-    // =======================================================================
-    // failed_experiences_as_messages 测试
-    // =======================================================================
-
-    #[test]
-    fn test_failed_experiences_as_messages_empty() {
-        let log = ExperienceLog::new();
-        let msgs = log.failed_experiences_as_messages(5);
-        assert!(msgs.is_empty());
-    }
-
-    #[test]
-    fn test_failed_experiences_as_messages_filters_success() {
-        let mut log = ExperienceLog::new();
-        log.record(make_entry("err1", "nose/compile_error", "hand/edit", true));
-        log.record(make_entry("err2", "nose/compile_error", "hand/edit", false));
-        log.record(make_entry("err3", "nose/type_error", "hand/cast", false));
-        log.record(make_entry("err4", "nose/test_fail", "hand/fix", true));
-
-        let msgs = log.failed_experiences_as_messages(5);
-        assert_eq!(msgs.len(), 2);
-        assert!(msgs[0].contains("FAILED"));
-        assert!(msgs[0].contains("err3") || msgs[0].contains("err2"));
-    }
-
-    #[test]
-    fn test_failed_experiences_as_messages_respects_n() {
-        let mut log = ExperienceLog::new();
-        for i in 0..5 {
-            log.record(make_entry(&format!("fail_{}", i), "nose/err", "hand/edit", false));
-        }
-        let msgs = log.failed_experiences_as_messages(2);
-        assert_eq!(msgs.len(), 2);
-    }
-
-    #[test]
-    fn test_failed_experiences_as_messages_format() {
-        let mut log = ExperienceLog::new();
-        log.record(make_entry("expected `;`", "nose/compile_error", "hand/edit", false));
-        let msgs = log.failed_experiences_as_messages(1);
-        assert_eq!(msgs.len(), 1);
-        assert!(msgs[0].contains("Signal: expected `;`"));
-        assert!(msgs[0].contains("Topic: nose/compile_error"));
-        assert!(msgs[0].contains("Action: hand/edit"));
-        assert!(msgs[0].contains("FAILED"));
     }
 
     // =======================================================================

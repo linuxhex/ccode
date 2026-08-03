@@ -30,6 +30,7 @@ use crate::node::state::StateNode;
 use crate::node::thinker::{ThinkerNode, EpisodicMemoryBridge};
 use crate::node::acp::AcpNode;
 use crate::node::transport::run_node;
+use crate::persistence::StatePersister;
 use crate::agent::AgentConfig;
 use crate::agent::AgentType;
 use crate::agent::subagent::{SubAgentNode, SubAgentDefinition};
@@ -130,6 +131,26 @@ impl NodeLauncher {
             tool.set_hook_dispatcher(dispatcher);
         }
 
+        // 注入 HookRegistry（从 hooks 配置目录加载，让 PreToolUse/PostToolUse hook 生效）
+        // 全局目录 ~/.ccode/hooks/ 与项目目录 <working_dir>/.ccode/hooks/ 均可选；
+        // load_hooks 对缺失目录静默返回空 registry，失败时降级为空 registry + warn
+        {
+            let global_dir = std::env::var("HOME")
+                .ok()
+                .map(|home| std::path::PathBuf::from(home).join(".ccode").join("hooks"));
+            let project_dir = std::path::PathBuf::from(&self.kernel_config.working_dir)
+                .join(".ccode")
+                .join("hooks");
+            let (registry, errors) = ccode_hooks::discovery::load_hooks(
+                global_dir.as_deref(),
+                Some(&project_dir),
+            );
+            for err in &errors {
+                tracing::warn!(target: "ccore::hooks", error = %err, "Hook 加载失败，已跳过该条目");
+            }
+            tool.set_hook_registry(registry);
+        }
+
         // 4. Thinker Node
         let thinker_ctx = self.node_context();
         let thinker_id = NodeId::new();
@@ -151,6 +172,23 @@ impl NodeLauncher {
 
         // 连接情景记忆桥接（ThinkerNode ↔ EpisodicMemoryStore，与 Kernel 共享同一实例）
         thinker.set_memory_bridge(Box::new(EpisodicMemoryBridge::new(self.episodic_memory.clone())));
+
+        // 接入状态持久化（FileStorage 创建失败不阻塞启动，仅禁用持久化并记录警告）
+        let state_dir = std::path::PathBuf::from(&self.kernel_config.working_dir)
+            .join(".ccode")
+            .join("state");
+        match crate::persistence::FileStorage::new(state_dir).await {
+            Ok(storage) => {
+                let persister = StatePersister::new(
+                    Arc::new(storage),
+                    thinker_id.as_str().to_string(),
+                );
+                thinker = thinker.with_state_persister(persister);
+            }
+            Err(e) => {
+                tracing::warn!(target: "ccore::persistence", error = %e, "状态持久化后端创建失败，持久化已禁用");
+            }
+        }
 
         // 5. TUI Node
         let tui_ctx = self.node_context();
@@ -182,6 +220,8 @@ impl NodeLauncher {
             }
         });
         let thinker_handle = tokio::spawn(async move {
+            // 启动时恢复上次的状态快照（支持会话中断后恢复）
+            thinker.restore_state().await;
             if let Err(e) = run_node(thinker, thinker_ctx).await {
                 tracing::error!("Thinker Node 异常退出：{}", e);
             }

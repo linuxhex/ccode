@@ -679,7 +679,7 @@ mod tests {
             session_id: "test",
             workspace_root: "/tmp",
         };
-        let (result, _, info) = run_http_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
+        let (result, _, info, _) = run_http_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
 
         match result {
             crate::runner::HookRunnerResult::Failed(reason) => {
@@ -757,7 +757,7 @@ mod tests {
             workspace_root: "/tmp",
         };
 
-        let (result, _, info) = run_http_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
+        let (result, _, info, _) = run_http_hook(&spec, &envelope, &ctx, GateKind::Tool).await;
 
         // Either a timeout or a connection error is fine; both previously risked
         // embedding the raw URL via `format!("...{e}")`.

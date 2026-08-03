@@ -6,13 +6,13 @@
 //! ## 架构
 //!
 //! MCP Server 作为独立 tokio task 运行，不阻塞 Kernel 主事件循环：
-//! - 通过消息总线与 ToolNode 通信
+//! - 工具调用通过 `McpToolRegistry::execute_tool` 直接执行（不经过消息总线）
 //! - 支持两种传输方式：Stdio（标准输入输出）和 SSE（HTTP Server-Sent Events）
 //!
 //! ## 消息流
 //!
 //! ```text
-//! 外部 Agent → MCP Server → 消息总线 → ToolNode → 执行结果 → 消息总线 → MCP Server → 外部 Agent
+//! 外部 Agent → MCP Server → McpToolRegistry::execute_tool → 执行结果 → MCP Server → 外部 Agent
 //! ```
 
 pub mod transport;
@@ -21,8 +21,6 @@ pub mod handler;
 
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
-
-use crate::message::Message;
 
 /// MCP 传输方式
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,26 +84,22 @@ impl McpServerHandle {
 
 /// MCP Server 主结构
 ///
-/// 持有配置、工具注册表和消息总线发送端，
-/// 在独立 tokio task 中运行，接收并处理外部 JSON-RPC 请求。
+/// 持有配置和工具注册表，在独立 tokio task 中运行，接收并处理外部 JSON-RPC 请求。
+/// 工具调用通过 `McpToolRegistry::execute_tool` 直接执行，不经过消息总线。
 pub struct McpServer {
     /// 服务配置
     config: McpServerConfig,
     /// 工具注册表
     tool_registry: tool_registry::McpToolRegistry,
-    /// 消息总线发送端（用于向 ToolNode 发送工具调用请求）
-    #[allow(dead_code)]
-    bus_tx: tokio::sync::mpsc::Sender<Message>,
 }
 
 impl McpServer {
     /// 创建 MCP Server 实例
-    pub fn new(config: McpServerConfig, bus_tx: tokio::sync::mpsc::Sender<Message>) -> Self {
-        let tool_registry = tool_registry::McpToolRegistry::new(bus_tx.clone());
+    pub fn new(config: McpServerConfig) -> Self {
+        let tool_registry = tool_registry::McpToolRegistry::new();
         Self {
             config,
             tool_registry,
-            bus_tx,
         }
     }
 
@@ -173,7 +167,7 @@ impl McpServer {
                                 &registry,
                                 server_name,
                                 server_version,
-                            );
+                            ).await;
                             match response {
                                 Ok(Some(response_str)) => {
                                     if let Err(e) = transport.send_message(&response_str).await {

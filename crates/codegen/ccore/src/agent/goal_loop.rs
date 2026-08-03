@@ -110,6 +110,25 @@ pub struct GoalLoop {
     done_reason: Option<GoalDoneReason>,
 }
 
+/// GoalLoop 快照（可序列化，用于持久化恢复）
+///
+/// 不含 `created_at: Instant`（不可序列化），恢复时重置为当前时间。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalLoopSnapshot {
+    /// 当前目标状态
+    pub state: GoalState,
+    /// 当前子任务索引
+    pub current_subtask_idx: usize,
+    /// 累计轮次
+    pub total_turns: u32,
+    /// 当前子任务轮次
+    pub subtask_turns: u32,
+    /// 目标规格（含子任务列表及其执行状态）
+    pub spec: GoalSpec,
+    /// 完成原因
+    pub done_reason: Option<GoalDoneReason>,
+}
+
 /// 目标完成原因
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GoalDoneReason {
@@ -130,8 +149,6 @@ pub enum GoalDoneReason {
 /// Goal Loop 输出动作——告诉主循环下一步做什么
 #[derive(Debug, Clone)]
 pub enum GoalAction {
-    /// 请求 LLM 规划子任务（初始阶段）
-    PlanSubTasks,
     /// 执行当前子任务（驱动 Turn 循环）
     ExecuteSubTask {
         /// 子任务描述（注入 WorkingMemory 作为 user 消息）
@@ -216,7 +233,7 @@ impl GoalLoop {
                 subtask: "规划失败：无子任务".to_string(),
             });
             return GoalAction::GoalComplete {
-                reason: self.done_reason.clone().unwrap(),
+                reason: self.done_reason.clone().expect("done_reason must be set before GoalComplete"),
             };
         }
         self.spec.subtasks = subtasks;
@@ -252,7 +269,7 @@ impl GoalLoop {
             self.state = GoalState::Failed;
             self.done_reason = Some(GoalDoneReason::TotalTurnsExhausted);
             return GoalAction::GoalComplete {
-                reason: self.done_reason.clone().unwrap(),
+                reason: self.done_reason.clone().expect("done_reason must be set before GoalComplete"),
             };
         }
 
@@ -316,6 +333,32 @@ impl GoalLoop {
         }
     }
 
+    /// 生成可序列化快照（用于持久化）
+    ///
+    /// 不含 `created_at: Instant`（不可序列化），恢复时重置为当前时间。
+    pub fn to_snapshot(&self) -> GoalLoopSnapshot {
+        GoalLoopSnapshot {
+            state: self.state,
+            current_subtask_idx: self.current_subtask_idx,
+            total_turns: self.total_turns,
+            subtask_turns: self.subtask_turns,
+            spec: self.spec.clone(),
+            done_reason: self.done_reason.clone(),
+        }
+    }
+
+    /// 从快照恢复状态（created_at 重置为当前时间，开始新的运行周期）
+    pub fn restore_from_snapshot(&mut self, snapshot: &GoalLoopSnapshot) {
+        self.state = snapshot.state;
+        self.current_subtask_idx = snapshot.current_subtask_idx;
+        self.total_turns = snapshot.total_turns;
+        self.subtask_turns = snapshot.subtask_turns;
+        self.spec = snapshot.spec.clone();
+        self.done_reason = snapshot.done_reason.clone();
+        // created_at 不可序列化，恢复时重置为当前时间
+        self.created_at = Instant::now();
+    }
+
     /// 检查退出条件是否满足（由外部调用者提供验证结果）
     pub fn check_exit_conditions(&self, check_results: &[bool]) -> bool {
         if check_results.len() != self.spec.exit_conditions.len() {
@@ -360,7 +403,7 @@ impl GoalLoop {
                 "目标完成！"
             );
             return GoalAction::GoalComplete {
-                reason: self.done_reason.clone().unwrap(),
+                reason: self.done_reason.clone().expect("done_reason must be set before GoalComplete"),
             };
         }
 
@@ -392,7 +435,7 @@ impl GoalLoop {
                 self.state = GoalState::Completed;
                 self.done_reason = Some(GoalDoneReason::AllComplete);
                 GoalAction::GoalComplete {
-                    reason: self.done_reason.clone().unwrap(),
+                    reason: self.done_reason.clone().expect("done_reason must be set before GoalComplete"),
                 }
             }
         }
@@ -427,12 +470,6 @@ impl GoalLoop {
             if let Some(s) = self.spec.subtasks.get_mut(self.current_subtask_idx) {
                 s.state = SubTaskState::Failed;
             }
-            let _subtask_desc = self
-                .spec
-                .subtasks
-                .get(self.current_subtask_idx)
-                .map(|s| s.description.clone())
-                .unwrap_or_default();
             tracing::warn!(
                 target: "ccore::goal",
                 idx = self.current_subtask_idx,

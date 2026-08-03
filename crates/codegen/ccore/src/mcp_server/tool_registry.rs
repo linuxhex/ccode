@@ -1,47 +1,31 @@
 //! MCP 工具注册表 — 管理可通过 MCP 协议调用的内置工具
 //!
-//! 注册 ccode 的 13 个内置工具（read/write/edit/bash/glob/grep
-//! + todo_write/ask_user/web_search/web_fetch/git_status/list_directory/create_file），
+//! 注册 ccode 的 12 个内置工具（read/write/edit/bash/glob/grep
+//! + todo_write/web_search/web_fetch/git_status/list_directory/create_file），
 //! 每个工具的调用通过消息总线转发给 ToolNode 执行。
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::process::Command as TokioCommand;
 
-use crate::message::{FrameCodec, Message, Topic};
-
-/// 带超时执行 Shell 命令
+/// 带超时异步执行命令
 ///
-/// 在独立线程中运行命令，若超过指定秒数则返回超时错误。
-fn run_command_with_timeout(command: &str, timeout_secs: u64) -> Result<std::process::Output, String> {
-    let command = command.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    std::thread::spawn(move || {
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .output();
-        let _ = tx.send(output);
-    });
-
-    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+/// 使用 `tokio::process::Command` 异步执行，不阻塞 tokio runtime；
+/// 超过指定秒数则取消任务并返回超时错误。
+/// 通过 `kill_on_drop` 确保超时或 future 被丢弃时子进程被终止，避免进程泄漏。
+async fn run_command_with_timeout(
+    mut cmd: TokioCommand,
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(format!("执行失败：{}", e)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("命令超时".into()),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("执行线程异常终止".into()),
+        Err(_) => Err("命令超时".into()),
     }
 }
-
-/// 工具处理函数类型 — 异步函数指针，接收参数返回结果
-type ToolHandler = Box<
-    dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>>
-        + Send
-        + Sync,
->;
 
 /// MCP 工具定义
 pub struct McpToolDef {
@@ -51,8 +35,6 @@ pub struct McpToolDef {
     pub description: String,
     /// 输入参数的 JSON Schema
     pub input_schema: Value,
-    /// 工具处理函数
-    handler: ToolHandler,
 }
 
 /// MCP 工具注册表
@@ -62,16 +44,13 @@ pub struct McpToolDef {
 pub struct McpToolRegistry {
     /// 工具定义映射（name → McpToolDef）
     tools: HashMap<String, McpToolDef>,
-    /// 消息总线发送端（用于向 ToolNode 发送工具调用请求）
-    bus_tx: tokio::sync::mpsc::Sender<Message>,
 }
 
 impl McpToolRegistry {
     /// 创建工具注册表并注册所有内置工具
-    pub fn new(bus_tx: tokio::sync::mpsc::Sender<Message>) -> Self {
+    pub fn new() -> Self {
         let mut registry = Self {
             tools: HashMap::new(),
-            bus_tx,
         };
         registry.register_builtin_tools();
         registry
@@ -86,7 +65,6 @@ impl McpToolRegistry {
         self.register_glob_tool();
         self.register_grep_tool();
         self.register_todo_write_tool();
-        self.register_ask_user_tool();
         self.register_web_search_tool();
         self.register_web_fetch_tool();
         self.register_git_status_tool();
@@ -106,47 +84,11 @@ impl McpToolRegistry {
             .collect()
     }
 
-    /// 调用指定工具
-    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
-        let def = self
-            .tools
-            .get(name)
-            .ok_or_else(|| format!("未知工具：{}", name))?;
-        (def.handler)(arguments).await
-    }
-
-    /// 通过消息总线向 ToolNode 发送工具调用请求
-    #[allow(dead_code)]
-    async fn send_tool_request(&self, tool_name: &str, arguments: Value) -> Result<Value, String> {
-        let payload = serde_json::json!({
-            "tool": tool_name,
-            "arguments": arguments,
-        });
-
-        let msg = FrameCodec::new_message(
-            Topic::new("tool/call"),
-            "mcp-server",
-            &payload,
-        )
-        .map_err(|e| format!("创建工具调用消息失败：{}", e))?;
-
-        self.bus_tx
-            .send(msg)
-            .await
-            .map_err(|e| format!("发送工具调用请求失败：{}", e))?;
-
-        // 返回确认结果（实际执行结果由 ToolNode 异步返回）
-        Ok(serde_json::json!({
-            "status": "dispatched",
-            "tool": tool_name,
-        }))
-    }
-
-    /// 执行内置工具（同步直接执行，不经过消息总线）
+    /// 执行内置工具（直接异步执行，不经过消息总线）
     ///
-    /// 支持 read/write/edit/bash/glob/grep/todo_write/ask_user/web_search/web_fetch/git_status/list_directory/create_file 共 13 个内置工具。
+    /// 支持 read/write/edit/bash/glob/grep/todo_write/web_search/web_fetch/git_status/list_directory/create_file 共 12 个内置工具。
     /// 对于 bash 工具，仅允许白名单命令以确保安全。
-    pub fn execute_tool(&self, name: &str, arguments: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    pub async fn execute_tool(&self, name: &str, arguments: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         match name {
             "read" => {
                 let path = arguments["path"].as_str()
@@ -215,20 +157,32 @@ impl McpToolRegistry {
             "bash" => {
                 let command = arguments["command"].as_str()
                     .ok_or_else(|| anyhow::anyhow!("缺少 command 参数"))?;
-                // 安全：仅允许白名单命令
+                // 安全：仅允许白名单命令（严格匹配首个 token，禁止路径形式，避免 /bin/ls、./ls 等绕过）
                 let allowed = ["ls", "cat", "pwd", "echo", "which", "head", "tail", "wc", "grep", "find", "git", "cargo", "rustc"];
                 let cmd_name = command.split_whitespace().next().unwrap_or("");
-                if !allowed.contains(&cmd_name) {
+                if cmd_name.is_empty()
+                    || cmd_name.contains('/')
+                    || cmd_name.contains('\\')
+                    || !allowed.contains(&cmd_name)
+                {
                     return Ok(serde_json::json!({
                         "content": [{"type": "text", "text": format!("命令 {} 不在白名单中", cmd_name)}],
                         "isError": true
                     }));
                 }
-                let output = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .output();
-                match output {
+                // 安全：拒绝 shell 元字符，防止 `;`/`|`/`&`/`$()`/反引号/重定向等命令拼接或替换绕过白名单
+                const FORBIDDEN_CHARS: &[char] = &[';', '|', '&', '`', '$', '(', ')', '<', '>', '\n', '\r'];
+                if command.chars().any(|c| FORBIDDEN_CHARS.contains(&c)) {
+                    tracing::warn!("bash 工具拒绝含 shell 元字符的命令：{}", command);
+                    return Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": "命令包含禁用的 shell 元字符"}],
+                        "isError": true
+                    }));
+                }
+                // 异步执行，不阻塞 tokio runtime
+                let mut cmd = TokioCommand::new("sh");
+                cmd.arg("-c").arg(command).kill_on_drop(true);
+                match cmd.output().await {
                     Ok(out) => {
                         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -248,12 +202,9 @@ impl McpToolRegistry {
                 let pattern = arguments["pattern"].as_str()
                     .ok_or_else(|| anyhow::anyhow!("缺少 pattern 参数"))?;
                 let path = arguments["path"].as_str().unwrap_or(".");
-                let output = std::process::Command::new("find")
-                    .arg(path)
-                    .arg("-name")
-                    .arg(pattern)
-                    .output();
-                match output {
+                let mut cmd = TokioCommand::new("find");
+                cmd.arg(path).arg("-name").arg(pattern).kill_on_drop(true);
+                match cmd.output().await {
                     Ok(out) => {
                         let text = String::from_utf8_lossy(&out.stdout).to_string();
                         Ok(serde_json::json!({
@@ -271,12 +222,9 @@ impl McpToolRegistry {
                 let pattern = arguments["pattern"].as_str()
                     .ok_or_else(|| anyhow::anyhow!("缺少 pattern 参数"))?;
                 let path = arguments["path"].as_str().unwrap_or(".");
-                let output = std::process::Command::new("grep")
-                    .arg("-r")
-                    .arg(pattern)
-                    .arg(path)
-                    .output();
-                match output {
+                let mut cmd = TokioCommand::new("grep");
+                cmd.arg("-r").arg(pattern).arg(path).kill_on_drop(true);
+                match cmd.output().await {
                     Ok(out) => {
                         let text = String::from_utf8_lossy(&out.stdout).to_string();
                         Ok(serde_json::json!({
@@ -311,38 +259,23 @@ impl McpToolRegistry {
                     }))
                 }
             }
-            "ask_user" => {
-                let question = arguments["question"].as_str()
-                    .ok_or_else(|| anyhow::anyhow!("缺少 question 参数"))?;
-                let mut text = question.to_string();
-                if let Some(options) = arguments["options"].as_array() {
-                    for (i, opt) in options.iter().enumerate() {
-                        let label = opt["label"].as_str().unwrap_or("?");
-                        let desc = opt["description"].as_str().unwrap_or("");
-                        text.push_str(&format!("\n  {}. {} — {}", i + 1, label, desc));
-                    }
-                }
-                Ok(serde_json::json!({
-                    "content": [{"type": "text", "text": text}],
-                    "isError": false
-                }))
-            }
             "web_search" => {
                 let query = arguments["query"].as_str()
                     .ok_or_else(|| anyhow::anyhow!("缺少 query 参数"))?;
-                let cmd = format!("curl -s \"https://api.duckduckgo.com/?q={}&format=json\" | head -c 2000", query);
-                // 安全：curl 在白名单中
-                let allowed = ["ls", "cat", "pwd", "echo", "which", "head", "tail", "wc", "grep", "find", "git", "cargo", "rustc", "curl"];
-                let cmd_name = cmd.split_whitespace().next().unwrap_or("");
-                if !allowed.contains(&cmd_name) {
-                    return Ok(serde_json::json!({
-                        "content": [{"type": "text", "text": format!("命令 {} 不在白名单中", cmd_name)}],
-                        "isError": true
-                    }));
-                }
-                match run_command_with_timeout(&cmd, 5) {
+                // 安全：参数化执行 curl，不经过 shell，杜绝命令注入；
+                // query 做 URL 编码避免构造异常请求；`--` 终止 curl 选项解析，url 仅作位置参数
+                let encoded = urlencoding::encode(query);
+                let url = format!("https://api.duckduckgo.com/?q={}&format=json", encoded);
+                let mut cmd = TokioCommand::new("curl");
+                cmd.arg("-s").arg("--").arg(&url).kill_on_drop(true);
+                match run_command_with_timeout(cmd, 5).await {
                     Ok(out) => {
-                        let text = String::from_utf8_lossy(&out.stdout).to_string();
+                        // 截断到 2000 字节，等价于原 `| head -c 2000`（按字节截断，from_utf8_lossy 容错）
+                        let mut bytes = out.stdout;
+                        if bytes.len() > 2000 {
+                            bytes.truncate(2000);
+                        }
+                        let text = String::from_utf8_lossy(&bytes).to_string();
                         Ok(serde_json::json!({
                             "content": [{"type": "text", "text": text}],
                             "isError": !out.status.success()
@@ -357,19 +290,18 @@ impl McpToolRegistry {
             "web_fetch" => {
                 let url = arguments["url"].as_str()
                     .ok_or_else(|| anyhow::anyhow!("缺少 url 参数"))?;
-                let cmd = format!("curl -sL \"{}\" | head -c 10000", url);
-                // 安全：curl 在白名单中
-                let allowed = ["ls", "cat", "pwd", "echo", "which", "head", "tail", "wc", "grep", "find", "git", "cargo", "rustc", "curl"];
-                let cmd_name = cmd.split_whitespace().next().unwrap_or("");
-                if !allowed.contains(&cmd_name) {
-                    return Ok(serde_json::json!({
-                        "content": [{"type": "text", "text": format!("命令 {} 不在白名单中", cmd_name)}],
-                        "isError": true
-                    }));
-                }
-                match run_command_with_timeout(&cmd, 5) {
+                // 安全：参数化执行 curl，不经过 shell，杜绝命令注入；
+                // `--` 终止 curl 选项解析，避免 url 被当作 curl 参数（如 --output）注入
+                let mut cmd = TokioCommand::new("curl");
+                cmd.arg("-sL").arg("--").arg(url).kill_on_drop(true);
+                match run_command_with_timeout(cmd, 5).await {
                     Ok(out) => {
-                        let text = String::from_utf8_lossy(&out.stdout).to_string();
+                        // 截断到 10000 字节，等价于原 `| head -c 10000`
+                        let mut bytes = out.stdout;
+                        if bytes.len() > 10000 {
+                            bytes.truncate(10000);
+                        }
+                        let text = String::from_utf8_lossy(&bytes).to_string();
                         Ok(serde_json::json!({
                             "content": [{"type": "text", "text": text}],
                             "isError": !out.status.success()
@@ -383,17 +315,10 @@ impl McpToolRegistry {
             }
             "git_status" => {
                 let path = arguments["path"].as_str().unwrap_or(".");
-                let cmd = format!("git -C \"{}\" status --short", path);
-                // 安全：git 在白名单中
-                let allowed = ["ls", "cat", "pwd", "echo", "which", "head", "tail", "wc", "grep", "find", "git", "cargo", "rustc", "curl"];
-                let cmd_name = cmd.split_whitespace().next().unwrap_or("");
-                if !allowed.contains(&cmd_name) {
-                    return Ok(serde_json::json!({
-                        "content": [{"type": "text", "text": format!("命令 {} 不在白名单中", cmd_name)}],
-                        "isError": true
-                    }));
-                }
-                match run_command_with_timeout(&cmd, 5) {
+                // 安全：参数化执行 git，不经过 shell，path 作为独立参数传递，杜绝命令注入
+                let mut cmd = TokioCommand::new("git");
+                cmd.arg("-C").arg(path).arg("status").arg("--short").kill_on_drop(true);
+                match run_command_with_timeout(cmd, 5).await {
                     Ok(out) => {
                         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -460,31 +385,6 @@ impl McpToolRegistry {
 
     /// 注册 read 工具 — 读取文件内容
     fn register_read_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let path = args["path"].as_str().unwrap_or("");
-                if path.is_empty() {
-                    return Err("read 工具缺少 path 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "read",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "read"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "read".into(),
             McpToolDef {
@@ -500,38 +400,12 @@ impl McpToolRegistry {
                     },
                     "required": ["path"],
                 }),
-                handler,
             },
         );
     }
 
     /// 注册 write 工具 — 写入文件
     fn register_write_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let path = args["path"].as_str().unwrap_or("");
-                if path.is_empty() {
-                    return Err("write 工具缺少 path 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "write",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "write"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "write".into(),
             McpToolDef {
@@ -551,38 +425,12 @@ impl McpToolRegistry {
                     },
                     "required": ["path", "content"],
                 }),
-                handler,
             },
         );
     }
 
     /// 注册 edit 工具 — 编辑文件（精确字符串替换）
     fn register_edit_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let path = args["path"].as_str().unwrap_or("");
-                if path.is_empty() {
-                    return Err("edit 工具缺少 path 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "edit",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "edit"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "edit".into(),
             McpToolDef {
@@ -606,38 +454,12 @@ impl McpToolRegistry {
                     },
                     "required": ["path", "old_string", "new_string"],
                 }),
-                handler,
             },
         );
     }
 
     /// 注册 bash 工具 — 执行 Shell 命令
     fn register_bash_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let command = args["command"].as_str().unwrap_or("");
-                if command.is_empty() {
-                    return Err("bash 工具缺少 command 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "bash",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "bash"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "bash".into(),
             McpToolDef {
@@ -653,38 +475,12 @@ impl McpToolRegistry {
                     },
                     "required": ["command"],
                 }),
-                handler,
             },
         );
     }
 
     /// 注册 glob 工具 — 文件模式匹配搜索
     fn register_glob_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let pattern = args["pattern"].as_str().unwrap_or("");
-                if pattern.is_empty() {
-                    return Err("glob 工具缺少 pattern 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "glob",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "glob"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "glob".into(),
             McpToolDef {
@@ -704,38 +500,12 @@ impl McpToolRegistry {
                     },
                     "required": ["pattern"],
                 }),
-                handler,
             },
         );
     }
 
     /// 注册 grep 工具 — 内容正则搜索
     fn register_grep_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let pattern = args["pattern"].as_str().unwrap_or("");
-                if pattern.is_empty() {
-                    return Err("grep 工具缺少 pattern 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "grep",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "grep"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "grep".into(),
             McpToolDef {
@@ -759,38 +529,12 @@ impl McpToolRegistry {
                     },
                     "required": ["pattern"],
                 }),
-                handler,
             },
         );
     }
 
     /// 注册 todo_write 工具 — 写入/更新待办列表
     fn register_todo_write_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let todos = args.get("todos");
-                if todos.is_none() || todos.unwrap().is_null() {
-                    return Err("todo_write 工具缺少 todos 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "todo_write",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "todo_write"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "todo_write".into(),
             McpToolDef {
@@ -816,97 +560,12 @@ impl McpToolRegistry {
                     },
                     "required": ["todos"],
                 }),
-                handler,
-            },
-        );
-    }
-
-    /// 注册 ask_user 工具 — 向用户提问
-    fn register_ask_user_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let question = args["question"].as_str().unwrap_or("");
-                if question.is_empty() {
-                    return Err("ask_user 工具缺少 question 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "ask_user",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "ask_user"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
-        self.tools.insert(
-            "ask_user".into(),
-            McpToolDef {
-                name: "ask_user".into(),
-                description: "向用户提问，等待用户回复".into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "要向用户提出的问题",
-                        },
-                        "options": {
-                            "type": "array",
-                            "description": "可选选项列表",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "label": { "type": "string", "description": "选项标签" },
-                                    "description": { "type": "string", "description": "选项描述" },
-                                },
-                                "required": ["label"],
-                            },
-                        },
-                    },
-                    "required": ["question"],
-                }),
-                handler,
             },
         );
     }
 
     /// 注册 web_search 工具 — 搜索网页
     fn register_web_search_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let query = args["query"].as_str().unwrap_or("");
-                if query.is_empty() {
-                    return Err("web_search 工具缺少 query 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "web_search",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "web_search"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "web_search".into(),
             McpToolDef {
@@ -922,38 +581,12 @@ impl McpToolRegistry {
                     },
                     "required": ["query"],
                 }),
-                handler,
             },
         );
     }
 
     /// 注册 web_fetch 工具 — 获取网页内容
     fn register_web_fetch_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let url = args["url"].as_str().unwrap_or("");
-                if url.is_empty() {
-                    return Err("web_fetch 工具缺少 url 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "web_fetch",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "web_fetch"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "web_fetch".into(),
             McpToolDef {
@@ -969,34 +602,12 @@ impl McpToolRegistry {
                     },
                     "required": ["url"],
                 }),
-                handler,
             },
         );
     }
 
     /// 注册 git_status 工具 — 查看 Git 仓库状态
     fn register_git_status_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let payload = serde_json::json!({
-                    "tool": "git_status",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "git_status"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "git_status".into(),
             McpToolDef {
@@ -1012,38 +623,12 @@ impl McpToolRegistry {
                     },
                     "required": [],
                 }),
-                handler,
             },
         );
     }
 
     /// 注册 list_directory 工具 — 列出目录内容
     fn register_list_directory_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let path = args["path"].as_str().unwrap_or("");
-                if path.is_empty() {
-                    return Err("list_directory 工具缺少 path 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "list_directory",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "list_directory"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "list_directory".into(),
             McpToolDef {
@@ -1059,38 +644,12 @@ impl McpToolRegistry {
                     },
                     "required": ["path"],
                 }),
-                handler,
             },
         );
     }
 
     /// 注册 create_file 工具 — 创建新文件
     fn register_create_file_tool(&mut self) {
-        let bus_tx = self.bus_tx.clone();
-        let handler = Box::new(move |args: Value| {
-            let bus_tx = bus_tx.clone();
-            Box::pin(async move {
-                let path = args["path"].as_str().unwrap_or("");
-                if path.is_empty() {
-                    return Err("create_file 工具缺少 path 参数".into());
-                }
-                let payload = serde_json::json!({
-                    "tool": "create_file",
-                    "arguments": args,
-                });
-                let msg = FrameCodec::new_message(
-                    Topic::new("tool/call"),
-                    "mcp-server",
-                    &payload,
-                )
-                .map_err(|e| format!("创建消息失败：{}", e))?;
-                bus_tx.send(msg).await
-                    .map_err(|e| format!("发送失败：{}", e))?;
-                Ok(serde_json::json!({"status": "dispatched", "tool": "create_file"}))
-            })
-                as Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-        });
-
         self.tools.insert(
             "create_file".into(),
             McpToolDef {
@@ -1110,7 +669,6 @@ impl McpToolRegistry {
                     },
                     "required": ["path", "content"],
                 }),
-                handler,
             },
         );
     }

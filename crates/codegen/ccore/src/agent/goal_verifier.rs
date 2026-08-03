@@ -8,6 +8,8 @@
 //! 验证策略（双路径）：
 //! 1. 快速路径：经验日志关键词匹配（零延迟，适用于明显成功/失败的场景）
 //! 2. LLM 评估：异步发送给 SamplerNode，由 LLM 判断（适用于模糊场景）
+//!    —— SamplerNode 识别请求的 `goal_verify: true` 标志，流式收集完整响应后
+//!       解析 JSON 并将结果发到 cortex/goal_verify_result，闭环验证流程。
 
 use serde::{Deserialize, Serialize};
 
@@ -20,17 +22,6 @@ pub struct GoalVerifyRequest {
     pub subtask_description: String,
     /// 验证标准
     pub verification: String,
-}
-
-/// GoalLoop 验证结果
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GoalVerifyResult {
-    /// 是否通过验证
-    pub passed: bool,
-    /// 验证标准
-    pub verification: String,
-    /// LLM 评估的推理过程（快速路径时为经验日志摘要）
-    pub reasoning: Option<String>,
 }
 
 impl GoalVerifyRequest {

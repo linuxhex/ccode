@@ -398,15 +398,13 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// glob 匹配的递归实现
 ///
 /// 将模式逐字符与文本对比：
-/// - `**` 贪心匹配任意层级（含零层）
-/// - `*` 匹配到下一个 `/` 或字符串末尾
+/// - `**` 贪心匹配任意层级（含零层），`**/` 可匹配零个路径段
+/// - `*` 匹配任意字符序列
 /// - `?` 匹配单个字符
 /// - 其他字符精确匹配
 fn glob_match_impl(pattern: &str, text: &str) -> bool {
     let pchars: Vec<char> = pattern.chars().collect();
     let tchars: Vec<char> = text.chars().collect();
-    let plen = pchars.len();
-    let tlen = tchars.len();
 
     // 双指针动态规划：pi 为模式指针，ti 为文本指针
     fn dp(pchars: &[char], tchars: &[char], pi: usize, ti: usize) -> bool {
@@ -425,8 +423,14 @@ fn glob_match_impl(pattern: &str, text: &str) -> bool {
             while next_pi < plen && pchars[next_pi] == '*' {
                 next_pi += 1;
             }
-            // ** 可以匹配零个或多个路径段
-            // 尝试匹配 0..tlen-ti 个字符
+            // **/ 可匹配零个路径段：跳过 **/ 直接从下一个路径段开始
+            // （如 **/credentials* 匹配 credentials.json）
+            if next_pi < plen && pchars[next_pi] == '/' {
+                if dp(pchars, tchars, next_pi + 1, ti) {
+                    return true;
+                }
+            }
+            // ** 匹配零到多个字符
             for end in ti..=tlen {
                 if dp(pchars, tchars, next_pi, end) {
                     return true;
@@ -435,21 +439,15 @@ fn glob_match_impl(pattern: &str, text: &str) -> bool {
             return false;
         }
 
-        // 处理 * （单层通配，不跨 /）
+        // 处理 * （通配，匹配任意字符序列）
         if pchars[pi] == '*' {
-            // 跳过连续的 *（非 ** 的情况）
+            // 跳过连续的 *（** 已在上方处理）
             let mut next_pi = pi + 1;
             while next_pi < plen && pchars[next_pi] == '*' {
-                // 如果下一个是 * 且再下一个也是 *，说明可能是 ***，前面已经处理了 ** 的情况
-                // 这里只跳过单独的 *
                 next_pi += 1;
             }
-            // * 匹配零到多个非 / 字符
+            // * 匹配零到多个任意字符
             for end in ti..=tlen {
-                // 遇到 / 就停止扩展
-                if end > ti && tchars[end - 1] == '/' {
-                    break;
-                }
                 if dp(pchars, tchars, next_pi, end) {
                     return true;
                 }
@@ -497,10 +495,10 @@ mod tests {
     }
 
     #[test]
-    fn glob_星号匹配不含路径分隔符() {
+    fn glob_星号匹配任意字符串() {
         assert!(glob_match("*", "Bash"));
         assert!(glob_match("*", "Read"));
-        assert!(!glob_match("*", "path/to/file"));
+        assert!(glob_match("*", "path/to/file"));
     }
 
     #[test]

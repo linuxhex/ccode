@@ -7,7 +7,7 @@
 //! 对标 Claude Code 的 Context Collapse。LLM 调用通过 [`CollapseSampler`]
 //! trait 注入，本模块不依赖具体 sampling crate。
 
-use crate::item::{CompactionItem, CompactionRole};
+use crate::item::CompactionItem;
 
 /// Context Collapse 配置。
 #[derive(Debug, Clone)]
@@ -141,6 +141,7 @@ Be concise and factual. Output only the summary.";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::item::CompactionRole;
 
     #[test]
     fn threshold_check() {

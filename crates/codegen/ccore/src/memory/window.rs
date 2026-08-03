@@ -67,6 +67,7 @@ impl SlidingWindow {
                     role: MessageRole::try_from(msg.role.as_str()).unwrap_or(MessageRole::User),
                     content: msg.content.clone(),
                     token_count: msg.token_count,
+                    created_at: std::time::Instant::now(),
                 },
                 Temperature::Warm => {
                     // 温消息：生成简短摘要

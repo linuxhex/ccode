@@ -97,16 +97,6 @@ struct CratesApiItem {
     downloads: Option<u64>,
     /// 最近更新时间
     updated_at: Option<String>,
-    /// 链接
-    #[serde(default)]
-    links: CratesApiLinks,
-}
-
-/// crates.io crate 链接信息
-#[derive(Debug, Clone, Deserialize, Default)]
-struct CratesApiLinks {
-    /// 版本详情页链接
-    version_downloads: Option<String>,
 }
 
 /// npm registry 搜索响应
@@ -170,11 +160,6 @@ struct PypiSearchItem {
 // ───────────────────────────────────────────────────────────────────────────
 // 工具实现
 // ───────────────────────────────────────────────────────────────────────────
-
-/// 默认包管理器
-fn default_registry() -> String {
-    "crates".into()
-}
 
 /// 默认返回数量
 fn default_limit() -> usize {
@@ -624,7 +609,7 @@ fn build_recommendation(items: &[DepResult], registry: &Registry) -> String {
 }
 
 /// 生成适配性分析：评估各包对项目的适合程度
-fn build_suitability_analysis(items: &[DepResult], registry: &Registry) -> String {
+fn build_suitability_analysis(items: &[DepResult], _registry: &Registry) -> String {
     if items.is_empty() {
         return String::new();
     }

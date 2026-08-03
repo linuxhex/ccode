@@ -614,8 +614,6 @@ impl Node for ToolNode {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn permission_oneshot_allowed() {
         let (tx, rx) = tokio::sync::oneshot::channel();

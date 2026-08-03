@@ -23,10 +23,8 @@
 //! is not initialized by the host.
 
 pub mod archive;
-pub mod auto_extract;
 pub mod backend;
 pub mod chunker;
-pub mod consolidation;
 pub mod dream;
 pub mod dream_lock;
 pub mod embedding;

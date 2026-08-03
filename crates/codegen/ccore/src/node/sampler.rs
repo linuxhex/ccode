@@ -24,7 +24,7 @@ use crate::message::Topic;
 use crate::metrics::AgentMetrics;
 use crate::node::{Node, NodeId, NodeType, NodeContext};
 use crate::node::transport::NodeTransportHandle;
-use crate::sampler::provider::{SampleRequest, StreamChunk, TokenUsage, CancellationHandle, SamplerEvent};
+use crate::sampler::provider::{SampleRequest, StreamChunk, StreamChannel, TokenUsage, CancellationHandle, SamplerEvent};
 use crate::sampler::router::ProviderRouter;
 use crate::sampler::retry::{classify_sampler_error, resolve_max_retries, RetryDecision};
 use crate::config::provider::ProviderConfig;
@@ -99,13 +99,17 @@ impl SamplerNode {
     }
 
     /// 将流式 chunk 通过消息总线逐个发送（优先走数据面 PUB）
+    ///
+    /// `collect_text` 为 true 时，额外累积 Text 通道内容并随返回值传出
+    /// （供 GoalLoop 验证请求解析 LLM 的 JSON 响应）。
     async fn stream_to_bus(
         &mut self,
         request_id: &str,
         model: &str,
         mut stream: std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamChunk>> + Send>>,
         transport: &NodeTransportHandle,
-    ) -> anyhow::Result<TokenUsage> {
+        collect_text: bool,
+    ) -> anyhow::Result<(TokenUsage, String)> {
         tracing::debug!("开始采样：model={}, request_id={}", model, request_id);
 
         // 累积 token 使用量
@@ -114,6 +118,8 @@ impl SamplerNode {
             completion_tokens: 0,
             total_tokens: 0,
         };
+        // 累积文本内容（仅 collect_text 时使用）
+        let mut text_acc = String::new();
 
         // 逐 chunk 读取流式响应
         while let Some(chunk_result) = stream.next().await {
@@ -141,6 +147,11 @@ impl SamplerNode {
                             accumulated_usage.completion_tokens = accumulated_usage.completion_tokens.max(usage.completion_tokens);
                         }
                         accumulated_usage.total_tokens = accumulated_usage.prompt_tokens + accumulated_usage.completion_tokens;
+                    }
+
+                    // 累积文本内容（GoalLoop 验证请求需要完整响应解析 JSON）
+                    if collect_text && matches!(chunk.channel, StreamChannel::Text) {
+                        text_acc.push_str(&chunk.content);
                     }
 
                     let stream_topic = Topic::sampler_stream(&chunk.request_id);
@@ -216,7 +227,7 @@ impl SamplerNode {
         self.cancel_handles.remove(request_id);
 
         tracing::debug!("采样完成：model={}, request_id={}", model, request_id);
-        Ok(accumulated_usage)
+        Ok((accumulated_usage, text_acc))
     }
 
     /// 发射 SamplerEvent 到消息总线
@@ -289,6 +300,74 @@ impl SamplerNode {
         Ok(())
     }
 
+    /// 解析 GoalLoop 验证 LLM 响应并发送结果到 cortex/goal_verify_result
+    ///
+    /// LLM 应返回 JSON：{"passed": true/false, "reasoning": "..."}。
+    /// 解析容错：尝试直接解析、提取 {...} 子串、关键词兜底。
+    async fn send_goal_verify_result(
+        &self,
+        request_id: &str,
+        text: &str,
+        transport: &NodeTransportHandle,
+    ) {
+        let passed = Self::parse_goal_verify_json(text);
+
+        let result_json = serde_json::json!({
+            "passed": passed,
+            "reasoning": text.chars().take(200).collect::<String>(),
+        });
+        tracing::info!(
+            target: "ccore::goal",
+            request_id,
+            passed,
+            "GoalLoop LLM 验证完成，结果发往 cortex/goal_verify_result"
+        );
+        if let Ok(result_msg) = FrameCodec::new_message(
+            Topic::new("cortex/goal_verify_result"),
+            self.id.as_str(),
+            &result_json,
+        ) {
+            if let Err(e) = transport.publish_data(&result_msg).await {
+                tracing::debug!("数据面 PUB 发送 goal_verify_result 失败，回退控制面：{}", e);
+                if let Err(e) = transport.send_message(&result_msg).await {
+                    tracing::warn!("发送 GoalLoop 验证结果失败：{}", e);
+                }
+            }
+        }
+    }
+
+    /// 从 LLM 文本响应中解析验证结果（passed）
+    fn parse_goal_verify_json(text: &str) -> bool {
+        // 1. 直接解析整个文本为 JSON
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+            if let Some(p) = v.get("passed").and_then(|x| x.as_bool()) {
+                return p;
+            }
+        }
+        // 2. 提取第一个 {...} 子串解析
+        if let Some(start) = text.find('{') {
+            if let Some(end) = text.rfind('}') {
+                if end > start {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[start..=end]) {
+                        if let Some(p) = v.get("passed").and_then(|x| x.as_bool()) {
+                            return p;
+                        }
+                    }
+                }
+            }
+        }
+        // 3. 关键词兜底
+        let lower = text.to_lowercase();
+        if lower.contains("\"passed\": true") || lower.contains("已通过") || lower.contains("验证通过") {
+            return true;
+        }
+        if lower.contains("\"passed\": false") || lower.contains("未通过") || lower.contains("验证失败") {
+            return false;
+        }
+        // 无法解析时默认不通过（保守判定，触发重试）
+        false
+    }
+
     /// 处理采样请求（带重试逻辑）
     async fn handle_sample_request(
         &mut self,
@@ -317,10 +396,18 @@ impl SamplerNode {
             match self.try_stream_with_fallback(&request, cancel_handle.clone()).await {
                 Ok((stream, provider_name)) => {
                     tracing::info!("采样开始：model={}, provider={}", model, provider_name);
-                    let result = self.stream_to_bus(&request_id, &model, stream, transport).await;
+                    let result = self
+                        .stream_to_bus(&request_id, &model, stream, transport, request.goal_verify)
+                        .await;
                     // 采样完成，记录推理延迟（从请求到响应的耗时）
                     AgentMetrics::global()
                         .record_inference_latency(start.elapsed().as_millis() as f64);
+                    // GoalLoop 验证闭环：解析 LLM 的 JSON 响应，结果发到 cortex/goal_verify_result
+                    if request.goal_verify {
+                        if let Ok((_, text)) = &result {
+                            self.send_goal_verify_result(&request_id, text, transport).await;
+                        }
+                    }
                     return result.map(|_| ());
                 }
                 Err(e) => {

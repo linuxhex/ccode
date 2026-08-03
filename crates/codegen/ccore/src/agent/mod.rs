@@ -16,6 +16,7 @@
 //! - `subagent`: 子 Agent 创建与结果回传
 //! - `skills`: 技能系统 + model 自动切换
 //! - `prompt`: System prompt 构建
+//! - `experiential`: ERL 经验反射学习（轨迹提取+启发式注入）
 
 pub mod prompt;
 pub mod subagent;

@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
+use crate::persistence::state::LoopStateSnapshot;
 
 use super::doom_loop::DoomLoopResult;
 use super::experiential::{TaskTrajectory, TrajectoryStep};
@@ -179,6 +180,35 @@ impl LoopStateMachine {
             collected_steps: Vec::new(),
             task_description: None,
         }
+    }
+
+    /// 生成可序列化快照（不含 GoalLoop，由调用方填充）
+    ///
+    /// GoalLoop 状态由 ThinkerNode 单独序列化后填充到 snapshot.goal 字段。
+    pub fn to_snapshot(&self) -> LoopStateSnapshot {
+        LoopStateSnapshot {
+            state: self.state,
+            turn_count: self.turn_count,
+            tokens_used: self.tokens_used,
+            consecutive_failures: self.consecutive_failures as u32,
+            elapsed_secs: self.created_at.elapsed().as_secs(),
+            done_reason: self.done_reason.clone(),
+            goal: None, // 由 ThinkerNode 填充
+        }
+    }
+
+    /// 从快照恢复 Turn 级状态
+    ///
+    /// created_at 重置为当前时间（Instant 不可序列化）。
+    /// collected_steps / task_description 不恢复（运行时收集的数据，新周期重新积累）。
+    pub fn restore_from_snapshot(&mut self, snapshot: &LoopStateSnapshot) {
+        self.state = snapshot.state;
+        self.turn_count = snapshot.turn_count;
+        self.tokens_used = snapshot.tokens_used;
+        self.consecutive_failures = snapshot.consecutive_failures as usize;
+        self.done_reason = snapshot.done_reason.clone();
+        // created_at 不可序列化，恢复时重置为当前时间
+        self.created_at = Instant::now();
     }
 
     /// 设置任务描述（用于 ERL trajectory 提取）
