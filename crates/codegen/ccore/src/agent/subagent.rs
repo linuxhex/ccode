@@ -10,7 +10,7 @@
 //! - 任务导向：收到 task 后开始工作，LLM 返回纯文本即视为完成
 //! - 上下文隔离：仅使用 SubAgentDefinition 允许的工具集
 //! - 资源限制：独立的 max_turns 和 token 预算
-//! - 不可嵌套：子代理不能再 spawn 子代理
+//! - 支持嵌套：子代理可 spawn 子代理（与 Claude Code 对齐）
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -159,9 +159,9 @@ impl SubAgentNode {
 
     /// 接收任务描述，初始化工作记忆并发起首次采样
     fn handle_task(&mut self, task: &str) {
-        // 系统消息：注入子代理的角色与约束
+        // 系统消息：注入子代理的角色与约束（支持嵌套，与 Claude Code 对齐）
         let system_prompt = format!(
-            "你是一个子代理（类型={:?}）。任务：{}\n约束：最多 {} 轮，不可 spawn 子代理。",
+            "你是一个子代理（类型={:?}）。任务：{}\n约束：最多 {} 轮。你可以使用 task 工具 spawn 子代理来处理复杂子任务。",
             self.definition.agent_type, task, self.definition.max_turns
         );
         let token_count = Self::estimate_tokens(&system_prompt);
@@ -193,7 +193,8 @@ impl SubAgentNode {
         self.current_sample_request_id = Some(request_id.clone());
 
         // 应用工具白名单过滤：只保留 allowed_tools 中列出的工具
-        let tools = if self.definition.allowed_tools.is_empty() {
+        // 但始终保留 task 工具以支持嵌套子代理（与 Claude Code 对齐）
+        let mut tools = if self.definition.allowed_tools.is_empty() {
             self.config.tools.clone()
         } else {
             self.config
@@ -203,6 +204,13 @@ impl SubAgentNode {
                 .cloned()
                 .collect()
         };
+        // 确保 task 工具始终可用（嵌套子代理支持）
+        let has_task = tools.iter().any(|t| t.name == "task");
+        if !has_task {
+            if let Some(task_def) = self.config.tools.iter().find(|t| t.name == "task") {
+                tools.push(task_def.clone());
+            }
+        }
 
         SampleRequest {
             request_id,
@@ -524,8 +532,10 @@ impl Node for SubAgentNode {
             // 收到工具注册
             "tool/register" => {
                 let tools: Vec<SamplerToolDefinition> = FrameCodec::decode_payload(&msg)?;
-                // 应用工具白名单
-                self.config.tools = if self.definition.allowed_tools.is_empty() {
+                // 提取 task 工具定义（始终保留，支持嵌套子代理）
+                let task_tool = tools.iter().find(|t| t.name == "task").cloned();
+                // 应用工具白名单过滤
+                let mut filtered = if self.definition.allowed_tools.is_empty() {
                     tools
                 } else {
                     tools
@@ -533,6 +543,14 @@ impl Node for SubAgentNode {
                         .filter(|t| self.definition.allowed_tools.contains(&t.name))
                         .collect()
                 };
+                // 确保 task 工具始终可用（嵌套子代理与 Claude Code 对齐）
+                let has_task = filtered.iter().any(|t| t.name == "task");
+                if !has_task {
+                    if let Some(task_def) = task_tool {
+                        filtered.push(task_def);
+                    }
+                }
+                self.config.tools = filtered;
                 tracing::info!(
                     "子代理 {} 收到工具注册，过滤后可用 {} 个工具",
                     self.id,
