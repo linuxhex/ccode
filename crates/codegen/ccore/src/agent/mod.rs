@@ -25,9 +25,12 @@ pub mod doom_loop;
 pub mod loop_state;
 pub mod plan_execute;
 pub mod skills;
+pub mod goal_loop;
+pub mod schedule_loop;
+pub mod proactive_loop;
 
 // 进阶模块（从 ccore-advanced re-export）
-pub use ccore_advanced::agent::{experiential, meta_cognitive, decentralized, goal_loop, schedule_loop, proactive_loop, goal_verifier};
+pub use ccore_advanced::agent::{experiential, meta_cognitive, decentralized, goal_verifier};
 
 use serde::{Deserialize, Serialize};
 
