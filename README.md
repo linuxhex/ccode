@@ -18,13 +18,6 @@
 | **UX/TUI** | 6 | 8 | 终端 UI 基础可用，但交互体验不如 Claude Code |
 | **综合评分** | **80** | **74** | 核心差距在实战验证，需聚焦端到端集成测试 |
 
-## 技术栈
-
-- **语言**：Rust
-- **消息总线**：ZeroMQ（ROUTER/DEALER + PUB/SUB）
-- **终端 UI**：ratatui + crossterm
-- **AI SDK**：async-openai + 多 Provider 适配（OpenAI/Claude/Gemini/DeepSeek/GLM）
-
 ## 开发
 
 ```bash
