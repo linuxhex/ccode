@@ -28,13 +28,15 @@ jobs:
           CCODE_TOOLS_BUNDLE_RG_PATH: /tmp/rg
           CCODE_SHELL_BUNDLE_RG_PATH: /tmp/rg
         run: |
+          set -o pipefail
           cargo build --release -p ccode-cli --target aarch64-apple-darwin 2>&1 | tail -20
-          echo "EXIT: $?"
+          echo "EXIT: ${PIPESTATUS[0]}"
 
       - name: Test cross build (x86_64-apple-darwin)
         env:
           CCODE_TOOLS_BUNDLE_RG_PATH: /tmp/rg
           CCODE_SHELL_BUNDLE_RG_PATH: /tmp/rg
         run: |
+          set -o pipefail
           cargo build --release -p ccode-cli --target x86_64-apple-darwin 2>&1 | tail -40
-          echo "EXIT: $?"
+          echo "EXIT: ${PIPESTATUS[0]}"
