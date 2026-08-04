@@ -1,0 +1,21 @@
+name: Version Check
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/version-check.yml'
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+      - name: Show versions
+        run: |
+          rustc --version
+          cargo --version
+          echo "---"
+          cargo check -p ccore 2>&1 | head -60
