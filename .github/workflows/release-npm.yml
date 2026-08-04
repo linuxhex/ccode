@@ -45,7 +45,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install ripgrep (for ccode-tools build script)
+      - name: Install ripgrep (for ccode-tools/ccode-shell build scripts)
         run: |
           RG_VER="15.0.0"
           # Determine ripgrep asset triple
@@ -58,8 +58,10 @@ jobs:
           # Download and extract rg
           curl -sL "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VER}/ripgrep-${RG_VER}-${RG_TARGET}.tar.gz" -o /tmp/rg.tar.gz
           tar -xzf /tmp/rg.tar.gz -C /tmp
-          chmod +x /tmp/ripgrep-${RG_VER}-${RG_TARGET}/rg
-          echo "CCODE_TOOLS_BUNDLE_RG_PATH=/tmp/ripgrep-${RG_VER}-${RG_TARGET}/rg" >> $GITHUB_ENV
+          RG_PATH="/tmp/ripgrep-${RG_VER}-${RG_TARGET}/rg"
+          chmod +x "$RG_PATH"
+          echo "CCODE_TOOLS_BUNDLE_RG_PATH=$RG_PATH" >> $GITHUB_ENV
+          echo "CCODE_SHELL_BUNDLE_RG_PATH=$RG_PATH" >> $GITHUB_ENV
 
       - name: Install Linux ARM cross-compiler
         if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
