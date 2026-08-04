@@ -1,0 +1,23 @@
+name: Test Build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download ripgrep
+        run: |
+          curl -sL "https://github.com/BurntSushi/ripgrep/releases/download/15.0.0/ripgrep-15.0.0-aarch64-apple-darwin.tar.gz" -o /tmp/rg.tar.gz
+          tar -xzf /tmp/rg.tar.gz -C /tmp
+          cp /tmp/ripgrep-15.0.0-aarch64-apple-darwin/rg /tmp/rg
+          chmod +x /tmp/rg
+      - name: cargo check
+        env:
+          CCODE_TOOLS_BUNDLE_RG_PATH: /tmp/rg
+          CCODE_SHELL_BUNDLE_RG_PATH: /tmp/rg
+        run: cargo check -p ccode-cli
