@@ -13,9 +13,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.92.0
+      - name: Download ripgrep
+        run: |
+          curl -sL "https://github.com/BurntSushi/ripgrep/releases/download/15.0.0/ripgrep-15.0.0-aarch64-apple-darwin.tar.gz" -o /tmp/rg.tar.gz
+          tar -xzf /tmp/rg.tar.gz -C /tmp
+          cp /tmp/ripgrep-15.0.0-aarch64-apple-darwin/rg /tmp/rg
+          chmod +x /tmp/rg
       - name: Show versions
         run: |
           rustc --version
           cargo --version
-          echo "---"
-          cargo check -p ccode-cli 2>&1 | head -60
+      - name: cargo build --release
+        env:
+          CCODE_TOOLS_BUNDLE_RG_PATH: /tmp/rg
+          CCODE_SHELL_BUNDLE_RG_PATH: /tmp/rg
+        run: cargo build --release -p ccode-cli 2>&1 | tail -30
