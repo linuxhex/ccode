@@ -1,0 +1,33 @@
+#!/usr/bin/env node
+// ============================================================================
+// ccode CLI 入口 — 纯 JS wrapper，不包含任何 Rust 源码
+// 根据当前平台查找对应的原生二进制并执行
+// ============================================================================
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
+const PLATFORM_MAP = { darwin: 'darwin', linux: 'linux' };
+const ARCH_MAP = { arm64: 'arm64', x64: 'x64' };
+
+const platform = PLATFORM_MAP[process.platform];
+const arch = ARCH_MAP[process.arch];
+
+if (!platform || !arch) {
+    console.error(`ccode: 不支持的系统 (${process.platform}/${process.arch})`);
+    process.exit(1);
+}
+
+const pkgName = `@ccode-ai/cli-${platform}-${arch}`;
+const binPath = path.join(__dirname, '..', pkgName, 'bin', 'ccode');
+
+if (!fs.existsSync(binPath)) {
+    console.error(`ccode: 未找到平台二进制 (${pkgName})，请重新安装: npm install -g @ccode-ai/cli`);
+    process.exit(1);
+}
+
+const child = spawn(binPath, process.argv.slice(2), { stdio: 'inherit' });
+child.on('exit', (code, signal) => {
+    if (signal) process.kill(process.pid, signal);
+    process.exit(code || 0);
+});

@@ -21,9 +21,6 @@
     "node": ">=16"
   },
   "files": [
-    "bin/",
-    "install.js"
-  ],
-  "os": ["darwin", "linux"],
-  "cpu": ["arm64", "x64"]
+    "bin/ccode"
+  ]
 }

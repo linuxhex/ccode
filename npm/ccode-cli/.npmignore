@@ -1,0 +1,5 @@
+# 主包仅包含 JS wrapper，排除所有源码
+*
+!bin/
+!bin/ccode
+!package.json
