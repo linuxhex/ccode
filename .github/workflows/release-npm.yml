@@ -44,7 +44,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.92.0
-          targets: ${{ matrix.target }}
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Install ripgrep (for ccode-tools/ccode-shell build scripts)
         run: |
@@ -79,7 +81,11 @@ jobs:
         env:
           CCODE_TOOLS_BUNDLE_RG_PATH: /tmp/rg
           CCODE_SHELL_BUNDLE_RG_PATH: /tmp/rg
-        run: cargo build --release -p ccode-cli --target ${{ matrix.target }}
+          RUST_BACKTRACE: 1
+        run: |
+          cargo build --release -p ccode-cli --target ${{ matrix.target }} 2>&1 | tee /tmp/build.log
+          echo "EXIT: ${PIPESTATUS[0]}"
+        shell: bash
 
       - name: Prepare npm package
         run: |
