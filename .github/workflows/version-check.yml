@@ -23,8 +23,23 @@ jobs:
         run: |
           rustc --version
           cargo --version
-      - name: cargo build --release
+      - name: Add x86_64 target
+        run: rustup target add x86_64-apple-darwin
+
+      - name: cargo build --release --target (native aarch64)
         env:
           CCODE_TOOLS_BUNDLE_RG_PATH: /tmp/rg
           CCODE_SHELL_BUNDLE_RG_PATH: /tmp/rg
-        run: cargo build --release -p ccode-cli 2>&1 | tail -30
+        run: |
+          cargo build --release -p ccode-cli --target aarch64-apple-darwin 2>&1 | tail -20
+          echo "EXIT_NATIVE: ${PIPESTATUS[0]}"
+        shell: bash
+
+      - name: cargo build --release --target (cross x86_64)
+        env:
+          CCODE_TOOLS_BUNDLE_RG_PATH: /tmp/rg
+          CCODE_SHELL_BUNDLE_RG_PATH: /tmp/rg
+        run: |
+          cargo build --release -p ccode-cli --target x86_64-apple-darwin 2>&1 | tail -40
+          echo "EXIT_CROSS: ${PIPESTATUS[0]}"
+        shell: bash
