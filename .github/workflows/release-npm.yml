@@ -40,10 +40,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.97.1
+      - name: Install Rust
+        run: |
+          rustup update 1.97.1
+          rustup default 1.97.1
+          rustup component add rustfmt clippy
 
       - name: Install ripgrep (for ccode-tools/ccode-shell build scripts)
         run: |

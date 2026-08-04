@@ -10,9 +10,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.97.1
+      - name: Install Rust
+        run: |
+          rustup update 1.97.1
+          rustup default 1.97.1
+          rustup component add rustfmt clippy
       - name: Download ripgrep
         run: |
           curl -sL "https://github.com/BurntSushi/ripgrep/releases/download/15.0.0/ripgrep-15.0.0-aarch64-apple-darwin.tar.gz" -o /tmp/rg.tar.gz
