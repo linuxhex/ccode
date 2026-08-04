@@ -3287,7 +3287,6 @@ dependencies = [
  "bytes",
  "ccode-compaction",
  "ccode-hooks",
- "ccore-advanced",
  "chrono",
  "crossbeam-queue",
  "crossterm",
@@ -3316,29 +3315,6 @@ dependencies = [
  "urlencoding",
  "uuid",
  "zeromq",
-]
-
-[[package]]
-name = "ccore-advanced"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "crossbeam-queue",
- "futures",
- "metrics",
- "metrics-exporter-prometheus",
- "notify 6.1.1",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "urlencoding",
 ]
 
 [[package]]

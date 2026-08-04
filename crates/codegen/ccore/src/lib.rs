@@ -37,6 +37,7 @@ pub mod prompt;
 // A+ 增强模块
 pub mod persistence;
 
-// 进阶模块（从 ccore-advanced re-export）
-pub use ccore_advanced::agent::{experiential, meta_cognitive, decentralized, goal_verifier};
-pub use ccore_advanced::{metrics, telemetry, retry, degradation, performance, error, mcp_server, utils};
+// 进阶模块（main 分支使用 stub 实现，master 分支使用 ccore-advanced 完整实现）
+mod stubs;
+pub use stubs::{experiential, meta_cognitive, decentralized, goal_verifier};
+pub use stubs::{metrics, telemetry, retry, degradation, performance, error, mcp_server, utils};

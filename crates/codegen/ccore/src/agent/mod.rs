@@ -29,8 +29,8 @@ pub mod goal_loop;
 pub mod schedule_loop;
 pub mod proactive_loop;
 
-// 进阶模块（从 ccore-advanced re-export）
-pub use ccore_advanced::agent::{experiential, meta_cognitive, decentralized, goal_verifier};
+// 进阶模块（main 分支使用 stub 实现，master 分支使用 ccore-advanced 完整实现）
+pub use crate::stubs::{experiential, meta_cognitive, decentralized, goal_verifier};
 
 use serde::{Deserialize, Serialize};
 

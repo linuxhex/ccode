@@ -7,7 +7,6 @@ async-openai = { git = "https://github.com/our-forks/async-openai.git", rev = "9
 resolver = "2"
 members = [
     "crates/codegen/ccore",
-    "crates/codegen/ccore-advanced",
     "crates/codegen/ccode-cli",
     "crates/build/ccode-proto-build",
     "crates/codegen/ptyctl",
