@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use super::provider::Provider;
 use super::openai_compat::OpenAICompatProvider;
 use super::claude_compat::ClaudeCompatProvider;
-use super::deepseek_compat::DeepSeekCompatProvider;
+use super::gemini::GeminiProvider;
 
 use crate::config::provider::ProviderConfig;
 
@@ -82,16 +82,8 @@ impl ProviderRouter {
 
         for config in configs {
             let provider: Box<dyn Provider> = match config.provider_type.as_str() {
-                "openai" | "openai-compat" | "ccode" => {
+                "openai" | "openai-compat" | "ccode" | "deepseek" | "glm" | "qwen" | "kimi" | "ollama" | "qoder" => {
                     Box::new(OpenAICompatProvider::new(super::openai_compat::OpenAICompatConfig {
-                        name: config.name.clone(),
-                        api_key: config.api_key.clone(),
-                        base_url: config.base_url.clone(),
-                        models: config.models.clone(),
-                    }))
-                }
-                "deepseek" => {
-                    Box::new(DeepSeekCompatProvider::new(super::deepseek_compat::DeepSeekCompatConfig {
                         name: config.name.clone(),
                         api_key: config.api_key.clone(),
                         base_url: config.base_url.clone(),
@@ -105,6 +97,14 @@ impl ProviderRouter {
                         base_url: config.base_url.clone(),
                         models: config.models.clone(),
                         api_version: config.api_version.clone().unwrap_or_else(|| "2023-06-01".into()),
+                    }))
+                }
+                "gemini" | "google" => {
+                    Box::new(GeminiProvider::new(super::gemini::GeminiConfig {
+                        name: config.name.clone(),
+                        api_key: config.api_key.clone(),
+                        base_url: config.base_url.clone(),
+                        models: config.models.clone(),
                     }))
                 }
                 _ => {

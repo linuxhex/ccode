@@ -4,15 +4,15 @@
 //! 覆盖：消息帧编解码、Broker 路由、Memory 系统、Agent 类型解析、Provider 配置。
 
 use ccore::message::frame::FrameCodec;
-use ccore::message::{Message, Topic, TopicPattern};
+use ccore::message::{Topic, TopicPattern};
 use ccore::kernel::broker::Broker;
-use ccore::node::{NodeId, NodeType, PermissionMode};
+use ccore::node::{NodeId, PermissionMode};
 use ccore::agent::AgentType;
 use ccore::memory::short_term::ShortTermMemory;
 use ccore::memory::heat::{HeatInput, HeatWeights, HeatThresholds, compute_heat, classify, Temperature};
 use ccore::memory::window::{SlidingWindow, MessageMeta};
 use ccore::memory::working::WorkingEntry;
-use ccore::config::provider::{ProviderConfig, ProviderAdapter};
+use ccore::config::provider::ProviderConfig;
 use ccore::sampler::router::ProviderRouter;
 
 use serde::{Deserialize, Serialize};
@@ -255,7 +255,7 @@ async fn test_short_term_memory_store_and_search() {
     // 存入几条消息
     let id1 = mem.store("user".into(), "请帮我写一个排序算法".into(), 20, false);
     let id2 = mem.store("assistant".into(), "好的，这是快速排序的实现...".into(), 80, false);
-    let id3 = mem.store("user".into(), "天气怎么样？".into(), 10, false);
+    let _id3 = mem.store("user".into(), "天气怎么样？".into(), 10, false);
     let _id4 = mem.store("tool".into(), "ls -la 的执行结果...".into(), 50, true);
 
     // 验证存储数量和轮次
@@ -284,7 +284,7 @@ async fn test_short_term_memory_search_edge_cases() {
     assert!(results.is_empty(), "空 Memory 搜索应返回空");
 
     // 存入 1 条
-    let id = mem.store("user".into(), "测试消息".into(), 5, false);
+    let _id = mem.store("user".into(), "测试消息".into(), 5, false);
 
     // top_k = 0
     let results = mem.search_by_text("测试", 0);
@@ -484,75 +484,69 @@ fn test_permission_mode() {
 /// ProviderConfig 模板生成测试
 #[test]
 fn test_provider_config_templates() {
-    // Ccode 默认配置
-    let ccode = ProviderConfig::default_ccode();
-    assert_eq!(ccode.name, "ccode");
-    assert_eq!(ccode.adapter, ProviderAdapter::Ccode);
-    assert!(ccode.models.contains(&"ccode-3".to_string()));
-    assert!(ccode.models.contains(&"ccode-3-fast".to_string()));
-    assert_eq!(ccode.fallback, vec!["deepseek".to_string()]);
-    assert_eq!(ccode.rate_limit, Some(60));
+    // DeepSeek 默认配置
+    let deepseek = ProviderConfig::deepseek_template();
+    assert_eq!(deepseek.name, "deepseek");
+    assert_eq!(deepseek.provider_type, "openai");
+    assert!(deepseek.models.contains(&"deepseek-chat".to_string()));
+    assert!(deepseek.models.contains(&"deepseek-v3".to_string()));
+    assert_eq!(deepseek.fallback, vec!["glm".to_string()]);
+    assert_eq!(deepseek.rate_limit, Some(60));
 
     // Claude 模板
     let claude = ProviderConfig::claude_template();
     assert_eq!(claude.name, "claude");
-    assert_eq!(claude.adapter, ProviderAdapter::Claude);
+    assert_eq!(claude.provider_type, "claude");
     assert!(claude.models.iter().any(|m| m.contains("claude")));
     assert_eq!(claude.api_version, Some("2023-06-01".to_string()));
-
-    // DeepSeek 模板
-    let deepseek = ProviderConfig::deepseek_template();
-    assert_eq!(deepseek.name, "deepseek");
-    assert_eq!(deepseek.adapter, ProviderAdapter::OpenAI);
-    assert!(deepseek.fallback.is_empty());
 
     // GLM 模板
     let glm = ProviderConfig::glm_template();
     assert_eq!(glm.name, "glm");
-    assert_eq!(glm.adapter, ProviderAdapter::GLM);
-    assert!(glm.models.contains(&"glm-4".to_string()));
+    assert_eq!(glm.provider_type, "openai");
+    assert!(glm.models.contains(&"glm-5.0".to_string()));
 
     // Kimi 模板
     let kimi = ProviderConfig::kimi_template();
     assert_eq!(kimi.name, "kimi");
-    assert_eq!(kimi.adapter, ProviderAdapter::Kimi);
+    assert_eq!(kimi.provider_type, "openai");
 
-    // 千问模板
-    let qianwen = ProviderConfig::qianwen_template();
-    assert_eq!(qianwen.name, "qianwen");
-    assert_eq!(qianwen.adapter, ProviderAdapter::Qianwen);
+    // Qwen 模板
+    let qwen = ProviderConfig::qwen_template();
+    assert_eq!(qwen.name, "qwen");
+    assert_eq!(qwen.provider_type, "openai");
 }
 
 /// ProviderConfig 序列化/反序列化一致性
 #[test]
 fn test_provider_config_serialization() {
-    let ccode = ProviderConfig::default_ccode();
-    let json = serde_json::to_string(&ccode).unwrap();
+    let deepseek = ProviderConfig::deepseek_template();
+    let json = serde_json::to_string(&deepseek).unwrap();
     let decoded: ProviderConfig = serde_json::from_str(&json).unwrap();
-    assert_eq!(decoded.name, ccode.name);
-    assert_eq!(decoded.models, ccode.models);
-    assert_eq!(decoded.fallback, ccode.fallback);
+    assert_eq!(decoded.name, deepseek.name);
+    assert_eq!(decoded.models, deepseek.models);
+    assert_eq!(decoded.fallback, deepseek.fallback);
 }
 
 /// ProviderRouter 模型查找测试
 #[test]
 fn test_provider_router_model_lookup() {
     let configs = vec![
-        ProviderConfig::default_ccode(),
         ProviderConfig::deepseek_template(),
+        ProviderConfig::glm_template(),
     ];
 
     let mut router = ProviderRouter::from_configs(&configs);
 
-    // 精确查找 ccode 模型
-    let provider = router.find_provider_name("ccode-3-fast");
-    assert!(provider.is_some(), "应找到 ccode-3-fast 对应的 Provider");
-    assert_eq!(provider.unwrap(), "ccode");
-
-    // 查找 deepseek 模型
+    // 精确查找 deepseek 模型
     let provider = router.find_provider_name("deepseek-chat");
     assert!(provider.is_some(), "应找到 deepseek-chat 对应的 Provider");
     assert_eq!(provider.unwrap(), "deepseek");
+
+    // 查找 glm 模型
+    let provider = router.find_provider_name("glm-5.0");
+    assert!(provider.is_some(), "应找到 glm-5.0 对应的 Provider");
+    assert_eq!(provider.unwrap(), "glm");
 
     // 不存在的模型
     let provider = router.find_provider_name("nonexistent-model-xyz");
@@ -563,14 +557,14 @@ fn test_provider_router_model_lookup() {
 #[test]
 fn test_provider_router_available_models() {
     let configs = vec![
-        ProviderConfig::default_ccode(),
         ProviderConfig::deepseek_template(),
+        ProviderConfig::glm_template(),
     ];
 
     let router = ProviderRouter::from_configs(&configs);
     let models = router.available_models();
 
-    assert!(models.contains(&"ccode-3".to_string()), "应包含 ccode-3");
     assert!(models.contains(&"deepseek-chat".to_string()), "应包含 deepseek-chat");
+    assert!(models.contains(&"glm-5.0".to_string()), "应包含 glm-5.0");
     assert_eq!(router.provider_count(), 2, "应有 2 个 Provider");
 }
