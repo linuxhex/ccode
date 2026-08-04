@@ -86,6 +86,9 @@ ccode-compaction = { path = "../../common/ccode-compaction" }
 # Hook 系统（权限链 + 输入改写）
 ccode-hooks = { path = "../ccode-hooks" }
 
+# 进阶模块（编译为 cdylib，运行时加载）
+ccore-advanced = { path = "../ccore-advanced" }
+
 # Dashboard HTTP 服务器 + MCP SSE 传输
 axum = { workspace = true }
 tower = { workspace = true }

@@ -19,7 +19,7 @@ use ccore::persistence::{FileStorage, SessionPersister, StatePersister, LoopStat
 /// 所有持久化操作都是异步的，不阻塞主循环。
 pub struct SessionPersistBridge {
     session_persister: Arc<SessionPersister<FileStorage>>,
-    state_persister: Arc<StatePersister<FileStorage>>,
+    state_persister: Arc<StatePersister>,
 }
 
 impl SessionPersistBridge {
