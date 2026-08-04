@@ -47,12 +47,19 @@ jobs:
 
       - name: Install ripgrep (for ccode-tools build script)
         run: |
-          if [[ "${{ runner.os }}" == "macOS" ]]; then
-            brew install ripgrep
-          else
-            sudo apt-get update && sudo apt-get install -y ripgrep
-          fi
-          echo "CCODE_TOOLS_BUNDLE_RG_PATH=$(which rg)" >> $GITHUB_ENV
+          RG_VER="15.0.0"
+          # Determine ripgrep asset triple
+          case "${{ matrix.target }}" in
+            x86_64-apple-darwin)    RG_TARGET="x86_64-apple-darwin" ;;
+            aarch64-apple-darwin)   RG_TARGET="aarch64-apple-darwin" ;;
+            x86_64-unknown-linux-gnu) RG_TARGET="x86_64-unknown-linux-musl" ;;
+            aarch64-unknown-linux-gnu) RG_TARGET="aarch64-unknown-linux-gnu" ;;
+          esac
+          # Download and extract rg
+          curl -sL "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VER}/ripgrep-${RG_VER}-${RG_TARGET}.tar.gz" -o /tmp/rg.tar.gz
+          tar -xzf /tmp/rg.tar.gz -C /tmp
+          chmod +x /tmp/ripgrep-${RG_VER}-${RG_TARGET}/rg
+          echo "CCODE_TOOLS_BUNDLE_RG_PATH=/tmp/ripgrep-${RG_VER}-${RG_TARGET}/rg" >> $GITHUB_ENV
 
       - name: Install Linux ARM cross-compiler
         if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
