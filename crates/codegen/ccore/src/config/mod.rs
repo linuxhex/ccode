@@ -60,8 +60,8 @@ pub struct CcodeConfig {
 impl Default for CcodeConfig {
     fn default() -> Self {
         Self {
-            providers: vec![provider::ProviderConfig::default_ccode()],
-            default_model: "ccode-3-fast".into(),
+            providers: vec![provider::ProviderConfig::deepseek_template()],
+            default_model: "deepseek-chat".into(),
             default_agent_type: "primary".into(),
             memory: memory::MemoryConfig::default(),
             permission_mode: PermissionMode::Trust,

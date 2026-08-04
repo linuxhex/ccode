@@ -117,6 +117,27 @@ impl ClaudeCompatProvider {
             body["temperature"] = serde_json::json!(temperature);
         }
 
+        // top_p 核采样
+        if let Some(top_p) = request.top_p {
+            body["top_p"] = serde_json::json!(top_p);
+        }
+
+        // Claude extended thinking 配置
+        // Anthropic 格式：{"thinking": {"type": "enabled", "budget_tokens": 4096}}
+        if let Some(ref thinking) = request.thinking {
+            if thinking.enabled {
+                let thinking_config = serde_json::json!({
+                    "type": "enabled",
+                    "budget_tokens": thinking.budget_tokens.unwrap_or(4096),
+                });
+                body["thinking"] = thinking_config;
+                // Claude 要求启用 thinking 时 temperature 必须为 1
+                if request.temperature.is_none() {
+                    body["temperature"] = serde_json::json!(1.0);
+                }
+            }
+        }
+
         body
     }
 
@@ -470,6 +491,20 @@ impl Provider for ClaudeCompatProvider {
             // 必须指定 API 版本
             .header("anthropic-version", &self.config.api_version)
             .header("Content-Type", "application/json")
+            .headers(
+                request.extra_headers.iter().fold(
+                    reqwest::header::HeaderMap::new(),
+                    |mut map, (k, v)| {
+                        if let (Ok(name), Ok(value)) = (
+                            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                            reqwest::header::HeaderValue::from_str(v),
+                        ) {
+                            map.insert(name, value);
+                        }
+                        map
+                    },
+                ),
+            )
             .json(&body)
             .send()
             .await
@@ -718,10 +753,13 @@ mod tests {
             reasoning_effort: None,
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            thinking: None,
             system_prompt: None,
             tool_choice: None,
             prompt_cache_key: None,
             goal_verify: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let body = provider.build_request_body(&request);
@@ -762,10 +800,13 @@ mod tests {
             reasoning_effort: None,
             max_tokens: Some(4096),
             temperature: Some(0.5),
+            top_p: None,
+            thinking: None,
             system_prompt: Some("You are a helpful assistant.".into()),
             tool_choice: Some(super::super::provider::ToolChoice::Auto),
             prompt_cache_key: None,
             goal_verify: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let body = provider.build_request_body(&request);

@@ -222,10 +222,13 @@ impl SubAgentNode {
             reasoning_effort: None,
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            thinking: None,
             system_prompt: None,
             tool_choice: None,
             prompt_cache_key: None,
             goal_verify: false,
+            extra_headers: std::collections::HashMap::new(),
         }
     }
 

@@ -408,10 +408,13 @@ impl ThinkerNode {
             reasoning_effort: self.doom_loop_detector.current_reasoning_effort(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            thinking: None,
             system_prompt: None,
             tool_choice: None,
             prompt_cache_key: Some(self.id.to_string()),  // 同一 agent 的请求共享 cache
             goal_verify: false,
+            extra_headers: std::collections::HashMap::new(),
         }
     }
 

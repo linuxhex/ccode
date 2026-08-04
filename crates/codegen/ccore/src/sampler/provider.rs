@@ -22,12 +22,16 @@ pub struct SampleRequest {
     pub tools: Vec<ToolDefinition>,
     /// 是否流式返回
     pub stream: bool,
-    /// 推理强度 (0.0 - 1.0)
+    /// 推理强度 (0.0 - 1.0)，对应 DeepSeek R1/GLM/Qwen 的 reasoning_effort
     pub reasoning_effort: Option<f64>,
     /// 最大生成 token 数
     pub max_tokens: Option<u32>,
     /// 温度
     pub temperature: Option<f64>,
+    /// top_p 核采样参数
+    pub top_p: Option<f64>,
+    /// 思维链/推理模式配置（DeepSeek R1 / GLM-5 / Qwen thinking）
+    pub thinking: Option<ThinkingConfig>,
     /// 系统提示（独立于 messages）
     pub system_prompt: Option<String>,
     /// 工具选择策略
@@ -39,6 +43,37 @@ pub struct SampleRequest {
     /// 流式收集完整响应并解析 JSON，结果发到 cortex/goal_verify_result）
     #[serde(default)]
     pub goal_verify: bool,
+    /// 额外的 HTTP 请求头（如 x-api-key、anthropic-version 等）
+    #[serde(default)]
+    pub extra_headers: std::collections::HashMap<String, String>,
+}
+
+/// 思维链/推理模式配置
+///
+/// 不同模型对 thinking 参数的支持方式不同：
+/// - DeepSeek R1: `thinking: {type: "enabled"}` 或 `reasoning_effort`
+/// - GLM-5.0: `thinking: {type: "enabled"}`
+/// - Qwen: `enable_thinking: true`
+/// - Claude: `thinking: {type: "enabled", budget_tokens: 4096}`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    /// 是否启用思维链（对应 OpenAI 兼容格式的 `thinking.type`）
+    pub enabled: bool,
+    /// 思维链 token 预算（仅 Claude 扩展思考模式使用）
+    #[serde(default)]
+    pub budget_tokens: Option<u32>,
+}
+
+impl ThinkingConfig {
+    /// 创建启用思维链的配置
+    pub fn enabled() -> Self {
+        Self { enabled: true, budget_tokens: None }
+    }
+
+    /// 创建带 token 预算的思维链配置
+    pub fn with_budget(budget_tokens: u32) -> Self {
+        Self { enabled: true, budget_tokens: Some(budget_tokens) }
+    }
 }
 
 /// Prompt cache 控制标记

@@ -119,6 +119,30 @@ impl OpenAICompatProvider {
             body["temperature"] = serde_json::json!(temperature);
         }
 
+        // top_p 核采样
+        if let Some(top_p) = request.top_p {
+            body["top_p"] = serde_json::json!(top_p);
+        }
+
+        // reasoning_effort：DeepSeek R1 / GLM / Qwen 推理强度
+        if let Some(reasoning_effort) = request.reasoning_effort {
+            body["reasoning_effort"] = serde_json::json!(reasoning_effort);
+        }
+
+        // thinking 配置：DeepSeek R1 / GLM-5 / Qwen thinking 模式
+        // OpenAI 兼容格式：{"thinking": {"type": "enabled"}}
+        if let Some(ref thinking) = request.thinking {
+            if thinking.enabled {
+                let mut thinking_config = serde_json::json!({
+                    "type": "enabled"
+                });
+                if let Some(budget) = thinking.budget_tokens {
+                    thinking_config["budget_tokens"] = serde_json::json!(budget);
+                }
+                body["thinking"] = thinking_config;
+            }
+        }
+
         body
     }
 
@@ -351,6 +375,20 @@ impl Provider for OpenAICompatProvider {
             .post(self.chat_url())
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .header("Content-Type", "application/json")
+            .headers(
+                request.extra_headers.iter().fold(
+                    reqwest::header::HeaderMap::new(),
+                    |mut map, (k, v)| {
+                        if let (Ok(name), Ok(value)) = (
+                            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                            reqwest::header::HeaderValue::from_str(v),
+                        ) {
+                            map.insert(name, value);
+                        }
+                        map
+                    },
+                ),
+            )
             .json(&body)
             .send()
             .await
@@ -437,6 +475,20 @@ impl Provider for OpenAICompatProvider {
             .post(self.chat_url())
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .header("Content-Type", "application/json")
+            .headers(
+                request.extra_headers.iter().fold(
+                    reqwest::header::HeaderMap::new(),
+                    |mut map, (k, v)| {
+                        if let (Ok(name), Ok(value)) = (
+                            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                            reqwest::header::HeaderValue::from_str(v),
+                        ) {
+                            map.insert(name, value);
+                        }
+                        map
+                    },
+                ),
+            )
             .json(&body)
             .send()
             .await
@@ -545,10 +597,13 @@ mod tests {
             reasoning_effort: None,
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            thinking: None,
             system_prompt: None,
             tool_choice: None,
             prompt_cache_key: None,
             goal_verify: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let body = provider.build_request_body(&request);
@@ -603,10 +658,13 @@ mod tests {
             reasoning_effort: None,
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            thinking: None,
             system_prompt: Some("You are a helpful assistant.".into()),
             tool_choice: Some(super::super::provider::ToolChoice::Auto),
             prompt_cache_key: None,
             goal_verify: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let body = provider.build_request_body(&request);
