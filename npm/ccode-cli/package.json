@@ -1,0 +1,29 @@
+{
+  "name": "@ccode-ai/cli",
+  "version": "0.1.0",
+  "description": "ccode AI coding agent — 分布式架构的智能编程助手",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/linuxhex/ccode"
+  },
+  "bin": {
+    "ccode": "bin/ccode"
+  },
+  "optionalDependencies": {
+    "@ccode-ai/cli-darwin-arm64": "0.1.0",
+    "@ccode-ai/cli-darwin-x64": "0.1.0",
+    "@ccode-ai/cli-linux-arm64": "0.1.0",
+    "@ccode-ai/cli-linux-x64": "0.1.0"
+  },
+  "keywords": ["ai", "coding", "agent", "cli", "llm"],
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "bin/",
+    "install.js"
+  ],
+  "os": ["darwin", "linux"],
+  "cpu": ["arm64", "x64"]
+}

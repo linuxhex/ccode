@@ -1,0 +1,19 @@
+{
+  "name": "@ccode-ai/cli-darwin-x64",
+  "version": "0.1.0",
+  "description": "ccode CLI — macOS Intel 二进制",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/linuxhex/ccode"
+  },
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "bin": {
+    "ccode": "bin/ccode"
+  },
+  "files": [
+    "bin/"
+  ],
+  "keywords": ["ai", "coding", "agent", "cli"]
+}

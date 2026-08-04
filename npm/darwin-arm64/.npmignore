@@ -1,0 +1,5 @@
+# 平台包仅包含二进制，排除所有源码
+*
+!bin/
+!bin/ccode
+!package.json

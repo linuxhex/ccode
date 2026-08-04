@@ -1,0 +1,19 @@
+{
+  "name": "@ccode-ai/cli-linux-arm64",
+  "version": "0.1.0",
+  "description": "ccode CLI — Linux ARM64 二进制",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/linuxhex/ccode"
+  },
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "bin": {
+    "ccode": "bin/ccode"
+  },
+  "files": [
+    "bin/"
+  ],
+  "keywords": ["ai", "coding", "agent", "cli"]
+}
