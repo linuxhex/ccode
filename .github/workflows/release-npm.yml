@@ -45,9 +45,6 @@ jobs:
         with:
           toolchain: 1.92.0
 
-      - name: Add Rust target
-        run: rustup target add ${{ matrix.target }}
-
       - name: Install ripgrep (for ccode-tools/ccode-shell build scripts)
         run: |
           RG_VER="15.0.0"
@@ -68,22 +65,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
-      - name: Verify toolchain
-        run: |
-          rustc --version
-          cargo --version
-          rustup target list --installed
-          echo "Target: ${{ matrix.target }}"
-
       - name: Build ccode binary
         env:
           CCODE_TOOLS_BUNDLE_RG_PATH: /tmp/rg
           CCODE_SHELL_BUNDLE_RG_PATH: /tmp/rg
-          RUST_BACKTRACE: 1
-        run: |
-          cargo build --release -p ccode-cli --target ${{ matrix.target }} 2>&1 | tee /tmp/build.log
-          echo "EXIT: ${PIPESTATUS[0]}"
-        shell: bash
+        run: cargo build --release -p ccode-cli --target ${{ matrix.target }}
 
       - name: Prepare npm package
         run: |
