@@ -1,5 +1,8 @@
 name: Debug Build
-on: workflow_dispatch
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   debug:
