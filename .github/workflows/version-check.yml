@@ -18,4 +18,4 @@ jobs:
           rustc --version
           cargo --version
           echo "---"
-          cargo check -p ccore 2>&1 | head -60
+          cargo check -p ccode-cli 2>&1 | head -60
