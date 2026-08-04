@@ -411,6 +411,29 @@ pub mod metrics {
 pub mod telemetry {}
 pub mod retry {
     pub use super::circuit_breaker;
+
+    pub struct RetryPolicy {
+        pub max_retries: u32,
+        pub initial_backoff_ms: u64,
+        pub max_backoff_ms: u64,
+        pub retryable_codes: Vec<u16>,
+    }
+
+    pub mod backoff {
+        use std::future::Future;
+
+        pub async fn retry_with_error_check<F, Fut, T, E>(
+            _policy: &super::RetryPolicy,
+            mut f: F,
+            _error_code_fn: impl Fn(&E) -> Option<u16>,
+        ) -> std::result::Result<T, E>
+        where
+            F: FnMut() -> Fut,
+            Fut: Future<Output = std::result::Result<T, E>>,
+        {
+            f().await
+        }
+    }
 }
 pub mod degradation {}
 pub mod performance {
