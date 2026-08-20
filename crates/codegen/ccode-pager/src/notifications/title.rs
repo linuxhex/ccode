@@ -219,7 +219,7 @@ fn push_separator(buf: &mut String, has_parts: &mut bool) {
 fn write_activity(buf: &mut String, activity: &TurnActivity) {
     match activity {
         TurnActivity::Thinking => buf.push_str("Thinking"),
-        TurnActivity::Responding => buf.push_str("Responding"),
+        TurnActivity::Responding => buf.push_str("Generating"),
         TurnActivity::ToolRunning { title, description } => {
             if let Some(desc) = description
                 .as_deref()
@@ -229,9 +229,18 @@ fn write_activity(buf: &mut String, activity: &TurnActivity) {
                 buf.push_str(&crate::acp::tracker::format_waiting_for_subject(desc));
             } else if title.is_empty() {
                 buf.push_str("Running tool");
+            } else if title.contains("read") || title.contains("view") || title.contains("cat") {
+                buf.push_str("Reading ");
+                write_truncated(buf, title, 24);
+            } else if title.contains("edit") || title.contains("write") || title.contains("patch") {
+                buf.push_str("Writing ");
+                write_truncated(buf, title, 24);
+            } else if title.contains("grep") || title.contains("search") || title.contains("find") {
+                buf.push_str("Searching ");
+                write_truncated(buf, title, 22);
             } else {
                 buf.push_str("Running: ");
-                write_truncated(buf, title, 30);
+                write_truncated(buf, title, 23);
             }
         }
         TurnActivity::AutoCompacting => buf.push_str("Compacting"),

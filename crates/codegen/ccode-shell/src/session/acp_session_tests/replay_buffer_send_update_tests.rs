@@ -252,6 +252,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
         trace_config_template: std::cell::RefCell::new(None),
         ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
+        config_cache: std::cell::RefCell::new(None),
     };
     ReplaySendUpdateFixture {
         actor,

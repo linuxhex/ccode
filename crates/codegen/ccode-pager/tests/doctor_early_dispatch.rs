@@ -315,10 +315,9 @@ fn doctor_irrelevant_unsafe_byobu_does_not_break_ssh_or_plain_tmux() {
 #[test]
 #[ignore = "spawns the real pager binary; CI/Bazel provides PAGER_BINARY"]
 fn doctor_hostile_home_and_byobu_create_no_config_files() {
-    let binary = pager_binary()
-        .expect("real pager binary is required when selected")
-        .canonicalize()
-        .unwrap();
+    let binary_path = pager_binary()
+        .expect("real pager binary is required when selected");
+    let binary = dunce::canonicalize(&binary_path).unwrap_or(binary_path);
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let ccode_home = temp.path().join("qhome");

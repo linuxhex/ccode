@@ -125,7 +125,7 @@ impl std::fmt::Debug for TemplateWatcher {
         f.debug_struct("TemplateWatcher")
             .field("template_dir", &self.template_dir)
             // SAFETY: RwLock is never poisoned in this module
-            .field("templates_count", &self.templates.read().unwrap().len())
+            .field("templates_count", &self.templates.read().expect("context RwLock poisoned").len())
             .finish()
     }
 }
@@ -160,7 +160,7 @@ impl TemplateWatcher {
             }
         }
         // SAFETY: RwLock is never poisoned in this module
-        *templates.write().unwrap() = initial_templates;
+        *templates.write().expect("context RwLock poisoned") = initial_templates;
 
         // 创建文件监听器
         let templates_clone = Arc::clone(&templates);
@@ -206,7 +206,7 @@ impl TemplateWatcher {
     /// 模板内容的克隆
     pub fn get(&self, name: &str) -> Option<String> {
         // SAFETY: RwLock is never poisoned in this module
-        self.templates.read().unwrap().get(name).cloned()
+        self.templates.read().expect("context RwLock poisoned").get(name).cloned()
     }
 
     /// 获取模板目录路径

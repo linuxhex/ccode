@@ -29,6 +29,11 @@ pub struct ForkArgs {
     /// `None` when the user invoked `/fork` (with or without flags) but
     /// no directive text. The new agent simply opens with no first prompt.
     pub directive: Option<String>,
+    /// Optional turn index to fork at. `None` forks from the current tip.
+    /// `Some(n)` forks the conversation up to and including prompt `n`
+    /// (0-indexed). The shell's `ForkSessionRequest::target_prompt_index`
+    /// consumes this directly.
+    pub target_prompt_index: Option<usize>,
 }
 
 /// Parse the raw argument string after `/fork`.
@@ -42,13 +47,10 @@ pub struct ForkArgs {
 ///
 /// Errors:
 /// - `--worktree` and `--no-worktree` cannot both appear.
-/// - `--at <turn>` returns a friendly "not supported in this version"
-///   message: the shell already supports the underlying parameter (see
-///   `ccode_shell::session::fork::ForkSessionRequest::target_prompt_index`)
-///   and a turn-picker UI is planned; this version deliberately rejects
-///   the flag so users discover the deferral cleanly.
+/// - `--at` requires a non-negative integer argument.
 pub fn parse_fork_args(args: &str) -> Result<ForkArgs, String> {
     let mut worktree_override: Option<bool> = None;
+    let mut target_prompt_index: Option<usize> = None;
     let mut rest = args.trim_start();
 
     while !rest.is_empty() {
@@ -78,7 +80,22 @@ pub fn parse_fork_args(args: &str) -> Result<ForkArgs, String> {
                 rest = after.trim_start();
             }
             "--at" => {
-                return Err("--at is not supported in this version".into());
+                if target_prompt_index.is_some() {
+                    return Err("--at specified twice".into());
+                }
+                let after_trimmed = after.trim_start();
+                let (num_str, remaining) = match after_trimmed.split_once(char::is_whitespace) {
+                    Some(parts) => parts,
+                    None => (after_trimmed, ""),
+                };
+                if num_str.is_empty() {
+                    return Err("--at requires a turn number (e.g. --at 3)".into());
+                }
+                let idx: usize = num_str
+                    .parse()
+                    .map_err(|_| format!("--at expects a non-negative integer, got {num_str:?}"))?;
+                target_prompt_index = Some(idx);
+                rest = remaining.trim_start();
             }
             _ => break,
         }
@@ -92,6 +109,7 @@ pub fn parse_fork_args(args: &str) -> Result<ForkArgs, String> {
     Ok(ForkArgs {
         worktree_override,
         directive,
+        target_prompt_index,
     })
 }
 
@@ -221,12 +239,43 @@ mod tests {
     }
 
     #[test]
-    fn parse_at_flag_returns_friendly_v1_error() {
-        let err = parse_fork_args("--at 3 directive").expect_err("--at must error in v1");
-        assert!(
-            err.contains("--at is not supported"),
-            "error should mention --at deferral: {err}"
-        );
+    fn parse_at_flag_sets_target_prompt_index() {
+        let parsed = parse_fork_args("--at 3 directive").expect("--at parses");
+        assert_eq!(parsed.target_prompt_index, Some(3));
+        assert_eq!(parsed.directive.as_deref(), Some("directive"));
+    }
+
+    #[test]
+    fn parse_at_flag_alone_sets_index_without_directive() {
+        let parsed = parse_fork_args("--at 0").expect("--at 0 parses");
+        assert_eq!(parsed.target_prompt_index, Some(0));
+        assert_eq!(parsed.directive, None);
+    }
+
+    #[test]
+    fn parse_at_flag_missing_number_errors() {
+        let err = parse_fork_args("--at").expect_err("--at without number must error");
+        assert!(err.contains("--at requires a turn number"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_at_flag_non_integer_errors() {
+        let err = parse_fork_args("--at abc").expect_err("--at abc must error");
+        assert!(err.contains("non-negative integer"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_at_flag_duplicate_errors() {
+        let err = parse_fork_args("--at 1 --at 2").expect_err("duplicate --at must error");
+        assert!(err.contains("--at specified twice"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_at_combined_with_worktree_and_directive() {
+        let parsed = parse_fork_args("--worktree --at 5 explore alternative").expect("full parse");
+        assert_eq!(parsed.worktree_override, Some(true));
+        assert_eq!(parsed.target_prompt_index, Some(5));
+        assert_eq!(parsed.directive.as_deref(), Some("explore alternative"));
     }
 
     #[test]
@@ -315,15 +364,15 @@ mod tests {
     }
 
     #[test]
-    fn run_at_flag_returns_error_result() {
+    fn run_at_flag_returns_action_with_target_index() {
         let models = ModelState::default();
         let mut ctx = make_ctx(&models);
         let cmd = ForkCommand;
         match cmd.run(&mut ctx, "--at 5") {
-            CommandResult::Error(msg) => {
-                assert!(msg.contains("--at is not supported"), "got: {msg}");
+            CommandResult::Action(Action::Fork(args)) => {
+                assert_eq!(args.target_prompt_index, Some(5));
             }
-            other => panic!("expected Error, got {other:?}"),
+            other => panic!("expected Action(Fork(..)), got {other:?}"),
         }
     }
 

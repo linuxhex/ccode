@@ -37,15 +37,15 @@ impl ThinkerNode {
             .iter()
             .enumerate()
             .map(|(idx, e)| {
-                let (role, content, token_count) = match e {
-                    crate::memory::working::WorkingEntry::Hot { role, content, token_count, .. } => {
-                        (format!("{:?}", role), content.clone(), *token_count)
+                let (role, content, token_count, tool_name) = match e {
+                    crate::memory::working::WorkingEntry::Hot { role, content, token_count, tool_name, .. } => {
+                        (format!("{:?}", role), content.clone(), *token_count, tool_name.clone())
                     }
                     crate::memory::working::WorkingEntry::Warm { summary, token_count, .. } => {
-                        ("warm".into(), summary.clone(), *token_count)
+                        ("warm".into(), summary.clone(), *token_count, None)
                     }
                     crate::memory::working::WorkingEntry::Cold { placeholder, token_count, .. } => {
-                        ("cold".into(), placeholder.clone(), *token_count)
+                        ("cold".into(), placeholder.clone(), *token_count, None)
                     }
                 };
                 crate::memory::window::MessageMeta {
@@ -57,6 +57,7 @@ impl ThinkerNode {
                     role,
                     content,
                     token_count,
+                    tool_name,
                     source_range: (idx, idx + 1),
                 }
             })

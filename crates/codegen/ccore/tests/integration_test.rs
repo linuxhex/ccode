@@ -396,6 +396,7 @@ async fn test_sliding_window_update() {
             content: "这是最近的工具调用结果，包含重要信息".into(),
             token_count: 30,
             source_range: (0, 1),
+            tool_name: Some("Read".into()),
         },
         MessageMeta {
             elapsed_turns: 5,
@@ -407,6 +408,7 @@ async fn test_sliding_window_update() {
             content: "中等时效的对话消息".into(),
             token_count: 20,
             source_range: (1, 2),
+            tool_name: None,
         },
         MessageMeta {
             elapsed_turns: 50,
@@ -418,6 +420,7 @@ async fn test_sliding_window_update() {
             content: "很早之前的消息，已经不重要了".into(),
             token_count: 25,
             source_range: (2, 3),
+            tool_name: None,
         },
     ];
 

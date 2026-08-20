@@ -132,7 +132,7 @@ pub async fn handle_request(
     }
 
     // 通知类消息（id 为 null 或不存在）不需要响应
-    let is_notification = request.id.as_ref().map_or(true, |v| v.is_null());
+    let is_notification = request.id.as_ref().is_none_or(|v| v.is_null());
 
     // 路由到对应方法
     let response = match request.method.as_str() {
@@ -200,7 +200,7 @@ fn handle_tools_list(
 ) -> JsonRpcResponse {
     // 检查参数（tools/list 不需要参数，但如果有也应该忽略）
     if let Some(p) = params {
-        if !p.is_null() && p.as_object().map_or(false, |o| !o.is_empty()) {
+        if !p.is_null() && p.as_object().is_some_and(|o| !o.is_empty()) {
             return JsonRpcResponse::error(
                 id,
                 INVALID_PARAMS,

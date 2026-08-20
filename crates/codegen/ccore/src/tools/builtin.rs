@@ -1050,10 +1050,10 @@ impl ToolExecutor for WebFetchExecutor {
 
 /// 简单的 HTML → 文本转换（去除标签）
 fn html_to_text(html: &str) -> String {
-    let re_script = regex::Regex::new(r"(?s)<script[^>]*>.*?</script>").unwrap_or_else(|_| regex::Regex::new("").unwrap());
-    let re_style = regex::Regex::new(r"(?s)<style[^>]*>.*?</style>").unwrap_or_else(|_| regex::Regex::new("").unwrap());
-    let re_tag = regex::Regex::new(r"<[^>]+>").unwrap_or_else(|_| regex::Regex::new("").unwrap());
-    let re_entity = regex::Regex::new(r"&nbsp;|&amp;|&lt;|&gt;|&quot;").unwrap_or_else(|_| regex::Regex::new("").unwrap());
+    let re_script = regex::Regex::new(r"(?s)<script[^>]*>.*?</script>").unwrap_or_else(|_| regex::Regex::new("").expect("hardcoded regex should compile"));
+    let re_style = regex::Regex::new(r"(?s)<style[^>]*>.*?</style>").unwrap_or_else(|_| regex::Regex::new("").expect("hardcoded regex should compile"));
+    let re_tag = regex::Regex::new(r"<[^>]+>").unwrap_or_else(|_| regex::Regex::new("").expect("hardcoded regex should compile"));
+    let re_entity = regex::Regex::new(r"&nbsp;|&amp;|&lt;|&gt;|&quot;").unwrap_or_else(|_| regex::Regex::new("").expect("hardcoded regex should compile"));
 
     let text = re_script.replace_all(html, "").to_string();
     let text = re_style.replace_all(&text, "").to_string();

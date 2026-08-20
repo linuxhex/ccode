@@ -268,6 +268,11 @@ impl SessionActor {
                 "block_count": prompt_blocks.len(),
             })),
         );
+        tracing::info!(
+            session_id = %self.session_info.id,
+            prompt_id = %prompt_id,
+            "turn started, preparing prompt..."
+        );
         let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
         if let Some(completion_id) = origin.completion_id() {
             self.mark_completions_reported(&[completion_id]).await;
@@ -462,9 +467,9 @@ impl SessionActor {
                 .await;
 
                 // ── 技能模型切换：如果技能指定了 model/effort，自动切换 ──
-                if let Some(first_skill) = parsed_skills.first() {
-                    if let Some(skill_info) = slash_skills.iter().find(|s| s.name == first_skill.name) {
-                        if let Some(ref model_override) = skill_info.model {
+                if let Some(first_skill) = parsed_skills.first()
+                    && let Some(skill_info) = slash_skills.iter().find(|s| s.name == first_skill.name)
+                        && let Some(ref model_override) = skill_info.model {
                             tracing::info!(
                                 skill_name = %first_skill.name,
                                 model = %model_override,
@@ -499,8 +504,6 @@ impl SessionActor {
                                 }
                             }
                         }
-                    }
-                }
 
                 original_blocks
             }
@@ -539,7 +542,7 @@ impl SessionActor {
             )
             .await;
         self.send_before_turn_event(ccode_tool_protocol::turn_hook::BeforeTurnPayload {
-            turn_number: self.chat_state_handle.get_prompt_index().await as u64,
+            turn_number,
             model_id: model_id.clone(),
             yolo_mode: self.permissions.is_yolo_mode(),
             conversation_message_count: msg_count,
@@ -548,12 +551,11 @@ impl SessionActor {
             schema_version: crate::session::events::EVENT_SCHEMA_VERSION.to_string(),
         })
         .await;
-        let turn_idx = self.chat_state_handle.get_prompt_index().await as u64;
         ccode_telemetry::session_ctx::log_session_event(crate::agent::session_metrics::Turn {
             session_id: self.session_info.id.0.to_string(),
-            turn_number: turn_idx,
+            turn_number,
         });
-        let current_prompt_index = self.chat_state_handle.get_prompt_index().await;
+        let current_prompt_index = turn_number as usize;
         ccode_telemetry::session_ctx::begin_prompt_id();
         let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
         let mut chunk_meta = serde_json::Map::new();
@@ -1608,7 +1610,7 @@ impl SessionActor {
         {
             let feedback = self.pending_compile_feedback.lock();
             if let Some(ref hint) = *feedback {
-                let conflicts = self.ccore_state.meta_detect_conflicts(&[hint.clone()]);
+                let conflicts = self.ccore_state.meta_detect_conflicts(std::slice::from_ref(hint));
                 if !conflicts.is_empty() {
                     tracing::warn!("ccore: 元认知检测到冲突循环，推荐调整策略");
                 }
@@ -2168,9 +2170,18 @@ impl SessionActor {
                     })),
                 });
             }
-            self.drain_pending_interjections().await;
-            self.flush_pending_skill_reminders().await;
-            self.inject_pending_monitor_events().await;
+            tokio::select! {
+                _ = async {
+                    tokio::join!(
+                        self.drain_pending_interjections(),
+                        self.flush_pending_skill_reminders(),
+                        self.inject_pending_monitor_events(),
+                    )
+                } => {}
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    tracing::warn!("drain/flush/inject timeout: operations hung for 1s");
+                }
+            }
             let memory_reminder = self.first_turn_memory_reminder().await;
             if memory_reminder.is_some() {
                 self.memory
@@ -2293,7 +2304,7 @@ impl SessionActor {
                 })),
             );
             let model_timer = std::time::Instant::now();
-            let (response, latency) = match self.run_turn_via_sampler(request.clone()).await {
+            let (response, latency) = match self.run_turn_via_sampler(request).await {
                 Ok(SamplerTurnOutcome::Response(r, latency)) => (r, latency),
                 Err(error) => {
                     self.tool_context.fail_task_output_usage_closed();

@@ -308,9 +308,14 @@ impl SessionActor {
         const DEFAULT_TOOL_CALL_BUDGET: u32 = 50;
         let mut tool_call_budget: u32 = DEFAULT_TOOL_CALL_BUDGET;
 
-        // === fileCache: 已读文件内容缓存 ===
+        // === fileCache: 已读文件内容缓存（含 mtime 去重检测） ===
+        /// 缓存条目：文件内容 + 缓存时的 mtime
+        struct CachedFile {
+            content: String,
+            mtime: std::time::SystemTime,
+        }
         const FILE_CACHE_MAX_ENTRIES: usize = 50;
-        let mut file_cache: std::collections::HashMap<std::path::PathBuf, String> =
+        let mut file_cache: std::collections::HashMap<std::path::PathBuf, CachedFile> =
             std::collections::HashMap::with_capacity(FILE_CACHE_MAX_ENTRIES);
         for call in tool_calls.into_iter() {
             if final_result.is_some() {
@@ -343,25 +348,44 @@ impl SessionActor {
             }
 
             // === fileCache 命中检查：对 Read 工具，如果文件已缓存则跳过实际调用 ===
-            if call.function.name == "Read" || call.function.name == "read_file" {
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) {
-                    if let Some(path_str) = args.get("file_path")
+            let read_cache_path: Option<std::path::PathBuf> =
+                if (call.function.name == "Read" || call.function.name == "read_file")
+                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                    && let Some(path_str) = args.get("file_path")
                         .or_else(|| args.get("path"))
                         .and_then(|v| v.as_str())
-                    {
-                        let path = std::path::PathBuf::from(path_str);
-                        if let Some(cached_content) = file_cache.get(&path) {
-                            tracing::debug!(
-                                file_path = %path_str,
-                                "fileCache hit: returning cached content for Read tool"
-                            );
-                            self.chat_state_handle.push_tool_result(ConversationItem::tool_result(
-                                call.id.clone(),
-                                format!("[fileCache] Content served from cache ({} bytes):\n{}",
-                                    cached_content.len(), cached_content),
-                            ));
-                            continue;
-                        }
+                {
+                    Some(std::path::PathBuf::from(path_str))
+                } else {
+                    None
+                };
+            if let Some(ref path) = read_cache_path {
+                if let Some(cached) = file_cache.get(path) {
+                    let is_unchanged = tokio::fs::metadata(path).await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|t| t == cached.mtime)
+                        .unwrap_or(false);
+                    if is_unchanged {
+                        tracing::debug!(
+                            file_path = %path.display(),
+                            "fileCache hit: file unchanged, returning stub"
+                        );
+                        self.chat_state_handle.push_tool_result(ConversationItem::tool_result(
+                            call.id.clone(),
+                            format!(
+                                "[File unchanged: {}] Content was previously read ({} bytes) and hasn't changed. \
+                                Use the previously read content from context.",
+                                path.display(), cached.content.len(),
+                            ),
+                        ));
+                        continue;
+                    } else {
+                        tracing::debug!(
+                            file_path = %path.display(),
+                            "fileCache: file modified since cache, invalidating"
+                        );
+                        file_cache.remove(path);
                     }
                 }
             }
@@ -638,9 +662,9 @@ impl SessionActor {
                         .or_else(|| prepared.dispatch_target_name.clone())
                         .unwrap_or_else(|| prepared.tool_name.clone());
 
-                    // === fileCache: 缓存 Read 工具的文件内容 ===
-                    if effective_tool_name == "Read" || effective_tool_name == "read_file" {
-                        if let Some(path_str) = prepared.parsed_args.get("file_path")
+                    // === fileCache: 缓存 Read 工具的文件内容（含 mtime） ===
+                    if (effective_tool_name == "Read" || effective_tool_name == "read_file")
+                        && let Some(path_str) = prepared.parsed_args.get("file_path")
                             .or_else(|| prepared.parsed_args.get("path"))
                             .and_then(|v| v.as_str())
                         {
@@ -652,17 +676,44 @@ impl SessionActor {
                                         file_cache.remove(&oldest);
                                     }
                                 }
-                                file_cache.insert(path, tool_result.prompt_text.clone());
+                                let mtime = tokio::fs::metadata(&path).await
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                file_cache.insert(path, CachedFile {
+                                    content: tool_result.prompt_text.clone(),
+                                    mtime,
+                                });
                             }
                         }
-                    }
 
-                    post_tool_use_result = self
+                    // === fileCache: Write 工具执行后使缓存失效 ===
+                    if !prepared.is_read_only
+                        && let Some(path_str) = prepared.parsed_args.get("file_path")
+                            .or_else(|| prepared.parsed_args.get("path"))
+                            .and_then(|v| v.as_str())
+                        {
+                            let path = std::path::PathBuf::from(path_str);
+                            if file_cache.remove(&path).is_some() {
+                                tracing::debug!(
+                                    file_path = %path_str,
+                                    "fileCache invalidated after write tool"
+                                );
+                            }
+                        }
+
+                    post_tool_use_result = if self
                         .hook_event_active(ccode_hooks::event::HookEventName::PostToolUse)
-                        .then(|| {
-                            serde_json::to_value(&tool_result.output)
-                                .unwrap_or(serde_json::Value::Null)
-                        });
+                    {
+                        let output = tool_result.output.clone();
+                        tokio::task::spawn_blocking(move || {
+                            serde_json::to_value(&output).unwrap_or(serde_json::Value::Null)
+                        })
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    };
                     let followups = self
                         .handle_bridge_tool_success(
                             &prepared.tool_call_id,
@@ -1144,8 +1195,8 @@ impl SessionActor {
                 }
 
                 // Inject additional context from hooks into the conversation.
-                if let Some(ref additional_ctx) = pre_result.rewrite.additional_context {
-                    if !additional_ctx.is_empty() {
+                if let Some(ref additional_ctx) = pre_result.rewrite.additional_context
+                    && !additional_ctx.is_empty() {
                         tracing::info!(
                             tool_name = %resolved_tool_name,
                             context_len = additional_ctx.len(),
@@ -1157,7 +1208,6 @@ impl SessionActor {
                             ConversationItem::user(context_msg),
                         );
                     }
-                }
 
                 if let ccode_hooks::result::HookDecision::Deny { reason, hook_name } =
                     pre_result.decision
@@ -1174,8 +1224,8 @@ impl SessionActor {
                 }
 
                 // Honor permission chain deny from rule engine / pre-filter.
-                if let Some(chain_result) = pre_result.chain_result {
-                    if let ccode_hooks::permission_rules::PermissionDecision::Deny { reason } =
+                if let Some(chain_result) = pre_result.chain_result
+                    && let ccode_hooks::permission_rules::PermissionDecision::Deny { reason } =
                         chain_result.decision
                     {
                         tracing::info!(
@@ -1194,7 +1244,6 @@ impl SessionActor {
                             )
                             .await?));
                     }
-                }
             }
             if let Some(denied) = self
                 .run_pre_tool_use_client_hook(&call, &tool_call_id, &envelope)
@@ -2739,6 +2788,35 @@ impl SessionActor {
                     name,
                     arguments_delta,
                 })
+                .await;
+            }
+            SamplingEvent::ToolCallReady {
+                tool_index,
+                ref id,
+                ref name,
+                ref arguments,
+                ..
+            } => {
+                tracing::debug!(
+                    tool_index,
+                    tool_call_id = %id,
+                    tool_name = %name,
+                    args_len = arguments.len(),
+                    "speculative: tool call fully streamed, available for early dispatch"
+                );
+                let raw_input = serde_json::from_str::<serde_json::Value>(arguments).ok();
+                let tool_call_id = acp::ToolCallId::new(std::sync::Arc::from(id.as_str()));
+                let meta = self.stamp_tool_meta(None, name, None);
+                self.send_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id, name.clone())
+                            .kind(acp::ToolKind::Other)
+                            .status(acp::ToolCallStatus::Pending)
+                            .raw_input(raw_input)
+                            .meta(meta),
+                    ),
+                    None,
+                )
                 .await;
             }
             SamplingEvent::Completed {

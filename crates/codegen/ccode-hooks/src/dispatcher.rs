@@ -137,7 +137,7 @@ pub async fn dispatch_pre_tool_use(
         if let Some(ctx) = rewrite_info.additional_context {
             // Append additional context from each hook.
             if let Some(ref mut existing) = combined_rewrite.additional_context {
-                existing.push_str("\n");
+                existing.push('\n');
                 existing.push_str(&ctx);
             } else {
                 combined_rewrite.additional_context = Some(ctx);

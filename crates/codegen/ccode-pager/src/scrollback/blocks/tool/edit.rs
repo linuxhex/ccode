@@ -76,6 +76,17 @@ pub enum EditHighlightPhase {
     },
 }
 
+/// Diff layout mode — controls how old/new lines are arranged visually.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffLayout {
+    /// Standard unified diff: one line per source line, `-`/`+` prefixed.
+    #[default]
+    Unified,
+    /// Old and new side-by-side, separated by a vertical divider.
+    /// Falls back to Unified when the terminal is too narrow (< 80 cols).
+    SideBySide,
+}
+
 /// Configuration for diff rendering (tweakable for dev testing).
 #[derive(Debug, Clone)]
 pub struct DiffRenderConfig {
@@ -93,6 +104,8 @@ pub struct DiffRenderConfig {
     /// Show two line-number columns (old + new) like GitHub's unified diff.
     /// When false (default), show a single column with the new-file line number.
     pub dual_line_numbers: bool,
+    /// Layout mode: unified (default) or side-by-side.
+    pub layout: DiffLayout,
 }
 
 impl Default for DiffRenderConfig {
@@ -103,6 +116,7 @@ impl Default for DiffRenderConfig {
             indent_bg: false,
             hunk_separator: "…".to_string(),
             dual_line_numbers: false,
+            layout: DiffLayout::Unified,
         }
     }
 }
@@ -370,6 +384,295 @@ pub fn render_diff_hunks_with_styles(
     config: &DiffRenderConfig,
 ) -> Vec<DiffLineOutput> {
     render_diff_hunks_core(hunks, path, Some(by_new_line), theme, width, config)
+}
+
+/// Minimum terminal width for side-by-side layout. Below this, falls back to unified.
+const SIDE_BY_SIDE_MIN_WIDTH: u16 = 80;
+
+/// Render diff hunks in a side-by-side layout.
+///
+/// Each output line contains old content on the left and new content on the right,
+/// separated by a `│` divider. Delete lines show content on the left with an empty
+/// right side; Insert lines show the reverse; Equal lines show content on both sides.
+///
+/// Falls back to unified layout when `width < SIDE_BY_SIDE_MIN_WIDTH`.
+pub fn render_diff_hunks_side_by_side(
+    hunks: &[DiffHunk],
+    path: &Path,
+    theme: &Theme,
+    width: u16,
+    config: &DiffRenderConfig,
+) -> Vec<DiffLineOutput> {
+    if width < SIDE_BY_SIDE_MIN_WIDTH {
+        return render_diff_hunks_core(hunks, path, None, theme, width, config);
+    }
+
+    let syntect = get_syntect();
+    let mut lines = Vec::new();
+
+    let divider = " │ ";
+    let divider_width: u16 = 3;
+    let half_width = (width.saturating_sub(divider_width)) / 2;
+
+    let gutter_w = 4u16;
+    let content_w = half_width.saturating_sub(gutter_w).max(10);
+
+    let mut first_line = true;
+
+    for hunk in hunks {
+        if !first_line && !config.hunk_separator.is_empty() {
+            let sep_line = DiffLineOutput {
+                line: Line::from(Span::styled(
+                    format!("  {} {}", config.hunk_separator, config.hunk_separator),
+                    Style::default().fg(theme.gray_dim),
+                )),
+                background: None,
+                content_start_col: 0,
+                gutter_span_count: 0,
+                content_text: String::new(),
+                joiner: None,
+                is_separator: true,
+            };
+            lines.push(sep_line);
+        }
+        first_line = false;
+
+        let mut old_hl = syntect.highlight_lines_by_file_path(path);
+        let mut new_hl = syntect.highlight_lines_by_file_path(path);
+
+        let mut i = 0;
+        while i < hunk.len() {
+            let line = &hunk[i];
+            match line.tag {
+                ChangeTag::Equal => {
+                    let text = expand_tabs(line.text.trim_end_matches('\n'));
+                    let style = side_highlight(&mut new_hl, &text, &syntect);
+                    let left_gutter = format!("{:>w$} ", line.lo, w = gutter_w as usize - 1);
+                    let right_gutter = format!("{:>w$} ", line.ln, w = gutter_w as usize - 1);
+                    let left_content = truncate_or_pad(&text, content_w as usize);
+                    let right_content = truncate_or_pad(&text, content_w as usize);
+
+                    let mut spans_out = Vec::new();
+                    spans_out.push(Span::styled(left_gutter, Style::default().fg(theme.gray_dim)));
+                    spans_out.push(Span::styled(left_content, style));
+                    spans_out.push(Span::styled(
+                        divider.to_string(),
+                        Style::default().fg(theme.gray_dim),
+                    ));
+                    spans_out.push(Span::styled(right_gutter, Style::default().fg(theme.gray_dim)));
+                    spans_out.push(Span::styled(right_content, style));
+
+                    lines.push(DiffLineOutput {
+                        line: Line::from(spans_out),
+                        background: None,
+                        content_start_col: gutter_w,
+                        gutter_span_count: 2,
+                        content_text: text.to_string(),
+                        joiner: Some(String::new()),
+                        is_separator: false,
+                    });
+                    // Advance both highlighters for the equal line.
+                    if let Some(hl) = old_hl.as_mut() {
+                        let owned = format!("{}\n", text.trim_end());
+                        let _ = hl.highlight_line(&owned, &syntect.syntax_set);
+                    }
+                    i += 1;
+                }
+                ChangeTag::Delete => {
+                    let mut delete_group = vec![line];
+                    let mut j = i + 1;
+                    while j < hunk.len() && hunk[j].tag == ChangeTag::Delete {
+                        delete_group.push(&hunk[j]);
+                        j += 1;
+                    }
+                    let mut insert_group: Vec<&crate::diff::DiffLine> = Vec::new();
+                    while j < hunk.len() && hunk[j].tag == ChangeTag::Insert {
+                        insert_group.push(&hunk[j]);
+                        j += 1;
+                    }
+
+                    let pair_count = delete_group.len().max(insert_group.len());
+                    for k in 0..pair_count {
+                        let del = delete_group.get(k);
+                        let ins = insert_group.get(k);
+
+                        let del_text = del
+                            .map(|l| expand_tabs(l.text.trim_end_matches('\n')))
+                            .unwrap_or_default();
+                        let ins_text = ins
+                            .map(|l| expand_tabs(l.text.trim_end_matches('\n')))
+                            .unwrap_or_default();
+
+                        let del_gutter = del
+                            .map(|l| format!("{:>w$} ", l.lo, w = gutter_w as usize - 1))
+                            .unwrap_or_else(|| " ".repeat(gutter_w as usize));
+                        let ins_gutter = ins
+                            .map(|l| format!("{:>w$} ", l.ln, w = gutter_w as usize - 1))
+                            .unwrap_or_else(|| " ".repeat(gutter_w as usize));
+
+                        let del_bg = if del.is_some() {
+                            Some(theme.diff_delete_bg)
+                        } else {
+                            None
+                        };
+                        let ins_bg = if ins.is_some() {
+                            Some(theme.diff_insert_bg)
+                        } else {
+                            None
+                        };
+
+                        let left_content = truncate_or_pad(&del_text, content_w as usize);
+                        let right_content = truncate_or_pad(&ins_text, content_w as usize);
+
+                        let del_style = Style::default()
+                            .fg(theme.diff_delete_fg)
+                            .bg(theme.diff_delete_bg);
+                        let ins_style = Style::default()
+                            .fg(theme.diff_insert_fg)
+                            .bg(theme.diff_insert_bg);
+
+                        let mut spans_out = Vec::new();
+                        spans_out.push(Span::styled(
+                            del_gutter,
+                            Style::default().fg(theme.gray_dim).bg(theme.diff_delete_bg),
+                        ));
+                        spans_out.push(Span::styled(left_content, del_style));
+                        spans_out.push(Span::styled(
+                            divider.to_string(),
+                            Style::default().fg(theme.gray_dim),
+                        ));
+                        spans_out.push(Span::styled(
+                            ins_gutter,
+                            Style::default().fg(theme.gray_dim).bg(theme.diff_insert_bg),
+                        ));
+                        spans_out.push(Span::styled(right_content, ins_style));
+
+                        let bg = del_bg.or(ins_bg);
+                        let content_text = if del.is_some() {
+                            del_text.to_string()
+                        } else {
+                            ins_text.to_string()
+                        };
+
+                        lines.push(DiffLineOutput {
+                            line: Line::from(spans_out),
+                            background: bg,
+                            content_start_col: gutter_w,
+                            gutter_span_count: 2,
+                            content_text,
+                            joiner: Some(String::new()),
+                            is_separator: false,
+                        });
+
+                        // Advance the old-side highlighter for the delete.
+                        if del.is_some() {
+                            if let Some(hl) = old_hl.as_mut() {
+                                let owned = format!("{}\n", del_text.trim_end());
+                                let _ = hl.highlight_line(&owned, &syntect.syntax_set);
+                            }
+                        }
+                        // Advance the new-side highlighter for the insert.
+                        if ins.is_some() {
+                            if let Some(hl) = new_hl.as_mut() {
+                                let owned = format!("{}\n", ins_text.trim_end());
+                                let _ = hl.highlight_line(&owned, &syntect.syntax_set);
+                            }
+                        }
+                    }
+                    i = j;
+                }
+                ChangeTag::Insert => {
+                    let text = expand_tabs(line.text.trim_end_matches('\n'));
+                    let gutter = format!("{:>w$} ", line.ln, w = gutter_w as usize - 1);
+                    let left_empty = " ".repeat(content_w as usize);
+                    let right_content = truncate_or_pad(&text, content_w as usize);
+
+                    let ins_style = Style::default()
+                        .fg(theme.diff_insert_fg)
+                        .bg(theme.diff_insert_bg);
+
+                    let mut spans_out = Vec::new();
+                    spans_out.push(Span::styled(
+                        " ".repeat(gutter_w as usize),
+                        Style::default().bg(theme.bg_base),
+                    ));
+                    spans_out.push(Span::styled(left_empty, Style::default()));
+                    spans_out.push(Span::styled(
+                        divider.to_string(),
+                        Style::default().fg(theme.gray_dim),
+                    ));
+                    spans_out.push(Span::styled(
+                        gutter,
+                        Style::default().fg(theme.gray_dim).bg(theme.diff_insert_bg),
+                    ));
+                    spans_out.push(Span::styled(right_content, ins_style));
+
+                    lines.push(DiffLineOutput {
+                        line: Line::from(spans_out),
+                        background: Some(theme.diff_insert_bg),
+                        content_start_col: gutter_w,
+                        gutter_span_count: 2,
+                        content_text: text.to_string(),
+                        joiner: Some(String::new()),
+                        is_separator: false,
+                    });
+                    // Advance the new-side highlighter for the insert.
+                    if let Some(hl) = new_hl.as_mut() {
+                        let owned = format!("{}\n", text.trim_end());
+                        let _ = hl.highlight_line(&owned, &syntect.syntax_set);
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    lines
+}
+
+/// Highlight a single line using an optional highlighter, falling back to default style.
+fn side_highlight(
+    hl: &mut Option<HighlightLines<'_>>,
+    text: &str,
+    syntect: &Syntect,
+) -> Style {
+    let Some(hl) = hl.as_mut() else {
+        return Style::default();
+    };
+    let owned = format!("{text}\n");
+    let ranges = hl
+        .highlight_line(&owned, &syntect.syntax_set)
+        .unwrap_or_default();
+    if let Some((st, _)) = ranges.first() {
+        Style::default().fg(Color::Rgb(st.foreground.r, st.foreground.g, st.foreground.b))
+    } else {
+        Style::default()
+    }
+}
+
+fn truncate_or_pad(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let text_width = text.width();
+    if text_width <= width {
+        format!("{text}{}", " ".repeat(width - text_width))
+    } else {
+        let mut result = String::with_capacity(width);
+        let mut w = 0;
+        for ch in text.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > width.saturating_sub(1) {
+                result.push('…');
+                break;
+            }
+            result.push(ch);
+            w += cw;
+        }
+        let remaining = width.saturating_sub(unicode_width::UnicodeWidthStr::width(result.as_str()));
+        if remaining > 0 {
+            result.push_str(&" ".repeat(remaining));
+        }
+        result
+    }
 }
 
 /// Full-file map spans for one line, when they may override the cold spans:
@@ -947,7 +1250,7 @@ impl EditToolCallBlock {
         let suffix_spans: Vec<Span<'static>> =
             if collapsed && show_summary && !self.hunks.is_empty() && !self.summary_untrusted {
                 let (ins, del) = self.count_changes();
-                if ins > 0 || del > 0 {
+                let mut spans = if ins > 0 || del > 0 {
                     vec![
                         Span::styled(
                             format!(" +{ins}"),
@@ -958,12 +1261,59 @@ impl EditToolCallBlock {
                     ]
                 } else {
                     Vec::new()
+                };
+                // Add execution time if available
+                if let Some(ms) = self.elapsed_ms {
+                    let elapsed_str = if ms < 1000 {
+                        format!("{}ms", ms)
+                    } else if ms < 10_000 {
+                        format!("{:.1}s", ms as f64 / 1000.0)
+                    } else {
+                        format!("{}s", ms / 1000)
+                    };
+                    spans.push(Span::styled(
+                        format!(" ({})", elapsed_str),
+                        detail_style,
+                    ));
                 }
+                spans
             } else if collapsed && self.edit_count > 1 {
-                vec![Span::styled(
+                let mut spans = vec![Span::styled(
                     format!(" ({} edits)", self.edit_count),
                     detail_style,
-                )]
+                )];
+                // Add execution time if available
+                if let Some(ms) = self.elapsed_ms {
+                    let elapsed_str = if ms < 1000 {
+                        format!("{}ms", ms)
+                    } else if ms < 10_000 {
+                        format!("{:.1}s", ms as f64 / 1000.0)
+                    } else {
+                        format!("{}s", ms / 1000)
+                    };
+                    spans.push(Span::styled(
+                        format!(" ({})", elapsed_str),
+                        detail_style,
+                    ));
+                }
+                spans
+            } else if collapsed {
+                // Show execution time even without diffstat
+                if let Some(ms) = self.elapsed_ms {
+                    let elapsed_str = if ms < 1000 {
+                        format!("{}ms", ms)
+                    } else if ms < 10_000 {
+                        format!("{:.1}s", ms as f64 / 1000.0)
+                    } else {
+                        format!("{}s", ms / 1000)
+                    };
+                    vec![Span::styled(
+                        format!(" ({})", elapsed_str),
+                        detail_style,
+                    )]
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             };
@@ -1007,6 +1357,9 @@ impl EditToolCallBlock {
         config: &DiffRenderConfig,
     ) -> Vec<DiffLineOutput> {
         let path = Path::new(&self.path);
+        if config.layout == DiffLayout::SideBySide {
+            return render_diff_hunks_side_by_side(&self.hunks, path, theme, width, config);
+        }
         match &self.highlight {
             EditHighlightPhase::FileScoped {
                 by_new_line,
@@ -1245,6 +1598,13 @@ impl EditToolCallBlock {
                     indent_bg: edit_cfg.indent_bg,
                     hunk_separator: edit_cfg.hunk_separator.clone(),
                     dual_line_numbers: edit_cfg.dual_line_numbers,
+                    layout: if crate::appearance::cache::load_diff_layout_side_by_side()
+                        || edit_cfg.diff_layout == "side_by_side"
+                    {
+                        DiffLayout::SideBySide
+                    } else {
+                        DiffLayout::Unified
+                    },
                 };
                 // Header with word-wrap and hanging indent
                 let header = self.header_line(

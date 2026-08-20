@@ -544,14 +544,13 @@ fn build_recommendation(items: &[DepResult], registry: &Registry) -> String {
     let mut reasons = Vec::new();
 
     // 分析最高下载量项目
-    if let Some(top) = items.iter().max_by_key(|i| i.downloads.unwrap_or(0)) {
-        if let Some(downloads) = top.downloads {
+    if let Some(top) = items.iter().max_by_key(|i| i.downloads.unwrap_or(0))
+        && let Some(downloads) = top.downloads {
             reasons.push(format!(
                 "下载量最高的包是 {name}（{downloads} 次下载）",
                 name = top.name,
             ));
         }
-    }
 
     // 分析 license 情况
     let with_license: Vec<&DepResult> = items
@@ -580,7 +579,7 @@ fn build_recommendation(items: &[DepResult], registry: &Registry) -> String {
     // 安全告警分析
     let with_advisories: Vec<&DepResult> = items
         .iter()
-        .filter(|i| i.security_advisories.map_or(false, |a| a > 0))
+        .filter(|i| i.security_advisories.is_some_and(|a| a > 0))
         .collect();
     if !with_advisories.is_empty() {
         reasons.push(format!(
@@ -592,7 +591,9 @@ fn build_recommendation(items: &[DepResult], registry: &Registry) -> String {
     // 适配性分析：基于项目特征给出建议
     let suitability = build_suitability_analysis(items, registry);
 
-    let summary = if reasons.is_empty() {
+    
+
+    if reasons.is_empty() {
         format!(
             "在 {registry_name} 上找到 {count} 个包。\n\n{suitability}",
             count = items.len(),
@@ -603,9 +604,7 @@ fn build_recommendation(items: &[DepResult], registry: &Registry) -> String {
             count = items.len(),
             reasons = reasons.join("，"),
         )
-    };
-
-    summary
+    }
 }
 
 /// 生成适配性分析：评估各包对项目的适合程度

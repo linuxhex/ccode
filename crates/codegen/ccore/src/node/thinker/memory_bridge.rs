@@ -77,7 +77,7 @@ impl EpisodicMemoryBridge {
         }
         let mut chunks = Vec::new();
         let mut current = String::new();
-        for sentence in text.split_inclusive(|c: char| c == '\n' || c == '。' || c == '.' || c == '！' || c == '？') {
+        for sentence in text.split_inclusive(['\n', '。', '.', '！', '？']) {
             if current.len() + sentence.len() > max_chunk && !current.is_empty() {
                 chunks.push(current.trim().to_string());
                 current.clear();

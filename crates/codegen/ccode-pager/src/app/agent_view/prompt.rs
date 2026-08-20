@@ -359,6 +359,42 @@ impl AgentView {
             }
         }
 
+        // ── Tab file path completion (Normal mode) ──────────────────────
+        // When Tab is pressed on a partial file path in Normal mode with no
+        // dropdowns open, trigger @-completion by inserting `@` at the start
+        // of the path token. The existing file search dropdown takes over.
+        if key!(Tab).matches(key)
+            && self.prompt_input_mode == PromptInputMode::Normal
+            && !self.prompt.slash_open()
+            && !self.prompt.file_search_visible()
+            && !self.prompt.completion_dropdown_open()
+            && !self.prompt.text().is_empty()
+        {
+            let text = self.prompt.text();
+            let cursor = self.prompt.cursor();
+            if cursor > 0 && cursor <= text.len() && text.is_char_boundary(cursor) {
+                let before_cursor = &text[..cursor];
+                let path_token_start = before_cursor
+                    .char_indices()
+                    .rev()
+                    .find(|(_, ch)| ch.is_whitespace())
+                    .map(|(i, _)| i + 1)
+                    .unwrap_or(0);
+                let token = &text[path_token_start..cursor];
+                let looks_like_path = token.contains('/')
+                    || token.starts_with('.')
+                    || token.starts_with('~');
+                if looks_like_path {
+                    self.prompt
+                        .textarea
+                        .replace_range(path_token_start..path_token_start, "@");
+                    self.prompt
+                        .update_file_search_context();
+                    return InputOutcome::Changed;
+                }
+            }
+        }
+
         if prompt_paging && self.prompt_mode == PromptMode::Normal {
             let page_action = [ActionId::PageUp, ActionId::PageDown]
                 .into_iter()

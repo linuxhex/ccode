@@ -152,10 +152,12 @@ pub trait SandboxBackend: Send + Sync {
 
 /// 沙箱档案名（对应 Claude Code 的 ProfileName）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum SandboxProfileName {
     /// 关闭沙箱
     Off,
     /// 工作区只读（默认）：允许读取所有文件，只允许写入工作区内
+    #[default]
     WorkspaceReadOnly,
     /// 工作区读写：允许读写工作区内所有文件
     Workspace,
@@ -165,11 +167,6 @@ pub enum SandboxProfileName {
     Custom(String),
 }
 
-impl Default for SandboxProfileName {
-    fn default() -> Self {
-        Self::WorkspaceReadOnly
-    }
-}
 
 /// 沙箱档案（对应 Claude Code 的 SandboxProfile）
 #[derive(Debug, Clone, Serialize, Deserialize)]

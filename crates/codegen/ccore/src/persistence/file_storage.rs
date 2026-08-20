@@ -46,6 +46,12 @@ impl StorageBackend for FileStorage {
         let path = self.key_to_path(key);
         let temp_path = path.with_extension("tmp");
 
+        // 确保父目录存在（key 可能含子目录路径）
+        if let Some(parent) = temp_path.parent() {
+            fs::create_dir_all(parent).await
+                .with_context(|| format!("无法创建目录：{:?}", parent))?;
+        }
+
         // 原子写入：先写临时文件
         let mut file = fs::File::create(&temp_path)
             .await

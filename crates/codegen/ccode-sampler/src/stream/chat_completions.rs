@@ -245,6 +245,15 @@ pub fn stream_chat_completions<'a>(
         }
 
         // ── Build the final response ─────────────────────────────────
+        for (tool_index, (id, name, arguments)) in &tool_call_acc {
+            yield SamplingEvent::ToolCallReady {
+                request_id: request_id.clone(),
+                tool_index: *tool_index,
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            };
+        }
         let tool_calls: Vec<ToolCall> = tool_call_acc
             .into_values()
             .map(|(id, name, arguments)| ToolCall {

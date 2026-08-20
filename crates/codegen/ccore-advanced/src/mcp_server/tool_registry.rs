@@ -2,7 +2,7 @@
 //!
 //! 注册 ccode 的 12 个内置工具（read/write/edit/bash/glob/grep
 //! + todo_write/web_search/web_fetch/git_status/list_directory/create_file），
-//! 每个工具的调用通过消息总线转发给 ToolNode 执行。
+//!   每个工具的调用通过消息总线转发给 ToolNode 执行。
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -44,6 +44,12 @@ pub struct McpToolDef {
 pub struct McpToolRegistry {
     /// 工具定义映射（name → McpToolDef）
     tools: HashMap<String, McpToolDef>,
+}
+
+impl Default for McpToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl McpToolRegistry {

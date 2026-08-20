@@ -159,7 +159,9 @@ impl StateNode {
             None => return,
         };
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(target: "ccore::state", "failed to create jsonl dir: {e}");
+            }
         }
         let line = match serde_json::to_string(&entry) {
             Ok(l) => l,
@@ -168,13 +170,15 @@ impl StateNode {
                 return;
             }
         };
-        use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
         {
-            let _ = writeln!(file, "{}", line);
+            use std::io::Write;
+            if let Err(e) = writeln!(file, "{}", line) {
+                tracing::warn!(target: "ccore::state", "failed to write jsonl entry: {e}");
+            }
         }
     }
 
@@ -196,13 +200,13 @@ impl StateNode {
                     "user" | "assistant" | "system" => {
                         let role = entry.role.as_deref().unwrap_or(&entry.entry_type);
                         let content = entry.content.as_deref().unwrap_or("");
-                        let tokens = entry.token_count.unwrap_or_else(|| (content.len() / 4) as u32);
+                        let tokens = entry.token_count.unwrap_or((content.len() / 4) as u32);
                         self.short_term.store(role.to_string(), content.to_string(), tokens, false);
                         count += 1;
                     }
                     "tool_call" | "tool_result" => {
                         let content = entry.content.as_deref().unwrap_or("");
-                        let tokens = entry.token_count.unwrap_or_else(|| (content.len() / 4) as u32);
+                        let tokens = entry.token_count.unwrap_or((content.len() / 4) as u32);
                         self.short_term.store("tool".to_string(), content.to_string(), tokens, true);
                         count += 1;
                     }
@@ -331,7 +335,7 @@ impl StateNode {
                     if entry.content.len() > 200 {
                         let original_tokens = entry.token_count as u64;
                         let summary: String = entry.content
-                            .split(|c: char| c == '.' || c == '。' || c == '\n')
+                            .split(['.', '。', '\n'])
                             .take(3)
                             .collect::<Vec<&str>>()
                             .join(". ");

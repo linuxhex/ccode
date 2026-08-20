@@ -24,6 +24,8 @@ pub struct MessageMeta {
     pub content: String,
     pub token_count: u32,
     pub source_range: (usize, usize),
+    /// 原始工具名（仅工具结果有值）
+    pub tool_name: Option<String>,
 }
 
 impl SlidingWindow {
@@ -67,6 +69,7 @@ impl SlidingWindow {
                     role: MessageRole::try_from(msg.role.as_str()).unwrap_or(MessageRole::User),
                     content: msg.content.clone(),
                     token_count: msg.token_count,
+                    tool_name: msg.tool_name.clone(),
                     created_at: std::time::Instant::now(),
                 },
                 Temperature::Warm => {

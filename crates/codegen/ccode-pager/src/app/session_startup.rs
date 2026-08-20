@@ -62,6 +62,7 @@ pub fn fork_session_params(
     parent_cwd: &Path,
     new_session_id: Option<&str>,
     parent_is_worktree: bool,
+    target_prompt_index: Option<usize>,
 ) -> serde_json::Value {
     let parent_cwd_str = parent_cwd.to_string_lossy().into_owned();
     let source_cwd = ccode_shell::session::resolve_local_session_any_cwd(parent_session_id)
@@ -77,6 +78,9 @@ pub fn fork_session_params(
     }
     if parent_is_worktree {
         payload["sourceWorkspaceDir"] = serde_json::Value::String(parent_cwd_str);
+    }
+    if let Some(idx) = target_prompt_index {
+        payload["targetPromptIndex"] = serde_json::Value::from(idx);
     }
     payload
 }
@@ -939,7 +943,7 @@ mod tests {
     #[test]
     fn fork_session_params_sets_new_session_id_and_workspace_dir() {
         let cwd = PathBuf::from("/wt");
-        let p = fork_session_params("parent-1", &cwd, Some("child-uuid"), true);
+        let p = fork_session_params("parent-1", &cwd, Some("child-uuid"), true, None);
         assert_eq!(p["sourceSessionId"], "parent-1");
         assert_eq!(p["newCwd"], "/wt");
         assert_eq!(p["newSessionId"], "child-uuid");
@@ -949,7 +953,7 @@ mod tests {
     #[test]
     fn fork_session_params_omits_workspace_dir_when_not_worktree() {
         let cwd = PathBuf::from("/proj");
-        let p = fork_session_params("parent-1", &cwd, None, false);
+        let p = fork_session_params("parent-1", &cwd, None, false, None);
         assert!(p.get("sourceWorkspaceDir").is_none());
         assert!(p.get("newSessionId").is_none());
     }
@@ -1013,9 +1017,8 @@ mod tests {
     /// hardcoded `false` here once disabled it everywhere.
     #[test]
     fn remote_restore_follows_compiled_restore_stack() {
-        assert_eq!(
-            MaterializeCtx::from_pager_args(&parse(&["ccode"])).allow_remote_restore,
-            false
+        assert!(
+            !MaterializeCtx::from_pager_args(&parse(&["ccode"])).allow_remote_restore
         );
     }
     /// Explicit-id resume under `--chat` passes the id through untouched:

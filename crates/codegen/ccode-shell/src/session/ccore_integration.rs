@@ -91,7 +91,7 @@ pub async fn wait_for_circuit_recovery(max_wait_ms: u64) -> bool {
     tracing::warn!("ccore: circuit breaker open, waiting for recovery...");
     let start = std::time::Instant::now();
     let max_wait = std::time::Duration::from_millis(max_wait_ms);
-    let check_interval = std::time::Duration::from_millis(500);
+    let check_interval = std::time::Duration::from_millis(200);
 
     while start.elapsed() < max_wait {
         tokio::time::sleep(check_interval).await;
@@ -113,6 +113,12 @@ pub struct SessionCacheTracker {
     inner: PromptCacheTracker,
     /// 请求计数器，用于生成 request_id
     request_counter: u64,
+}
+
+impl Default for SessionCacheTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionCacheTracker {
@@ -164,6 +170,12 @@ use ccore::tools::read_tracker::ReadTracker;
 /// 改为 Arc<Mutex> 后所有线程共享同一份读取记录。
 pub struct SessionReadTracker {
     inner: Arc<std::sync::Mutex<ReadTracker>>,
+}
+
+impl Default for SessionReadTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionReadTracker {
@@ -274,6 +286,12 @@ pub struct MetaAssessment {
     pub difficulty: DifficultyLevel,
     /// 推荐策略
     pub strategy: ExecutionStrategy,
+}
+
+impl Default for SessionMetaCognitive {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionMetaCognitive {
@@ -477,9 +495,7 @@ impl CcoreSessionState {
             .or_else(|| args.get("target_file"))
             .and_then(|v| v.as_str());
 
-        let Some(path) = path else {
-            return None;
-        };
+        let path = path?;
 
         if !self.read_tracker.has_been_read(path) {
             Some(format!(

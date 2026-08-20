@@ -16,8 +16,6 @@ use ratatui::widgets::WidgetRef;
 use ratatui_core::buffer::Buffer as CoreBuffer;
 use ratatui_core::layout::Rect as CoreRect;
 use ratatui_core::widgets::Widget as _;
-use std::cell::Ref;
-use std::cell::RefCell;
 use std::ops::Range;
 use std::time::Instant;
 use textwrap::Options;
@@ -55,7 +53,7 @@ pub struct ElementKind(pub u16);
 /// The default implementation ([`InternalClipboard`]) stores text in memory.
 /// Host apps can provide a system clipboard backend (e.g. `arboard`) via
 /// [`TextArea::set_clipboard_provider`].
-pub trait ClipboardProvider: std::fmt::Debug {
+pub trait ClipboardProvider: std::fmt::Debug + Send + Sync {
     /// Read the current clipboard contents (for paste).
     fn get(&mut self) -> Option<String>;
     /// Write text to the clipboard (on copy/cut).
@@ -189,7 +187,7 @@ impl ClickTracker {
 #[derive(Debug)]
 pub struct TextArea {
     text: EditBuffer,
-    wrap_cache: RefCell<Option<WrapCache>>,
+    wrap_cache: std::sync::Mutex<Option<WrapCache>>,
     preferred_col: Option<usize>,
     elements: Vec<TextElement>,
     next_element_id: u64,
@@ -411,7 +409,7 @@ impl TextArea {
     pub fn new() -> Self {
         Self {
             text: EditBuffer::new(),
-            wrap_cache: RefCell::new(None),
+            wrap_cache: std::sync::Mutex::new(None),
             preferred_col: None,
             elements: Vec::new(),
             next_element_id: 0,
@@ -454,7 +452,7 @@ impl TextArea {
     pub fn set_tab_width(&mut self, tab_width: u8) {
         if self.tab_width != tab_width {
             self.tab_width = tab_width;
-            self.wrap_cache.replace(None);
+            *self.wrap_cache.lock().unwrap() = None;
         }
     }
 
@@ -533,7 +531,7 @@ impl TextArea {
             {
                 self.selection = None;
             }
-            self.wrap_cache.replace(None);
+            *self.wrap_cache.lock().unwrap() = None;
             if mutation_kind == Some(MutationKind::Kill) {
                 self.kill_buffer = plan.into_removed_text();
             }
@@ -615,7 +613,7 @@ impl TextArea {
         self.elements.clear();
         let len = self.text.len();
         self.set_cursor_inner(cursor.min(len));
-        self.wrap_cache.replace(None);
+        *self.wrap_cache.lock().unwrap() = None;
         self.preferred_col = None;
         // Kill buffer intentionally survives: yank is independent of buffer
         // content, so a cut can be pasted into a fresh prompt after send.
@@ -2108,7 +2106,7 @@ impl TextArea {
     fn restore(&mut self, entry: UndoEntry) {
         self.text = EditBuffer::from_parts(entry.text, entry.cursor);
         self.elements = entry.elements;
-        self.wrap_cache.replace(None);
+        *self.wrap_cache.lock().unwrap() = None;
         self.preferred_col = None;
         // Note: next_element_id is intentionally NOT restored — it only increases.
         // Note: kill_buffer is intentionally NOT restored — yank is separate from undo.
@@ -2413,7 +2411,7 @@ impl TextArea {
         self.scroll_override = None;
         // If we have a wrapping cache, prefer navigating across wrapped (visual) lines.
         if let Some((target_col, maybe_line)) = {
-            let cache_ref = self.wrap_cache.borrow();
+            let cache_ref = self.wrap_cache.lock().unwrap();
             if let Some(cache) = cache_ref.as_ref() {
                 let lines = &cache.lines;
                 if let Some(idx) = Self::wrapped_line_index_by_start(lines, self.cursor()) {
@@ -2477,7 +2475,7 @@ impl TextArea {
         self.scroll_override = None;
         // If we have a wrapping cache, prefer navigating across wrapped (visual) lines.
         if let Some((target_col, move_to_last)) = {
-            let cache_ref = self.wrap_cache.borrow();
+            let cache_ref = self.wrap_cache.lock().unwrap();
             if let Some(cache) = cache_ref.as_ref() {
                 let lines = &cache.lines;
                 if let Some(idx) = Self::wrapped_line_index_by_start(lines, self.cursor()) {
@@ -2575,7 +2573,7 @@ impl TextArea {
     }
 
     fn beginning_of_current_visual_line(&self) -> Option<usize> {
-        let cache = self.wrap_cache.borrow();
+        let cache = self.wrap_cache.lock().unwrap();
         let cache = cache.as_ref()?;
         let idx = Self::wrapped_line_index_by_start(&cache.lines, self.cursor())?;
         Some(cache.lines[idx].start)
@@ -2584,7 +2582,7 @@ impl TextArea {
     /// Soft-continued visual rows land on the last char (exclusive end is the
     /// next row's start). Final segment of a logical line uses exclusive end.
     fn end_of_current_visual_line(&self) -> Option<usize> {
-        let cache = self.wrap_cache.borrow();
+        let cache = self.wrap_cache.lock().unwrap();
         let cache = cache.as_ref()?;
         let idx = Self::wrapped_line_index_by_start(&cache.lines, self.cursor())?;
         let line = &cache.lines[idx];
@@ -2671,7 +2669,7 @@ impl TextArea {
         };
         self.elements.push(elem);
         self.elements.sort_by_key(|e| e.range.start);
-        self.wrap_cache.replace(None);
+        *self.wrap_cache.lock().unwrap() = None;
         id
     }
 
@@ -2698,7 +2696,7 @@ impl TextArea {
     pub fn set_element_display(&mut self, id: ElementId, display: Option<Line<'static>>) {
         if let Some(e) = self.elements.iter_mut().find(|e| e.id == id) {
             e.display = display;
-            self.wrap_cache.replace(None);
+            *self.wrap_cache.lock().unwrap() = None;
         }
     }
 
@@ -2719,7 +2717,7 @@ impl TextArea {
         for (range, kind, display) in elems {
             self.add_element(range, kind, display);
         }
-        self.wrap_cache.replace(None);
+        *self.wrap_cache.lock().unwrap() = None;
     }
 
     /// Inline an element: remove it from the element list so its buffer text
@@ -2741,7 +2739,7 @@ impl TextArea {
         self.elements.remove(idx);
         self.set_cursor_inner(end);
         self.preferred_col = None;
-        self.wrap_cache.replace(None);
+        *self.wrap_cache.lock().unwrap() = None;
         self.undo.last_kind = None; // always discrete
 
         true
@@ -2922,14 +2920,14 @@ impl TextArea {
     }
 
     #[expect(clippy::unwrap_used)]
-    fn wrapped_lines(&self, width: u16) -> Ref<'_, Vec<Range<usize>>> {
+    fn wrapped_lines(&self, width: u16) -> Vec<Range<usize>> {
         // A zero-width terminal must not reach textwrap — it can produce
         // borrowed empty slices that don't point into the input buffer,
         // causing out-of-bounds panics in wrap_ranges pointer arithmetic.
         let width = width.max(1);
         // Ensure cache is ready (potentially mutably borrow, then drop)
         {
-            let mut cache = self.wrap_cache.borrow_mut();
+            let mut cache = self.wrap_cache.lock().unwrap();
             let needs_recalc = match cache.as_ref() {
                 Some(c) => c.width != width,
                 None => true,
@@ -2948,8 +2946,8 @@ impl TextArea {
             }
         }
 
-        let cache = self.wrap_cache.borrow();
-        Ref::map(cache, |c| &c.as_ref().unwrap().lines)
+        let cache = self.wrap_cache.lock().unwrap();
+        cache.as_ref().unwrap().lines.clone()
     }
 
     /// Element-display-aware greedy wrapping.
@@ -3752,7 +3750,7 @@ mod tests {
         assert_eq!(textarea.kill_buffer, "sentinel");
         assert_eq!(textarea.preferred_col, Some(3));
         assert_eq!(textarea.scroll_override, Some(2));
-        assert!(textarea.wrap_cache.borrow().is_some());
+        assert!(textarea.wrap_cache.lock().unwrap().is_some());
         assert!(!textarea.can_undo());
     }
 

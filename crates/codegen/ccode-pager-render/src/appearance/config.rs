@@ -471,6 +471,8 @@ pub struct EditBlockConfig {
     /// Show two line-number columns (old + new) like GitHub's unified diff.
     /// When false (default), show a single column with the new-file line number.
     pub dual_line_numbers: bool,
+    /// Diff layout mode: "unified" (default) or "side_by_side".
+    pub diff_layout: String,
 }
 
 impl Default for EditBlockConfig {
@@ -487,6 +489,7 @@ impl Default for EditBlockConfig {
             expanded_by_default: None,
             hunk_separator: "…".to_string(),
             dual_line_numbers: false,
+            diff_layout: "unified".to_string(),
         }
     }
 }
@@ -1151,6 +1154,8 @@ pub struct RawEditBlockConfig {
     /// Show two line-number columns (old + new) like GitHub's unified diff.
     /// When false (default), show a single column with the new-file line number.
     pub dual_line_numbers: bool,
+    /// Diff layout mode: "unified" (default) or "side_by_side".
+    pub diff_layout: Option<String>,
 }
 
 impl Default for RawEditBlockConfig {
@@ -1167,6 +1172,7 @@ impl Default for RawEditBlockConfig {
             expanded_by_default: None,
             hunk_separator: Some("…".to_string()),
             dual_line_numbers: false,
+            diff_layout: None,
         }
     }
 }
@@ -1572,6 +1578,7 @@ impl From<RawEditBlockConfig> for EditBlockConfig {
             expanded_by_default: raw.expanded_by_default,
             hunk_separator: raw.hunk_separator.unwrap_or_else(|| "…".to_string()),
             dual_line_numbers: raw.dual_line_numbers,
+            diff_layout: raw.diff_layout.unwrap_or_else(|| "unified".to_string()),
         }
     }
 }

@@ -423,6 +423,9 @@ impl SessionActor {
     /// URL-derived headers (cli-chat-proxy auth, the staging auth header)
     /// so the sampler crate stays URL-agnostic.
     pub(super) async fn reconstruct_full_config(&self) -> SamplingConfig {
+        if let Some(cached) = self.config_cache.borrow().clone() {
+            return cached;
+        }
         #[allow(clippy::items_after_statements)]
         #[derive(Debug)]
         struct TraceContextInjector;
@@ -506,7 +509,7 @@ impl SessionActor {
                 extra_headers.insert("x-compaction-at".to_string(), value.to_string());
             }
         }
-        SamplingConfig {
+        let config = SamplingConfig {
             api_key: creds.api_key,
             base_url: cfg.base_url,
             model: cfg.model,
@@ -551,7 +554,9 @@ impl SessionActor {
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
-        }
+        };
+        *self.config_cache.borrow_mut() = Some(config.clone());
+        config
     }
     /// Install auto-mode permission classifier with a live LLM side-query
     /// (laziness-classifier pattern: `prepare_chat_completion` +
@@ -763,6 +768,7 @@ impl SessionActor {
     /// the sampler actor is invalidated automatically by
     /// `update_config`.
     pub(crate) async fn prepare_sampler_for_turn(&self) {
+        *self.config_cache.borrow_mut() = None;
         self.refresh_token_if_expired().await;
         let mut sampler_config = self.reconstruct_full_config().await;
         if self.tool_context.task_output_token_budget.is_some()
@@ -1128,30 +1134,18 @@ impl SessionActor {
     /// 在关键状态变更点调用：`turn_start`（用户消息加入）、`turn_end`（Agent
     /// 响应完成）。快照经 `SessionPersistBridge` → `SessionPersister` →
     /// `FileStorage`（原子写入）落盘；序列化或写入失败仅 `tracing::warn`，
-    /// 绝不影响主循环。
+    /// 绝不影响主循环。后台异步执行，不阻塞 turn 返回。
     fn persist_turn_snapshot(
         &self,
         request: &ConversationRequest,
         response: Option<&ConversationResponse>,
         tag: &'static str,
     ) {
-        let payload = serde_json::json!({
-            "session_id": self.session_info.id.0.to_string(),
-            "tag": tag,
-            "model": request.model.clone(),
-            "items": response.map(|r| &r.items),
-            "stop_reason": response.and_then(|r| r.stop_reason),
-            "usage": response.and_then(|r| r.usage.as_ref()),
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        });
-        let data = match serde_json::to_vec(&payload) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(tag = tag, error = %e, "会话快照序列化失败，跳过持久化");
-                return;
-            }
-        };
         let session_id = self.session_info.id.0.to_string();
+        let model = request.model.clone();
+        let items = response.map(|r| r.items.clone());
+        let stop_reason = response.and_then(|r| r.stop_reason);
+        let usage = response.and_then(|r| r.usage.clone());
         let base_dir = self
             .tool_context
             .cwd
@@ -1159,7 +1153,31 @@ impl SessionActor {
             .join(".ccode")
             .join("sessions");
         let agent_id = ccode_telemetry::id::agent_id();
-        crate::session::persist::save_session_snapshot(session_id, base_dir, agent_id, data);
+        tokio::spawn(async move {
+            let session_id_for_serialize = session_id.clone();
+            let data = tokio::task::spawn_blocking(move || {
+                let payload = serde_json::json!({
+                    "session_id": session_id_for_serialize,
+                    "tag": tag,
+                    "model": model,
+                    "items": items,
+                    "stop_reason": stop_reason,
+                    "usage": usage,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                serde_json::to_vec(&payload).ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(data) = data {
+                tokio::task::spawn_blocking(move || {
+                    crate::session::persist::save_session_snapshot(session_id, base_dir, agent_id, data);
+                })
+                .await
+                .ok();
+            }
+        });
     }
     /// Drive a single turn through the sampler-based path.
     ///
@@ -1194,11 +1212,10 @@ impl SessionActor {
     ) -> Result<SamplerTurnOutcome, acp::Error> {
         self.prepare_sampler_for_turn().await;
         // ccore 融合：熔断器门控
-        if !crate::session::ccore_integration::check_circuit_breaker() {
-            if !crate::session::ccore_integration::wait_for_circuit_recovery(5000).await {
+        if !crate::session::ccore_integration::check_circuit_breaker()
+            && !crate::session::ccore_integration::wait_for_circuit_recovery(1000).await {
                 tracing::warn!("ccore: circuit breaker still open after waiting, degrading");
             }
-        }
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             *self.turn_stream_drained.lock() = Some(tx);
@@ -1244,18 +1261,18 @@ impl SessionActor {
                 if metrics.attempts > 0 {
                     span.record("attempt", i64::from(metrics.attempts));
                 }
-                if tokio::time::timeout(std::time::Duration::from_secs(5), stream_drained_rx)
+                if tokio::time::timeout(std::time::Duration::from_millis(100), stream_drained_rx)
                     .await
                     .is_err()
                 {
                     self.turn_stream_drained.lock().take();
                     tracing::warn!(
-                        "stream-drain barrier timed out; proceeding to emit tool \
+                        "stream-drain barrier timed out (100ms); proceeding to emit tool \
                          calls (eventId ordering may be imperfect this turn)"
                     );
                 }
                 self.persist_turn_snapshot(&request, Some(&response), "turn_end");
-                // ccore 融合：情景记忆编码
+                // ccore 融合：情景记忆编码（后台异步，不阻塞 turn 返回）
                 {
                     let user_text: String = request.items.iter()
                         .filter_map(|item| match item {
@@ -1277,7 +1294,10 @@ impl SessionActor {
                         .collect::<Vec<_>>()
                         .join(" ");
                     if !user_text.is_empty() || !assistant_text.is_empty() {
-                        self.ccore_state.encode_episodic_turn(&user_text, &assistant_text, &[]);
+                        let state = self.ccore_state.clone();
+                        tokio::spawn(async move {
+                            state.encode_episodic_turn(&user_text, &assistant_text, &[]);
+                        });
                     }
                 }
                 Ok(SamplerTurnOutcome::Response(

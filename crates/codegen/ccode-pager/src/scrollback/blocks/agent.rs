@@ -72,6 +72,14 @@ impl AgentMessageBlock {
         self.content.is_empty()
     }
 
+    /// Fast line count estimate from source text length.
+    ///
+    /// Avoids full markdown rendering — suitable for streaming entries
+    /// where exact height isn't critical but layout stability matters.
+    pub fn estimate_line_count(&self, width: usize) -> usize {
+        self.content.estimate_line_count(width)
+    }
+
     /// Finish streaming and do a full re-render for safety.
     pub fn finish(&mut self) {
         self.content.finish();
@@ -204,11 +212,23 @@ impl BlockContent for AgentMessageBlock {
         self.mermaid.len() as u16
     }
 
+    fn estimate_line_count(&self, width: usize) -> Option<usize> {
+        // Fast path for streaming: estimate from source text without full render.
+        // Add extra rows for mermaid diagrams to avoid under-estimating.
+        let base = self.content.estimate_line_count(width);
+        let extra = self.estimate_extra_rows() as usize;
+        Some(base + extra)
+    }
+
     fn accent(&self, _ctx: &BlockContext) -> Option<AccentStyle> {
         None
     }
 
     fn has_vpad(&self, _ctx: &BlockContext) -> bool {
+        false
+    }
+
+    fn has_vpad_fast(&self) -> bool {
         false
     }
 

@@ -44,7 +44,10 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new(config: GeminiConfig) -> Self {
         let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(300))
+            .pool_idle_timeout(std::time::Duration::from_secs(600))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { config, client }
@@ -154,7 +157,7 @@ impl GeminiProvider {
                 });
             }
         }
-        if generation_config.as_object().map_or(false, |o| !o.is_empty()) {
+        if generation_config.as_object().is_some_and(|o| !o.is_empty()) {
             body["generationConfig"] = generation_config;
         }
 
@@ -498,6 +501,20 @@ impl Provider for GeminiProvider {
 
     fn name(&self) -> &str {
         &self.config.name
+    }
+
+    async fn warm_up(&self) -> Result<()> {
+        let url = self.stream_url(self.config.models.first().map(|s| s.as_str()).unwrap_or("gemini-pro"));
+        tracing::info!("预热 Provider {} 连接：{}", self.config.name, url);
+        match self.client.head(&url).send().await {
+            Ok(resp) => {
+                tracing::info!("Provider {} 连接预热完成，status={}", self.config.name, resp.status());
+            }
+            Err(e) => {
+                tracing::warn!("Provider {} 连接预热失败（非致命）：{}", self.config.name, e);
+            }
+        }
+        Ok(())
     }
 }
 

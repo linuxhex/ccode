@@ -411,14 +411,13 @@ fn build_recommendation(items: &[CodeResult]) -> String {
     let mut reasons = Vec::new();
 
     // 按 stars 分析最高星标项目
-    if let Some(top) = items.iter().max_by_key(|i| i.stars.unwrap_or(0)) {
-        if let Some(stars) = top.stars {
+    if let Some(top) = items.iter().max_by_key(|i| i.stars.unwrap_or(0))
+        && let Some(stars) = top.stars {
             reasons.push(format!(
                 "最高星标项目 {repo}（{stars} ⭐）",
                 repo = top.repository,
             ));
         }
-    }
 
     // 检查是否有知名 license 的项目
     let with_license: Vec<&CodeResult> = items
@@ -444,7 +443,9 @@ fn build_recommendation(items: &[CodeResult]) -> String {
         ));
     }
 
-    let summary = if reasons.is_empty() {
+    
+
+    if reasons.is_empty() {
         format!("找到 {count} 个代码结果，建议查看详细代码片段以判断适用性。", count = items.len())
     } else {
         format!(
@@ -452,9 +453,7 @@ fn build_recommendation(items: &[CodeResult]) -> String {
             count = items.len(),
             reasons = reasons.join("，")
         )
-    };
-
-    summary
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

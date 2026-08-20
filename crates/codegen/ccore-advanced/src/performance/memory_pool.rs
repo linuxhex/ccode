@@ -105,11 +105,11 @@ impl<'a> BufferGuard<'a> {
         }
     }
 
-    pub fn as_mut(&mut self) -> &mut Vec<u8> {
+    pub fn inner_mut(&mut self) -> &mut Vec<u8> {
         &mut self.buf
     }
 
-    pub fn as_ref(&self) -> &Vec<u8> {
+    pub fn inner_ref(&self) -> &Vec<u8> {
         &self.buf
     }
 }
@@ -142,7 +142,7 @@ mod tests {
         let pool = MessagePool::new(10, 1024);
         {
             let mut guard = BufferGuard::new(&pool);
-            guard.as_mut().extend_from_slice(b"test");
+            guard.inner_mut().extend_from_slice(b"test");
         }
         // guard drop 后缓冲区应回到池中
         assert_eq!(pool.available(), 10);

@@ -191,7 +191,7 @@ mod tests {
             &cfg,
             &OkSampler,
             |early| early.iter().map(|i| i.0.as_str()).collect::<Vec<_>>().join("\n"),
-            |s| Item(s),
+            Item,
         )
         .await
         .unwrap();
@@ -209,7 +209,7 @@ mod tests {
             &cfg,
             &OkSampler,
             |early| early.iter().map(|i| i.0.as_str()).collect::<Vec<_>>().join("\n"),
-            |s| Item(s),
+            Item,
         )
         .await
         .unwrap();

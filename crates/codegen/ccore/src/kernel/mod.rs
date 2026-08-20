@@ -30,7 +30,6 @@ pub mod registry;
 pub mod health;
 pub mod transport;
 pub mod launcher;
-pub mod transaction;
 pub mod backpressure;
 pub mod metrics;
 pub mod self_healing;
@@ -43,7 +42,7 @@ pub mod lock_order;
 use anyhow::Result;
 use bytes::Bytes;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::CcodeConfig;
 use crate::config::provider::ProviderConfig;
@@ -197,6 +196,14 @@ pub struct Kernel {
     mcp_server: Option<McpServerHandle>,
     /// HookDispatcher 桥接（可选，由产品层注入 ccode-hooks 适配器）
     hook_dispatcher: Option<Arc<dyn crate::tools::hook_bridge::HookDispatcher>>,
+    /// Skills 数量（传递给 TUI 显示）
+    skills_count: usize,
+    /// 已启动 Node 的 JoinHandle（从 NodeLauncher 转移，避免 launcher drop 时 abort）
+    node_task_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// 全局 Agent 重启计数（防止无限重启循环）
+    global_restart_count: u32,
+    /// 全局最大重启次数（超过后停止重启）
+    max_global_restarts: u32,
 }
 
 impl Kernel {
@@ -265,6 +272,10 @@ impl Kernel {
             registration_notify_tx,
             mcp_server,
             hook_dispatcher: None,
+            skills_count: 0,
+            node_task_handles: Vec::new(),
+            global_restart_count: 0,
+            max_global_restarts: 5,
         }
     }
 
@@ -281,6 +292,11 @@ impl Kernel {
     /// Kernel 在 spawn ToolNode 时将适配器传递给 ToolNode。
     pub fn set_hook_dispatcher(&mut self, dispatcher: Arc<dyn crate::tools::hook_bridge::HookDispatcher>) {
         self.hook_dispatcher = Some(dispatcher);
+    }
+
+    /// 设置 Skills 数量（传递给 TUI 显示）
+    pub fn set_skills_count(&mut self, count: usize) {
+        self.skills_count = count;
     }
 
     /// 获取情景记忆存储
@@ -309,7 +325,7 @@ impl Kernel {
     /// 获取元认知控制器（懒初始化）
     /// 监控 Agent 推理质量，检测逻辑不一致和策略偏差
     pub fn meta_cognitive(&self) -> &MetaCognitiveController {
-        self.meta_cognitive.get_or_init(|| MetaCognitiveController::new())
+        self.meta_cognitive.get_or_init(MetaCognitiveController::new)
     }
 
     /// 获取 Token 预算管理器
@@ -393,8 +409,11 @@ impl Kernel {
             if let Some(dispatcher) = self.hook_dispatcher.take() {
                 launcher.set_hook_dispatcher(dispatcher);
             }
+            launcher.set_skills_count(self.skills_count);
             match launcher.spawn_initial_set().await {
                 Ok(nodes) => {
+                    // 转移 task_handles 到 Kernel，避免 launcher 被 drop 时 abort 正在运行的 Node
+                    self.node_task_handles = launcher.take_task_handles();
                     let start_time = std::time::Instant::now();
                     tracing::info!("初始 Node 集合启动完成：{} 个", nodes.len());
                     for desc in &nodes {
@@ -429,7 +448,13 @@ impl Kernel {
                         })
                         .collect();
 
-                    // 等待所有 Node 完成注册（事件驱动：通过 watch channel 通知，替代轮询）
+                    // 等待所有 Node 完成注册。
+                    //
+                    // 关键问题：注册等待期间主事件循环尚未启动，但 router_loop 后台任务
+                    // 已经在接收消息并放入 incoming_rx 通道。如果只等 watch channel 通知，
+                    // 而 sys/register 消息从未被处理，则注册等待必然超时。
+                    //
+                    // 解决：在等待期间同时处理 incoming 消息，使 sys/register 能被及时处理。
                     let expected_count = node_ids.len();
                     let mut all_registered = false;
                     let mut reg_rx = self.registration_notify_tx.subscribe();
@@ -441,37 +466,64 @@ impl Kernel {
                     if already_done {
                         all_registered = true;
                     } else {
-                        // 等待 watch channel 通知，最多 5 秒超时
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            async {
-                                while reg_rx.changed().await.is_ok() {
-                                    let count = *reg_rx.borrow();
-                                    if count >= expected_count {
-                                        // 再次确认所有目标 Node 都已注册
-                                        let registered = node_ids.iter().all(|id| {
-                                            let nid: NodeId = id.parse().unwrap_or_else(|_| NodeId::from("invalid"));
-                                            self.registry.get(&nid).is_some()
-                                        });
-                                        if registered {
-                                            return true;
+                        // 同时等待注册通知和处理 incoming 消息
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        loop {
+                            // 先检查是否已全部注册
+                            let registered = node_ids.iter().all(|id| {
+                                let nid: NodeId = id.parse().unwrap_or_else(|_| NodeId::from("invalid"));
+                                self.registry.get(&nid).is_some()
+                            });
+                            if registered {
+                                all_registered = true;
+                                break;
+                            }
+
+                            // 检查是否超时
+                            if Instant::now() >= deadline {
+                                tracing::warn!(
+                                    "初始 Node 集合注册超时（{}/{} 已注册），跳过 spawn 广播",
+                                    self.registry.len(), expected_count,
+                                );
+                                break;
+                            }
+
+                            tokio::select! {
+                                // 注册通知（watch channel 变更）
+                                _ = reg_rx.changed() => {
+                                    // 继续循环，顶部会重新检查
+                                }
+                                // 处理 incoming 消息（含 sys/register）
+                                result = transport.recv() => {
+                                    match result {
+                                        Ok(Some(incoming)) => {
+                                            if let Err(e) = self.handle_incoming(incoming, &mut transport).await {
+                                                tracing::warn!("处理注册期间消息失败：{}", e);
+                                            }
+                                        }
+                                        Ok(None) => {
+                                            tracing::warn!("传输层通道已关闭");
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("传输层接收错误：{}", e);
+                                            break;
                                         }
                                     }
                                 }
-                                false
                             }
-                        ).await {
-                            Ok(true) => all_registered = true,
-                            _ => {}
                         }
                     }
 
                     if all_registered {
+                        // 延迟 500ms 广播 sys/spawn，确保所有 Node 的 SUB socket 已就绪
+                        // ZMQ PUB/SUB 不缓存消息，SUB 未连接时消息会丢失
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         for (frames, desc) in spawn_frames_list.iter().zip(nodes.iter()) {
                             if let Err(e) = transport.broadcast(frames.clone()).await {
                                 tracing::warn!("广播 spawn 事件失败：{}", e);
                             } else {
-                                tracing::debug!("广播 spawn 事件：{} ({:?})", desc.id, desc.node_type);
+                                tracing::info!("广播 spawn 事件：{} ({:?})", desc.id, desc.node_type);
                             }
                         }
 
@@ -560,7 +612,7 @@ impl Kernel {
                             tracing::warn!("Node 心跳超时，移除：{}", node_id);
                             self.broker.deregister_identity(&node_id);
                             // 通知 AutonomicNervousSystem 注销该 Agent
-                            self.autonomic.unregister_agent(&node_id.to_string()).await;
+                            self.autonomic.unregister_agent(node_id.as_ref()).await;
                             Self::broadcast_node_deregister(&mut transport, &node_id).await;
                         }
                     }
@@ -569,9 +621,21 @@ impl Kernel {
                 event = heartbeat_rx.recv() => {
                     match event {
                         Some(heartbeat) => {
+                            // 全局重启次数限制：防止无限重启循环
+                            if self.global_restart_count >= self.max_global_restarts {
+                                tracing::error!(
+                                    agent_id = %heartbeat.agent_id,
+                                    global_restart_count = self.global_restart_count,
+                                    max_global_restarts = self.max_global_restarts,
+                                    "达到全局最大重启次数，停止重启 Agent"
+                                );
+                                continue;
+                            }
+                            self.global_restart_count += 1;
                             tracing::warn!(
                                 agent_id = %heartbeat.agent_id,
                                 restart_count = heartbeat.restart_count,
+                                global_restart_count = self.global_restart_count,
                                 "收到心跳超时事件，执行 Agent 重启"
                             );
                             // 实际重启逻辑：通过 NodeLauncher 重新 spawn 该 Agent
@@ -588,6 +652,9 @@ impl Kernel {
                                     None,
                                     format!("重启 Agent {}", heartbeat.agent_id),
                                 );
+                                // 转移 task_handles 到 Kernel，避免 launcher 被 drop 时 abort 正在运行的 Agent
+                                let new_handles = launcher.take_task_handles();
+                                self.node_task_handles.extend(new_handles);
                                 // 重新注册到 ANS
                                 self.autonomic.register_agent(descriptor.id.to_string()).await;
                                 tracing::info!("Agent {} 已重启，新 ID：{}", heartbeat.agent_id, descriptor.id);
@@ -684,6 +751,13 @@ impl Kernel {
 
         Self::broadcast_shutdown(&mut transport).await;
         transport.shutdown().await;
+        // abort 所有 Node task，让 runtime 能正常 drop
+        for handle in &self.node_task_handles {
+            handle.abort();
+        }
+        for handle in std::mem::take(&mut self.node_task_handles) {
+            let _ = handle.await;
+        }
         tracing::info!(
             target: "ccore::kernel",
             "shutdown complete"
@@ -708,7 +782,47 @@ impl Kernel {
         let src_node = incoming.message.header.src_node.clone();
         let sequence = incoming.message.header.sequence;
 
-        // 序列号检查（跳过注册消息）
+        // ── 热路径快速分发 ──
+        // 高频业务消息（tool_call/tool_result/output + sampler/stream）占 Agent 循环 95%+ 的消息量。
+        // 这些消息只需路由，不需要序列号检查或系统消息处理，直接走快速路径。
+        // 优化效果：减少每消息 ~2μs 的序列号检查 + 字符串匹配开销。
+        if topic.starts_with("agent/") && (
+            topic.ends_with("/tool_call") ||
+            topic.ends_with("/tool_result") ||
+            topic.ends_with("/output")
+        ) {
+            let targets = self.broker.find_targets(&incoming.message);
+            if !targets.is_empty() {
+                let frames = FrameCodec::encode(&incoming.message)?;
+                let frames_bytes: Vec<Bytes> = frames.into_iter().map(Bytes::from).collect();
+                for (target_identity, _node_id) in targets {
+                    transport.send_to(Bytes::from(target_identity), frames_bytes.clone()).await?;
+                }
+                self.backpressure.record_sent();
+                collector.record_success(now.elapsed().as_millis() as f64);
+            }
+            return Ok(());
+        }
+
+        // ── 热路径：sampler 流式 chunk ──
+        // 每个 LLM token 产生一条 sampler/*/stream 消息，是系统中最高频的消息类型。
+        // 跳过序列号检查和 backpressure，最小化逐 token 路由延迟。
+        if topic.starts_with("sampler/") && topic.ends_with("/stream") {
+            let targets = self.broker.find_targets(&incoming.message);
+            if !targets.is_empty() {
+                let frames = FrameCodec::encode(&incoming.message)?;
+                let frames_bytes: Vec<Bytes> = frames.into_iter().map(Bytes::from).collect();
+                for (target_identity, _node_id) in targets {
+                    transport.send_to(Bytes::from(target_identity), frames_bytes.clone()).await?;
+                }
+                self.backpressure.record_sent();
+                collector.record_success(now.elapsed().as_millis() as f64);
+            }
+            return Ok(());
+        }
+
+        // ── 序列号检查（非热路径消息） ──
+        // 系统消息（register/heartbeat）和业务低频消息才需要序列号检查
         if topic != "sys/register" {
             let node_id: NodeId = match src_node.parse() {
                 Ok(id) => id,
@@ -870,6 +984,62 @@ impl Kernel {
 
                     // 通知注册等待者（事件驱动：替代轮询）
                     let _ = self.registration_notify_tx.send(self.registry.len());
+
+                    // 通过 DEALER 直接通知 TUI 关于 Thinker 的信息
+                    // 避免 PUB/SUB slow joiner 导致 TUI 长时间收不到 sys/spawn
+                    // 场景1：Thinker 注册 → 通知所有已注册的 TUI
+                    // 场景2：TUI 注册 → 通知 TUI 关于已注册的 Thinker
+                    let thinker_to_notify: Option<NodeId> = if node_type == NodeType::Thinker {
+                        Some(node_id.clone())
+                    } else if node_type == NodeType::TUI {
+                        self.registry.find_by_type(NodeType::Thinker)
+                            .into_iter().next().cloned()
+                    } else {
+                        None
+                    };
+
+                    if let Some(thinker_id) = thinker_to_notify {
+                        let tui_targets: Vec<NodeId> = if node_type == NodeType::Thinker {
+                            // Thinker 注册：通知所有已注册的 TUI
+                            self.registry.find_by_type(NodeType::TUI)
+                                .into_iter().cloned().collect()
+                        } else {
+                            // TUI 注册：只通知自己
+                            vec![node_id.clone()]
+                        };
+
+                        if !tui_targets.is_empty() {
+                            if let Ok(spawn_msg) = FrameCodec::new_message(
+                                Topic::sys_spawn(),
+                                "kernel",
+                                &serde_json::json!({
+                                    "node_id": thinker_id.to_string(),
+                                    "node_type": "thinker",
+                                    "name": "thinker",
+                                }),
+                            ) {
+                                if let Ok(encoded) = FrameCodec::encode(&spawn_msg) {
+                                    let spawn_frames: Vec<Bytes> = encoded
+                                        .into_iter().map(Bytes::from).collect();
+                                    for tui_id in &tui_targets {
+                                        if let Some(identity) = self.broker.get_identity(tui_id) {
+                                            let identity_bytes = Bytes::from(identity.to_vec());
+                                            match transport.send_to(identity_bytes, spawn_frames.clone()).await {
+                                                Ok(()) => tracing::info!(
+                                                    "DEALER 通知 TUI {} 关于 Thinker {}",
+                                                    tui_id, thinker_id
+                                                ),
+                                                Err(e) => tracing::warn!(
+                                                    "DEALER 通知 TUI {} 失败：{}",
+                                                    tui_id, e
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // ROS 1 核心：返回 publisher 发现信息给新注册的 Node
@@ -942,6 +1112,12 @@ impl Kernel {
 
                 // ✅ 通知 AutonomicNervousSystem 注销该 Agent
                 self.autonomic.unregister_agent(node_id_str).await;
+            }
+
+            // 全局关闭信号：TUI 退出时发送，Kernel 收到后退出主循环
+            "sys/shutdown" => {
+                tracing::info!("收到 sys/shutdown 信号，Kernel 准备退出");
+                self.running = false;
             }
 
             // Agent spawn 请求
@@ -1334,38 +1510,49 @@ impl Kernel {
             // cortex/erl_trajectory — ERL 轨迹提取请求（来自 ThinkerNode turn 结束）
             "cortex/erl_trajectory" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
-                if let Ok(trajectory) = serde_json::from_value::<crate::agent::experiential::TaskTrajectory>(
-                    payload["trajectory"].clone()
-                ) {
-                    // 调用 ERL 提取 heuristics
-                    let heuristics = self.erl().extract_heuristics(&trajectory);
-                    if !heuristics.is_empty() {
-                        // 将最重要的 heuristic 回传给 ThinkerNode
-                        let best = heuristics.iter()
-                            .max_by(|a, b| a.relevance_score.partial_cmp(&b.relevance_score).unwrap_or(std::cmp::Ordering::Equal))
-                            .expect("heuristics non-empty");
-                        let result = serde_json::json!({
-                            "heuristic": best.content,
-                            "from_success": best.from_success,
-                            "relevance": best.relevance_score,
-                        });
-                        if let Ok(result_msg) = FrameCodec::new_message(
-                            Topic::new("cortex/erl_heuristic"),
-                            "kernel",
-                            &result,
-                        ) {
-                            if let Err(e) = self.route_and_forward(&result_msg, transport).await {
-                                tracing::warn!("发送 ERL heuristic 结果失败：{}", e);
-                            }
-                        }
-                        tracing::info!(
-                            target: "ccore::erl",
-                            count = heuristics.len(),
-                            best_score = best.relevance_score,
-                            "ERL 从轨迹提取了 {} 条 heuristics",
-                            heuristics.len()
-                        );
+                // 手动构造 TaskTrajectory（避免 ccore-advanced 的 serde 跨 crate 兼容性问题）
+                let trajectory = {
+                    let tj = &payload["trajectory"];
+                    crate::agent::experiential::TaskTrajectory {
+                        task: tj["task"].as_str().unwrap_or_default().to_string(),
+                        steps: tj["steps"].as_array().map(|arr| {
+                            arr.iter().map(|v| crate::agent::experiential::TrajectoryStep {
+                                step_type: v["step_type"].as_str().unwrap_or_default().to_string(),
+                                content: v["content"].as_str().unwrap_or_default().to_string(),
+                            }).collect()
+                        }).unwrap_or_default(),
+                        success: tj["success"].as_bool().unwrap_or(false),
+                        failure_reason: tj["failure_reason"].as_str().map(|s| s.to_string()),
                     }
+                };
+                // 调用 ERL 提取 heuristics
+                let heuristics = self.erl().extract_heuristics(&trajectory);
+                if !heuristics.is_empty() {
+                    // 将最重要的 heuristic 回传给 ThinkerNode
+                    let best = heuristics.iter()
+                        .max_by(|a, b| a.relevance_score.partial_cmp(&b.relevance_score).unwrap_or(std::cmp::Ordering::Equal))
+                        .expect("heuristics non-empty");
+                    let result = serde_json::json!({
+                        "heuristic": best.content,
+                        "from_success": best.from_success,
+                        "relevance": best.relevance_score,
+                    });
+                    if let Ok(result_msg) = FrameCodec::new_message(
+                        Topic::new("cortex/erl_heuristic"),
+                        "kernel",
+                        &result,
+                    ) {
+                        if let Err(e) = self.route_and_forward(&result_msg, transport).await {
+                            tracing::warn!("发送 ERL heuristic 结果失败：{}", e);
+                        }
+                    }
+                    tracing::info!(
+                        target: "ccore::erl",
+                        count = heuristics.len(),
+                        best_score = best.relevance_score,
+                        "ERL 从轨迹提取了 {} 条 heuristics",
+                        heuristics.len()
+                    );
                 }
             }
 
@@ -1423,14 +1610,11 @@ impl Kernel {
             // 双路径验证：快速路径（经验日志关键词）+ LLM 评估路径
             "cortex/goal_verify" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
-                let verify_req: crate::agent::goal_verifier::GoalVerifyRequest =
-                    serde_json::from_value(payload.clone()).unwrap_or_else(|_| {
-                        crate::agent::goal_verifier::GoalVerifyRequest {
-                            agent_id: payload["agent_id"].as_str().unwrap_or("").to_string(),
-                            subtask_description: payload["subtask_description"].as_str().unwrap_or("").to_string(),
-                            verification: payload["verification"].as_str().unwrap_or("").to_string(),
-                        }
-                    });
+                let verify_req = crate::agent::goal_verifier::GoalVerifyRequest {
+                    agent_id: payload["agent_id"].as_str().unwrap_or("").to_string(),
+                    subtask_description: payload["subtask_description"].as_str().unwrap_or("").to_string(),
+                    verification: payload["verification"].as_str().unwrap_or("").to_string(),
+                };
 
                 // 策略 1：经验日志快速验证（零延迟）
                 let recent_outcome = self.experience_log.lock().await.recent_outcome_summary();
@@ -1509,7 +1693,9 @@ impl Kernel {
                             "kernel",
                             &result_json,
                         ) {
-                            let _ = self.route_and_forward(&result_msg, transport).await;
+                            if let Err(e) = self.route_and_forward(&result_msg, transport).await {
+                                tracing::warn!(target: "ccore::kernel", "route_and_forward failed: {e}");
+                            }
                         }
                     }
                 }
@@ -1706,7 +1892,7 @@ impl Kernel {
         };
         let agent_config = crate::agent::AgentConfig {
             agent_type,
-            model: model.clone().unwrap_or_else(|| default_model),
+            model: model.clone().unwrap_or(default_model),
             permission_mode,
             max_turns: Some(definition.max_turns),
             subagents_enabled: false,

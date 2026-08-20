@@ -332,7 +332,7 @@ impl PermissionChecker {
 
         // 14. 解释器黑名单
         let first_word = command.split_whitespace().next().unwrap_or("");
-        let base = first_word.split('/').last().unwrap_or(first_word);
+        let base = first_word.split('/').next_back().unwrap_or(first_word);
         for interp in INTERPRETER_BLACKLIST {
             if base == *interp {
                 risks.push(ShellRisk::BlacklistedInterpreter((*interp).to_string()));

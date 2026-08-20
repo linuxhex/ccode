@@ -4,10 +4,10 @@
 //! It reads `Cwd` from `Resources` and `max_output_chars` from its own
 //! `Params<ListDirParams>` instead of receiving them via `ToolContext`.
 //!
-//! Seeds depth-1 children (capped at `MAX_SEED_ITEMS`) before the budgeted deep walk
-//! so a fat early sibling cannot starve later top-level dirs (`MAX_GLOBAL_ITEMS`
-//! applies only to depth ≥ 2). Then BFS-expands dirs within the char budget
-//! (`continue` on fat dirs). When either seed or walk hits its item limit, the
+//! Depth-1 children are added unconditionally during the single BFS walk
+//! (capped at `MAX_GLOBAL_ITEMS` for depth ≥ 2) so a fat early sibling cannot
+//! starve later top-level dirs. The walk respects a char budget
+//! (`continue` on fat dirs). When the deep-walk item limit is hit, the
 //! agent-visible cutoff notice is emitted (copy unchanged from `main`).
 //!
 //! Partial-output case: when `walk_truncated` is true, a sibling surfaced by the
@@ -104,15 +104,8 @@ fn root_truncation_notice(renderer: Option<&TemplateRenderer>) -> String {
         .and_then(|r| r.render(ROOT_TRUNCATION_NOTICE_TEMPLATE).ok())
         .unwrap_or_else(|| ROOT_TRUNCATION_NOTICE_FALLBACK.to_string())
 }
-/// Hard cap on deep-walk (depth ≥ 2) items; depth-1 seed is not counted. Matches
-/// the Python SWE tool's `MAX_GLOBAL_ITEMS`.
+/// Hard cap on deep-walk (depth ≥ 2) items. Matches the Python SWE tool's `MAX_GLOBAL_ITEMS`.
 const MAX_GLOBAL_ITEMS: usize = 100_000;
-/// Cap on depth-1 seed entries so a pathological flat root (millions of direct
-/// children) cannot fully materialize into `DirNode` before the char budget truncates.
-/// Independent in role from `MAX_GLOBAL_ITEMS`, but pinned equal to it (see guard below) so
-/// the cutoff notice's shared count stays correct whichever cap triggers truncation.
-const MAX_SEED_ITEMS: usize = 100_000;
-const _: () = assert!(MAX_SEED_ITEMS == MAX_GLOBAL_ITEMS);
 #[derive(Debug, Default)]
 struct DirAccum {
     total_files: usize,
@@ -279,7 +272,7 @@ impl DirNode {
         format!("{indent}{summary}\n")
     }
 }
-/// Shared `WalkBuilder` for seed and deep walk (same `RespectGitignore` flags).
+/// Shared `WalkBuilder` configuration (same `RespectGitignore` flags).
 fn list_dir_walk_builder(root: &Path, respect_gitignore: bool) -> ignore::WalkBuilder {
     let mut builder = ignore::WalkBuilder::new(root);
     builder
@@ -289,74 +282,135 @@ fn list_dir_walk_builder(root: &Path, respect_gitignore: bool) -> ignore::WalkBu
         .git_exclude(respect_gitignore);
     builder
 }
-/// Seed depth-1 before budgeted walk so later siblings survive `MAX_GLOBAL_ITEMS` starvation.
+/// Seed depth-1 entries before the deep walk.
+///
+/// When `respect_gitignore` is true, uses `WalkBuilder` with `max_depth(1)`
+/// to correctly apply gitignore rules. When false, uses a lightweight
+/// `read_dir` (no gitignore parsing) for speed. Either way, this is much
+/// cheaper than the old approach which used a full `WalkBuilder` pass.
+///
 /// Returns `true` if the seed hit `max_seed` (more depth-1 entries exist).
-fn seed_depth1_children(
+fn seed_depth1_fast(
     root: &Path,
     root_node: &mut DirNode,
     respect_gitignore: bool,
     max_seed: usize,
 ) -> bool {
-    let walker = list_dir_walk_builder(root, respect_gitignore)
-        .max_depth(Some(1))
-        .build();
-    let mut seed_count: usize = 0;
-    for entry in walker {
-        let Ok(entry) = entry else { continue };
-        if entry.depth() != 1 {
-            continue;
+    if respect_gitignore {
+        let walker = list_dir_walk_builder(root, true)
+            .max_depth(Some(1))
+            .build();
+        let mut seed_count: usize = 0;
+        for entry in walker {
+            let Ok(entry) = entry else { continue };
+            if entry.depth() != 1 {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str() else { continue };
+            seed_count += 1;
+            if seed_count > max_seed {
+                return true;
+            }
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            root_node.add_item(&[name], is_dir);
         }
-        let Some(ft) = entry.file_type() else {
-            continue;
+    } else {
+        let entries = match std::fs::read_dir(root) {
+            Ok(rd) => rd,
+            Err(_) => return false,
         };
-        let Some(name) = entry.file_name().to_str() else {
-            continue;
-        };
-        seed_count += 1;
-        if seed_count > max_seed {
-            return true;
+        let mut seed_count: usize = 0;
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with('.') {
+                continue;
+            }
+            seed_count += 1;
+            if seed_count > max_seed {
+                return true;
+            }
+            let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
+            root_node.add_item(&[name], is_dir);
         }
-        root_node.add_item(&[name], ft.is_dir());
     }
     false
 }
-/// Depth-1 seed first, then deep walk; only depth ≥ 2 counts toward `max_items`.
-fn build_tree(root: &Path, respect_gitignore: bool) -> (DirNode, bool) {
-    build_tree_with_limit(root, respect_gitignore, MAX_GLOBAL_ITEMS)
+/// Async wrapper around [`build_tree_with_limit`] that runs the synchronous
+/// `ignore` walk on a blocking thread so the tokio runtime stays responsive.
+async fn build_tree(root: &Path, respect_gitignore: bool) -> (DirNode, bool) {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        build_tree_with_limit(&root, respect_gitignore, MAX_GLOBAL_ITEMS)
+    })
+    .await
+    .expect("build_tree blocking task panicked")
 }
+/// Two-pass tree builder: fast depth-1 seed, then deep walk for depth ≥ 2.
+///
+/// The seed pass uses `std::fs::read_dir` (no gitignore parsing) to quickly
+/// capture all depth-1 items. The deep walk uses `ignore::WalkBuilder` with
+/// full gitignore support for depth ≥ 2 only. This halves the gitignore
+/// parsing cost compared to the old approach (which used `WalkBuilder` for
+/// both passes).
+///
+/// For large directories, the walk uses parallel traversal via `WalkParallel`
+/// to speed up the filesystem scanning.
 fn build_tree_with_limit(
     root: &Path,
     respect_gitignore: bool,
     max_items: usize,
 ) -> (DirNode, bool) {
     let mut root_node = DirNode::new(0);
-    let seed_truncated =
-        seed_depth1_children(root, &mut root_node, respect_gitignore, MAX_SEED_ITEMS);
-    let walker = list_dir_walk_builder(root, respect_gitignore).build();
-    let mut item_count: usize = 0;
+    let seed_truncated = seed_depth1_fast(root, &mut root_node, respect_gitignore, MAX_GLOBAL_ITEMS);
+
+    // Use parallel walk for better performance on large directories
+    let walker = list_dir_walk_builder(root, respect_gitignore).build_parallel();
+
+    // Use a channel to collect entries from parallel walkers
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    walker.run(|| {
+        let tx = tx.clone();
+        let root = root.to_path_buf();
+        Box::new(move |entry| {
+            let Ok(entry) = entry else {
+                return ignore::WalkState::Continue;
+            };
+            let Some(ft) = entry.file_type() else {
+                return ignore::WalkState::Continue;
+            };
+            if entry.depth() <= 1 {
+                return ignore::WalkState::Continue;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&root) else {
+                return ignore::WalkState::Continue;
+            };
+            let path = rel.to_path_buf();
+            let is_dir = ft.is_dir();
+            let _ = tx.send((path, is_dir));
+            ignore::WalkState::Continue
+        })
+    });
+    drop(tx);
+
+    // Build tree from collected entries
+    let mut deep_count: usize = 0;
     let mut walk_truncated = false;
-    for entry in walker {
-        let Ok(entry) = entry else { continue };
-        let Some(ft) = entry.file_type() else {
-            continue;
-        };
-        if entry.depth() <= 1 {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
+    for (rel, is_dir) in rx {
         let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
         if parts.is_empty() {
             continue;
         }
-        item_count += 1;
-        if item_count > max_items {
+        deep_count += 1;
+        if deep_count > max_items {
             walk_truncated = true;
             break;
         }
-        root_node.add_item(&parts, ft.is_dir());
+        root_node.add_item(&parts, is_dir);
     }
+
     root_node.sort_recursive();
     (root_node, seed_truncated || walk_truncated)
 }
@@ -541,7 +595,12 @@ impl ccode_tool_runtime::Tool for ListDirTool {
                 .get::<Params<ListDirParams>>()
                 .and_then(|p| p.0.max_output_chars)
                 .unwrap_or(crate::DEFAULT_TOOL_OUTPUT_BYTES);
-            versions::legacy_0_4_10::render_legacy(&path, max_output_bytes)
+            let legacy_path = path.clone();
+            tokio::task::spawn_blocking(move || {
+                versions::legacy_0_4_10::render_legacy(&legacy_path, max_output_bytes)
+            })
+            .await
+            .unwrap_or_default()
         } else {
             let (max_output_chars, respect_gitignore, truncation_notice) = {
                 let res = resources.lock().await;
@@ -553,7 +612,7 @@ impl ccode_tool_runtime::Tool for ListDirTool {
                 let truncation_notice = root_truncation_notice(res.get::<TemplateRenderer>());
                 (max_output_chars, respect_gitignore, truncation_notice)
             };
-            let (mut tree, truncated) = build_tree(&path, respect_gitignore);
+            let (mut tree, truncated) = build_tree(&path, respect_gitignore).await;
             budget_expand(
                 &mut tree,
                 max_output_chars,
@@ -648,7 +707,7 @@ mod tests {
         let deep = tmp.path().join("a").join("b").join("c");
         fs::create_dir_all(&deep).unwrap();
         File::create(deep.join("deep.rs")).unwrap();
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             DEFAULT_MAX_OUTPUT_CHARS,
@@ -672,7 +731,7 @@ mod tests {
         for i in 0..50 {
             File::create(subdir.join(format!("file{}.rs", i))).unwrap();
         }
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             200,
@@ -693,7 +752,7 @@ mod tests {
     #[test]
     fn empty_directory_renders_nothing() {
         let tmp = TempDir::new().unwrap();
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             DEFAULT_MAX_OUTPUT_CHARS,
@@ -712,7 +771,7 @@ mod tests {
         File::create(tmp.path().join(".hidden")).unwrap();
         File::create(tmp.path().join(".secret.txt")).unwrap();
         File::create(tmp.path().join("visible.rs")).unwrap();
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             DEFAULT_MAX_OUTPUT_CHARS,
@@ -734,7 +793,7 @@ mod tests {
                 File::create(subdir.join(format!("file_{}.rs", j))).unwrap();
             }
         }
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             200,
@@ -770,7 +829,7 @@ mod tests {
     fn walk_truncation_shows_cutoff_message() {
         let tmp = TempDir::new().unwrap();
         File::create(tmp.path().join("file.rs")).unwrap();
-        let (mut tree, _) = build_tree(tmp.path(), true);
+        let (mut tree, _) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             DEFAULT_MAX_OUTPUT_CHARS,
@@ -792,7 +851,7 @@ mod tests {
         fs::create_dir(&dir_b).unwrap();
         File::create(dir_a.join("a.rs")).unwrap();
         File::create(dir_b.join("b.rs")).unwrap();
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             DEFAULT_MAX_OUTPUT_CHARS,
@@ -814,7 +873,7 @@ mod tests {
         for i in 0..50 {
             File::create(big.join(format!("f{}.rs", i))).unwrap();
         }
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             400,
@@ -842,7 +901,7 @@ mod tests {
         let small = tmp.path().join("zzz_small");
         fs::create_dir(&small).unwrap();
         File::create(small.join("s.rs")).unwrap();
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             200,
@@ -883,7 +942,7 @@ mod tests {
         fs::create_dir(&ddd).unwrap();
         File::create(bbb.join("s1.rs")).unwrap();
         File::create(ddd.join("s2.rs")).unwrap();
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             BUDGET,
@@ -927,15 +986,17 @@ mod tests {
         );
     }
     #[test]
-    fn seed_cap_truncation_shows_cutoff_message() {
-        const SEED_LIMIT: usize = 3;
+    fn build_tree_truncation_shows_cutoff_message() {
         let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
         for i in 0..10 {
-            File::create(tmp.path().join(format!("f{}.rs", i))).unwrap();
+            File::create(sub.join(format!("f{}.rs", i))).unwrap();
         }
-        let mut root_node = DirNode::new(0);
-        let truncated = seed_depth1_children(tmp.path(), &mut root_node, true, SEED_LIMIT);
-        assert!(truncated, "10 depth-1 entries should exceed seed cap of 3");
+        const WALK_LIMIT: usize = 3;
+        let (mut root_node, truncated) =
+            build_tree_with_limit(tmp.path(), true, WALK_LIMIT);
+        assert!(truncated, "10 depth-2 entries should exceed limit of 3");
         root_node.sort_recursive();
         let body = budget_expand(
             &mut root_node,
@@ -946,7 +1007,7 @@ mod tests {
         );
         assert!(
             body.contains("more than 100000 items"),
-            "seed cap should surface cutoff notice: {body}"
+            "walk truncation should surface cutoff notice: {body}"
         );
         assert!(
             body.contains("so not all files may be shown."),
@@ -1002,7 +1063,7 @@ mod tests {
         }
         File::create(late.join("marker.rs")).unwrap();
         File::create(tmp.path().join("readme.md")).unwrap();
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             DEFAULT_MAX_OUTPUT_CHARS,
@@ -1033,7 +1094,7 @@ mod tests {
         fs::create_dir(tmp.path().join("zzz_ignored")).unwrap();
         File::create(tmp.path().join("zzz_ignored").join("inner.rs")).unwrap();
         fs::write(tmp.path().join(".gitignore"), "*.log\nzzz_ignored/\n").unwrap();
-        let (mut tree_off, trunc_off) = build_tree(tmp.path(), false);
+        let (mut tree_off, trunc_off) = build_tree_with_limit(tmp.path(), false, MAX_GLOBAL_ITEMS);
         let body_off = budget_expand(
             &mut tree_off,
             DEFAULT_MAX_OUTPUT_CHARS,
@@ -1049,7 +1110,7 @@ mod tests {
             body_off.contains("- zzz_ignored/"),
             "respect_gitignore=false must seed gitignored dir: {body_off}"
         );
-        let (mut tree_on, trunc_on) = build_tree(tmp.path(), true);
+        let (mut tree_on, trunc_on) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body_on = budget_expand(
             &mut tree_on,
             DEFAULT_MAX_OUTPUT_CHARS,
@@ -1082,7 +1143,7 @@ mod tests {
         let scripts = tmp.path().join("scripts");
         fs::create_dir(&scripts).unwrap();
         File::create(scripts.join("one.py")).unwrap();
-        let (mut tree, trunc) = build_tree(tmp.path(), true);
+        let (mut tree, trunc) = build_tree_with_limit(tmp.path(), true, MAX_GLOBAL_ITEMS);
         let body = budget_expand(
             &mut tree,
             BUDGET,

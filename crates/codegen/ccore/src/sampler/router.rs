@@ -228,4 +228,12 @@ impl ProviderRouter {
     pub fn provider_count(&self) -> usize {
         self.providers.len()
     }
+
+    /// 预热所有 Provider 的 HTTP 连接
+    pub async fn warm_up_all(&self) {
+        let futs: Vec<_> = self.providers.values()
+            .map(|entry| entry.provider.warm_up())
+            .collect();
+        futures::future::join_all(futs).await;
+    }
 }

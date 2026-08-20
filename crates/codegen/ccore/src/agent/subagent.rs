@@ -760,18 +760,14 @@ pub struct ResultAggregator {
     completed: Vec<SubAgentResult>,
     /// 超时设置（秒）
     timeout_secs: u64,
-    /// 最大重试次数（用于失败重试功能，当前未使用）
-    #[allow(dead_code)]
-    max_retries: u32,
 }
 
 impl ResultAggregator {
-    pub fn new(timeout_secs: u64, max_retries: u32) -> Self {
+    pub fn new(timeout_secs: u64, _max_retries: u32) -> Self {
         Self {
             pending: HashMap::new(),
             completed: Vec::new(),
             timeout_secs,
-            max_retries,
         }
     }
 
@@ -1179,7 +1175,6 @@ mod tests {
         let manager = SubAgentManager::new(5, 600);
         let aggregator = manager.create_aggregator(300);
         assert_eq!(aggregator.timeout_secs, 300);
-        assert_eq!(aggregator.max_retries, 5);
 
         let default_aggregator = manager.create_default_aggregator();
         assert_eq!(default_aggregator.timeout_secs, 600);

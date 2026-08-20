@@ -3278,6 +3278,7 @@ dependencies = [
 name = "ccore"
 version = "0.1.0"
 dependencies = [
+ "anstyle",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -3287,10 +3288,13 @@ dependencies = [
  "bytes",
  "ccode-compaction",
  "ccode-hooks",
+ "ccode-markdown",
+ "ccode-textarea",
  "ccore-advanced",
  "chrono",
  "crossbeam-queue",
  "crossterm",
+ "dunce",
  "futures",
  "git2",
  "libc",
@@ -4107,11 +4111,7 @@ dependencies = [
 
 [[package]]
 name = "dagre_rust"
-version = "0.0.5"
-dependencies = [
- "graphlib_rust",
- "ordered_hashmap",
-]
+version = "0.1.0"
 
 [[package]]
 name = "dark-light"
@@ -6468,10 +6468,7 @@ dependencies = [
 
 [[package]]
 name = "graphlib_rust"
-version = "0.0.2"
-dependencies = [
- "ordered_hashmap",
-]
+version = "0.1.0"
 
 [[package]]
 name = "grid"
@@ -7940,14 +7937,6 @@ dependencies = [
 [[package]]
 name = "mermaid-to-svg"
 version = "0.1.0"
-dependencies = [
- "dagre_rust",
- "graphlib_rust",
- "serde_yaml",
- "thiserror 2.0.18",
- "unicode-segmentation",
- "unicode-width 0.2.0",
-]
 
 [[package]]
 name = "metrics"
@@ -9052,7 +9041,7 @@ dependencies = [
 
 [[package]]
 name = "ordered_hashmap"
-version = "0.0.3"
+version = "0.1.0"
 
 [[package]]
 name = "os_info"

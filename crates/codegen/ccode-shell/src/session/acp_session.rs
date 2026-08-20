@@ -1086,6 +1086,11 @@ pub(crate) struct SessionActor {
     /// 在 SessionActor 构造时一次性创建，所有调用点共享，确保跨轮次状态累积。
     /// 使用 Arc 包装以便在 'static 异步闭包中传递（如 dispatch_tool）。
     pub(crate) ccore_state: std::sync::Arc<crate::session::ccore_integration::CcoreSessionState>,
+    /// Cache for `reconstruct_full_config()` — avoids redundant async lock
+    /// acquisitions (`get_sampling_config`, `get_credentials`, etc.) when
+    /// called multiple times within a single turn. Invalidated on model
+    /// switch, auth recovery, and compaction setting changes.
+    pub(crate) config_cache: std::cell::RefCell<Option<SamplingConfig>>,
 }
 /// Template for building trace configs on synthetic auto-wake turns.
 ///
@@ -1282,23 +1287,27 @@ const PROMPT_CONTEXT_FILENAME: &str = "prompt_context.json";
 /// This is best-effort: failures are logged but do not block session creation.
 /// The saved JSON enables deterministic re-rendering, `ccode prompt --json`
 /// inspection, and post-hoc debugging of what went into a session's system prompt.
-fn save_prompt_context(session_info: &SessionInfo, prompt_context: &ccode_agent::PromptContext) {
-    let dir = crate::session::persistence::session_dir(session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(?e, "failed to create session dir for prompt_context.json");
-        return;
-    }
-    let path = dir.join(PROMPT_CONTEXT_FILENAME);
-    match serde_json::to_string_pretty(prompt_context) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                tracing::warn!(?e, "failed to write prompt_context.json");
+async fn save_prompt_context(session_info: &SessionInfo, prompt_context: &ccode_agent::PromptContext) {
+    let info = session_info.clone();
+    let ctx = prompt_context.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let dir = crate::session::persistence::session_dir(&info);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(?e, "failed to create session dir for prompt_context.json");
+            return;
+        }
+        let path = dir.join(PROMPT_CONTEXT_FILENAME);
+        match serde_json::to_string_pretty(&ctx) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!(?e, "failed to write prompt_context.json");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(?e, "failed to serialize PromptContext");
             }
         }
-        Err(e) => {
-            tracing::warn!(?e, "failed to serialize PromptContext");
-        }
-    }
+    }).await;
 }
 const SYSTEM_PROMPT_FILENAME: &str = "system_prompt.txt";
 /// Synchronously and atomically rewrite `{session_dir}/chat_history.jsonl`.
@@ -1314,48 +1323,56 @@ const SYSTEM_PROMPT_FILENAME: &str = "system_prompt.txt";
 /// distinct temp suffix (`.sync.tmp`) avoids clobbering the persistence actor's
 /// own `chat_history.jsonl.tmp`; whichever atomic `rename` lands last wins and
 /// the content is identical, so the two writers can never produce a torn file.
-fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[ConversationItem]) {
-    let dir = crate::session::persistence::session_dir(session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(session_id = %session_info.id.0, ?e,
-            "persist_chat_history_jsonl_sync: failed to create session dir");
-        return;
-    }
-    let final_path = dir.join("chat_history.jsonl");
-    let tmp_path = dir.join("chat_history.jsonl.sync.tmp");
-    let result = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        for item in conversation {
-            serde_json::to_writer(&mut buf, item)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            buf.push(b'\n');
+async fn persist_chat_history_jsonl_sync(session_info: &SessionInfo, conversation: &[ConversationItem]) {
+    let info = session_info.clone();
+    let items: Vec<ConversationItem> = conversation.to_vec();
+    let _ = tokio::task::spawn_blocking(move || {
+        let dir = crate::session::persistence::session_dir(&info);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(session_id = %info.id.0, ?e,
+                "persist_chat_history_jsonl_sync: failed to create session dir");
+            return;
         }
-        std::fs::File::create(&tmp_path)?.write_all(&buf)?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        tracing::warn!(session_id = %session_info.id.0, ?e,
-            "persist_chat_history_jsonl_sync: failed to persist chat_history.jsonl");
-        let _ = std::fs::remove_file(&tmp_path);
-    }
+        let final_path = dir.join("chat_history.jsonl");
+        let tmp_path = dir.join("chat_history.jsonl.sync.tmp");
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut buf = Vec::new();
+            for item in &items {
+                serde_json::to_writer(&mut buf, item)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                buf.push(b'\n');
+            }
+            std::fs::File::create(&tmp_path)?.write_all(&buf)?;
+            std::fs::rename(&tmp_path, &final_path)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::warn!(session_id = %info.id.0, ?e,
+                "persist_chat_history_jsonl_sync: failed to persist chat_history.jsonl");
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }).await;
 }
 /// Persist the exact rendered system prompt to `{session_dir}/system_prompt.txt`.
 /// Should match the first System entry in `chat_history.jsonl` modulo trailing
 /// newlines (`canonical_system_prompt_eq`); a trailing-newline-only difference
 /// is benign, and this artifact is a convenience mirror, not the source of truth
 /// (the conversation head is).
-fn save_system_prompt(session_info: &SessionInfo, system_prompt: &str) {
-    let dir = crate::session::persistence::session_dir(session_info);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(?e, "failed to create session dir for system_prompt.txt");
-        return;
-    }
-    let path = dir.join(SYSTEM_PROMPT_FILENAME);
-    if let Err(e) = std::fs::write(&path, system_prompt) {
-        tracing::warn!(?e, "failed to write system_prompt.txt");
-    }
+async fn save_system_prompt(session_info: &SessionInfo, system_prompt: &str) {
+    let info = session_info.clone();
+    let prompt = system_prompt.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        let dir = crate::session::persistence::session_dir(&info);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(?e, "failed to create session dir for system_prompt.txt");
+            return;
+        }
+        let path = dir.join(SYSTEM_PROMPT_FILENAME);
+        if let Err(e) = std::fs::write(&path, &prompt) {
+            tracing::warn!(?e, "failed to write system_prompt.txt");
+        }
+    }).await;
 }
 /// Load the canonical system prompt from `{session_dir}/system_prompt.txt`.
 ///

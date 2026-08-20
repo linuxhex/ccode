@@ -2143,11 +2143,14 @@ mod tests {
         )
         .unwrap();
 
+        let mut compat = CompatConfig::default();
+        compat.claude.skills = false;
+        compat.cursor.skills = false;
         let raw = list_skills_with_options(
             Some(repo_root.to_str().unwrap()),
             None,
             &home,
-            CompatConfig::default(),
+            compat,
         )
         .await;
 

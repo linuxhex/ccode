@@ -63,17 +63,17 @@ pub(in crate::app::dispatch) fn dispatch_fork(
             app.show_toast("Cannot create worktree: not in a git repository");
             vec![]
         }
-        Some(worktree) => dispatch_fork_resolved(app, worktree, args.directive),
+        Some(worktree) => dispatch_fork_resolved(app, worktree, args.directive, args.target_prompt_index),
         None => {
             if in_git_repo {
                 use crate::app::app_view::WorktreeMode;
                 match app.fork_worktree_mode {
-                    WorktreeMode::Always => dispatch_fork_resolved(app, true, args.directive),
-                    WorktreeMode::Never => dispatch_fork_resolved(app, false, args.directive),
+                    WorktreeMode::Always => dispatch_fork_resolved(app, true, args.directive, args.target_prompt_index),
+                    WorktreeMode::Never => dispatch_fork_resolved(app, false, args.directive, args.target_prompt_index),
                     WorktreeMode::Ask => open_fork_question(app, args.directive),
                 }
             } else {
-                dispatch_fork_resolved(app, false, args.directive)
+                dispatch_fork_resolved(app, false, args.directive, args.target_prompt_index)
             }
         }
     }
@@ -175,6 +175,7 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
     app: &mut AppView,
     worktree: bool,
     directive: Option<String>,
+    target_prompt_index: Option<usize>,
 ) -> Vec<Effect> {
     let ActiveView::Agent(parent_id) = app.active_view else {
         return vec![];
@@ -266,6 +267,7 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
             parent_cwd,
             parent_is_worktree,
             new_session_id: None,
+            target_prompt_index,
         }]
     }
 }
@@ -497,6 +499,7 @@ pub(in crate::app::dispatch) fn dispatch_startup_fork_session(
         parent_cwd: cwd,
         parent_is_worktree,
         new_session_id,
+        target_prompt_index: None,
     });
     effects
 }

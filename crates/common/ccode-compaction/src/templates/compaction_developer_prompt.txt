@@ -1,5 +1,12 @@
-Your task is to create a detailed summary of the Ccode Chat conversation so far, paying close attention to the user's explicit requests and all previous actions as Ccode.
-This summary should be thorough in capturing technical details, code patterns, architectural decisions, tool chains, and verification steps that would be essential for continuing development, research, or complex tasks without losing context.
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need in the conversation above.
+- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+
+Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
 
 Important Clarification on Terminology (Broad File Definition):
 Throughout this prompt, the term "file", "files", "file IDs", "file names", and "Files and Code Sections / Artifacts" are defined broadly. They explicitly include:
@@ -11,43 +18,53 @@ Throughout this prompt, the term "file", "files", "file IDs", "file names", and 
 
 Only include information that is visible in the direct user-Ccode conversation history (user messages + Ccode's responses, reasoning, tool calls, and tool outputs). Do not include any internal team communication, chatroom messages, or multi-agent interactions.
 
-Use your internal thinking channel to chronologically analyze each message and section of the conversation before producing the final summary, and ensure you've covered all necessary points.
-During that analysis, thoroughly identify:
-- The user's explicit requests and evolving intents
-- Ccode's approach to addressing them: reasoning steps, specific tool calls (including parallel calls), parameters, results, and how they were interpreted/synthesized (truth-seeking emphasis)
-- Key decisions, technical concepts, code patterns, and architectural choices
-- Specific details like:
-  - file IDs, attachment IDs, image references/URLs, render_result IDs (if any)
-  - file names, attachment names, image captions/descriptions, render component details (if any)
-  - full code snippets (especially recent ones or those executed in REPL)
-  - function signatures
-  - file edits / diffs
-  - tool call details (e.g., code_execution snippets, web_search queries, browse_page instructions, X search operators)
-  - render components used (if any)
-- Errors encountered (tool failures, code exec errors, search limitations, reasoning issues) and how they were diagnosed/fixed
-- Pay special attention to specific user feedback, especially if the user told you to do something differently, corrected facts, or changed direction.
+Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
 
-Double-check for technical accuracy and completeness, addressing each required element thoroughly.
+1. Chronologically analyze each message and section of the conversation. For each section thoroughly identify:
+   - The user's explicit requests and intents
+   - Your approach to addressing the user's requests
+   - Key decisions, technical concepts and code patterns
+   - Specific details like:
+     - file IDs, attachment IDs, image references/URLs, render_result IDs (if any)
+     - file names, attachment names, image captions/descriptions, render component details (if any)
+     - full code snippets (especially recent ones or those executed in REPL)
+     - function signatures
+     - file edits / diffs
+     - tool call details (e.g., code_execution snippets, web_search queries, browse_page instructions, X search operators)
+     - render components used (if any)
+   - Errors encountered (tool failures, code exec errors, search limitations, reasoning issues) and how they were diagnosed/fixed
+   - Pay special attention to specific user feedback, especially if the user told you to do something differently, corrected facts, or changed direction.
+2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.
 
-Your final summary must contain the following sections, in order:
+Your summary should include the following sections:
 
 1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail, including any evolution over the conversation.
 
 2. Key Technical Concepts: List all important technical concepts, technologies, frameworks, and Ccode-specific tool patterns discussed.
 
-3. Tool Usage & Verification: Summarize significant tool calls (code_execution REPL state, web_search, browse_page, X tools, etc.), key information retrieved/verified, cross-referencing steps, and how they influenced decisions or responses.
+3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or created. Pay special attention to the most recent messages and include full code snippets where applicable and include a summary of why this file read or edit is important.
 
-4. Files, Attachments, Images, Render Results & Code Artifacts: Enumerate all specific file-like artifacts (broadly defined as above: files, attachments, images, render_results, etc.), code sections, or REPL executions examined, modified, or created. Pay special attention to the most recent messages and include full code snippets, image descriptions/references, render outputs, or attachment details where applicable, plus a summary of why this artifact is important for continuation.
+4. Errors and fixes: List all errors that you ran into, and how you fixed them. Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
 
-5. Errors and Fixes: List all errors encountered (tool-related or otherwise), how you fixed them, and specific user feedback (especially "do something differently").
+5. Problem Solving: Document problems solved and any ongoing troubleshooting efforts.
 
-6. Problem Solving: Document problems solved, tool-assisted solutions, and any ongoing troubleshooting efforts.
+6. All user messages: List ALL user messages that are not tool results. These are critical for understanding the users' feedback and changing intent.
 
-7. All User Messages: List ALL user messages that are not tool results (verbatim or high-fidelity summary). These are critical for understanding feedback and intent changes.
+7. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.
+
+8. Current Work: Describe in detail precisely what was being worked on immediately before this summary request, paying special attention to the most recent messages from both user and assistant. Include file names and code snippets where applicable.
+
+9. Optional Next Step: List the next step that you will take that is related to the most recent work you were doing. IMPORTANT: ensure that this step is DIRECTLY in line with the user's most recent explicit requests, and the task you were working on immediately before this summary request. If your last task was concluded, then only list next steps if they are explicitly in line with the users request. Do not start on tangential requests or really old requests that were already completed without confirming with the user first.
+                       If there is a next step, include direct quotes from the most recent conversation showing exactly what task you were working on and where you left off. This should be verbatim to ensure there's no drift in task interpretation.
 
 Here's an example of how your output should be structured:
 
 <example>
+<analysis>
+[Your thought process, ensuring all points are covered thoroughly and accurately]
+</analysis>
+
+<summary>
 1. Primary Request and Intent:
    [Detailed description]
 
@@ -56,36 +73,44 @@ Here's an example of how your output should be structured:
    - [Concept 2]
    - [...]
 
-3. Tool Usage & Verification:
-   - [Key tool calls and verification steps]
+3. Files and Code Sections:
+   - [File Name 1]
+      - [Summary of why this file is important]
+      - [Summary of the changes made to this file, if any]
+      - [Important Code Snippet]
+   - [File Name 2]
+      - [Important Code Snippet]
+   - [...]
 
-4. Files, Attachments, Images, Render Results & Code Artifacts:
-   - [Artifact 1 (broadly defined file/attachment/image/render etc.)]
-      - [file/attachment/image/render name and ID]
-      - [Summary of importance]
-      - [Changes or execution results]
-      - [Important Code Snippet / Image reference / Render details]
+4. Errors and fixes:
+    - [Detailed description of error 1]:
+      - [How you fixed the error]
+      - [User feedback on the error if any]
+    - [...]
 
-5. Errors and Fixes:
-    - [Error 1]: [How fixed] [User feedback]
+5. Problem Solving:
+   [Description of solved problems and ongoing troubleshooting]
 
-6. Problem Solving:
-   [Description]
-
-7. All User Messages:
+6. All user messages:
     - [Detailed non tool use user message]
     - [...]
+
+7. Pending Tasks:
+    - [Task 1]
+    - [Task 2]
+    - [...]
+
+8. Current Work:
+   [Precise description of current work]
+
+9. Optional Next Step:
+   [Optional Next step to take]
+
+</summary>
 </example>
 
-Output the summary directly using the section headings above. Do not wrap the output in any XML tags or other markup — emit the seven sections as plain text.
+Please provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response.
 
-There may be additional summarization instructions provided in the included context. If so, follow these instructions when creating the above summary. Examples of instructions include:
-<example>
-## Compact Instructions
-When summarizing focus on tool outputs, REPL state, code changes, test results, and recent user feedback/corrections. Include critical code snippets and tool calls verbatim.
-</example>
+There may be additional summarization instructions provided in the included context. If you do, remember to follow those instructions.
 
-<example>
-# Summary instructions
-When using compact mode — prioritize most recent tool results, executed code diffs, and exact user instructions on direction changes.
-</example>
+REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block. Tool calls will be rejected and you will fail the task.

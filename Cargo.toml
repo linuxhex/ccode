@@ -381,6 +381,10 @@ opt-level = 0
 lto = false
 incremental = true
 
+[profile.test]
+inherits = "dev"
+panic = "unwind"
+
 [profile.bench]
 debug = true
 

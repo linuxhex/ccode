@@ -96,9 +96,14 @@ pub enum ReflexAction {
 pub struct ReflexRouter {
     /// 规则库：signal_topic_prefix → 规则列表
     rules: HashMap<String, Vec<ReflexRule>>,
-    /// 已编译的正则：rule_id → regex::Regex
-    #[allow(dead_code)]
+    /// 编译后的正则表达式缓存（rule.id → Regex）
     compiled_patterns: HashMap<String, regex::Regex>,
+}
+
+impl Default for ReflexRouter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReflexRouter {

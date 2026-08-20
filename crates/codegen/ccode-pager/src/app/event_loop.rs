@@ -347,7 +347,7 @@ impl Presenter {
         draw: impl FnOnce(bool),
         queued_after: impl FnOnce() -> u64,
     ) -> bool {
-        if self.in_flight_target.is_some() || !self.dirty {
+        if !self.dirty {
             return false;
         }
         let force_full_repaint = std::mem::take(&mut self.force_full_repaint);
@@ -1770,7 +1770,7 @@ pub(crate) async fn run(
     // case batched (draws stay cadence-throttled regardless), small enough that
     // loop-top work (suspends, deadline re-derivation) never waits on an
     // unbounded drain during a token firehose.
-    const ACP_DRAIN_BATCH_MAX: usize = 32;
+    const ACP_DRAIN_BATCH_MAX: usize = 8;
 
     let mut reconnect_reinit: Option<ReconnectReinit> = None;
     let mut reconnect_abort_handle: Option<tokio::task::AbortHandle> = None;

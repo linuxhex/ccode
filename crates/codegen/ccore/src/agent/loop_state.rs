@@ -216,6 +216,11 @@ impl LoopStateMachine {
         self.task_description = Some(desc);
     }
 
+    /// 获取当前任务描述（供 Reminder 注入使用）
+    pub fn task_description(&self) -> Option<&str> {
+        self.task_description.as_deref()
+    }
+
     /// 记录步骤到轨迹（供 ERL 提取 heuristics）
     pub fn record_step(&mut self, step_type: &str, content: &str) {
         self.collected_steps.push(TrajectoryStep {

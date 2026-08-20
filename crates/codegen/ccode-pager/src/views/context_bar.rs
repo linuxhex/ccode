@@ -222,13 +222,22 @@ pub fn context_bar_line_for_session(
     let breakpoints = default_breakpoints(theme);
     let color = crate::theme::quantize(blend_color(pct, &breakpoints));
 
+    // Show warning icon when context usage exceeds 80% (like opencode)
+    let warning_prefix = if pct >= 80.0 { "⚠ " } else { "" };
+
     if hovered {
         // Bar fills the space the default tokens would occupy, minus the gap
         // and the percentage. `total_width >= min_width` by construction, so
         // this subtraction is safe.
         let bar_width = total_width - min_width;
-        let mut spans =
-            progress_bar_spans(bar_width, pct as f32 / 100.0, color, theme.bg_highlight);
+        let mut spans = Vec::new();
+        if !warning_prefix.is_empty() {
+            spans.push(Span::styled(
+                warning_prefix.to_string(),
+                Style::default().fg(color).bg(theme.bg_base),
+            ));
+        }
+        spans.extend(progress_bar_spans(bar_width, pct as f32 / 100.0, color, theme.bg_highlight));
         spans.push(Span::styled(" ", Style::default().bg(theme.bg_base)));
         spans.push(Span::styled(
             fmt_pct5(pct),
@@ -236,8 +245,9 @@ pub fn context_bar_line_for_session(
         ));
         Some(Line::from(spans))
     } else {
+        let display = format!("{warning_prefix}{token_str}");
         Some(Line::from(Span::styled(
-            token_str,
+            display,
             Style::default().fg(color).bg(theme.bg_base),
         )))
     }

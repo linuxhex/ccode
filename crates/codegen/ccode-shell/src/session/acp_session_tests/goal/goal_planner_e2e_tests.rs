@@ -285,6 +285,7 @@ async fn planner_fork_inherits_parent_model() {
                     ..Default::default()
                 },
                 ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
+                config_cache: std::cell::RefCell::new(None),
                 ..StdArc::try_unwrap(actor).ok().expect("single-owner actor")
             });
             create_test_goal(&actor);

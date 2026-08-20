@@ -306,6 +306,7 @@ async fn create_test_actor_with_memory(
         workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
         trace_config_template: std::cell::RefCell::new(None),
         ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
+        config_cache: std::cell::RefCell::new(None),
     }
 }
 #[tokio::test(flavor = "current_thread")]

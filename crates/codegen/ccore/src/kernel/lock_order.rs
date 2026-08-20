@@ -38,7 +38,7 @@ pub(crate) mod checker {
     use std::cell::RefCell;
     
     thread_local! {
-        static HELD_LOCKS: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+        static HELD_LOCKS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     }
     
     /// 检查锁获取顺序是否合法

@@ -64,13 +64,11 @@ pub struct VerifyAttempt {
 
 /// 自动验证控制器
 pub struct VerifyController {
-    #[allow(dead_code)]
-    max_retries: u32,
 }
 
 impl VerifyController {
-    pub fn new(max_retries: u32) -> Self {
-        Self { max_retries }
+    pub fn new(_max_retries: u32) -> Self {
+        Self { }
     }
 
     /// 执行验证循环：验证 → 失败 → 修 → 再验证（最多 max_retries 次）

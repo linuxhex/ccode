@@ -42,14 +42,6 @@ pub struct TokenBudgetManager {
     context_window: usize,
     /// 已使用的token数
     tokens_used: usize,
-    /// 系统提示占用的token数
-    /// 保留：预算计算需要区分系统/工具/对话 token 占比
-    #[allow(dead_code)]
-    system_prompt_tokens: usize,
-    /// 工具定义占用的token数
-    /// 保留：预算计算需要区分系统/工具/对话 token 占比
-    #[allow(dead_code)]
-    tool_definition_tokens: usize,
     /// 模型上下文窗口缓存
     model_windows: HashMap<String, usize>,
 }
@@ -77,8 +69,6 @@ impl TokenBudgetManager {
             model: model.to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             tokens_used: 0,
-            system_prompt_tokens: 0,
-            tool_definition_tokens: 0,
             model_windows: HashMap::new(),
         };
 
@@ -278,14 +268,14 @@ mod tests {
     fn test_estimate_tokens_english() {
         let tokens = TokenBudgetManager::estimate_tokens("Hello world, this is a test.");
         // ~30 chars / 4 = ~8 tokens
-        assert!(tokens >= 7 && tokens <= 9);
+        assert!((7..=9).contains(&tokens));
     }
 
     #[test]
     fn test_estimate_tokens_cjk() {
         let tokens = TokenBudgetManager::estimate_tokens("你好世界测试");
         // 5 CJK chars / 1.5 = ~4 tokens
-        assert!(tokens >= 3 && tokens <= 5);
+        assert!((3..=5).contains(&tokens));
     }
 
     #[test]

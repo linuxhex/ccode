@@ -434,6 +434,8 @@ pub(crate) async fn spawn_session_actor(
         soft_trim_threshold: session_pruning_config.soft_trim_threshold,
         soft_trim_head: session_pruning_config.soft_trim_head,
         soft_trim_tail: session_pruning_config.soft_trim_tail,
+        soft_clear_age_turns: session_pruning_config.soft_clear_age_turns,
+        soft_clear_summary_chars: session_pruning_config.soft_clear_summary_chars,
         hard_clear_age_turns: session_pruning_config.hard_clear_age_turns,
     };
     let (chat_state_event_tx, chat_state_event_rx) = mpsc::unbounded_channel();
@@ -978,7 +980,7 @@ pub(crate) async fn spawn_session_actor(
     let system_prompt = agent.system_prompt().to_string();
     let mut prompt_context = agent.prompt_context().clone();
     prompt_context.normalize_for_persistence();
-    save_prompt_context(&session_info, &prompt_context);
+    save_prompt_context(&session_info, &prompt_context).await;
     let is_subagent_spawn = startup_hints.is_subagent;
     install_system_prompt(
         &mut conversation,
@@ -1012,9 +1014,9 @@ pub(crate) async fn spawn_session_actor(
         }
     }
     if let Some(ConversationItem::System(sys)) = conversation.first() {
-        save_system_prompt(&session_info, &sys.content);
+        save_system_prompt(&session_info, &sys.content).await;
     } else {
-        save_system_prompt(&session_info, &system_prompt);
+        save_system_prompt(&session_info, &system_prompt).await;
     }
     let initial_prefix_carries_fallback_date = resumed_prefix_carries_fallback_date(
         agent
@@ -1023,7 +1025,7 @@ pub(crate) async fn spawn_session_actor(
             .surfaces_local_date(),
         &conversation,
     );
-    persist_chat_history_jsonl_sync(&session_info, &conversation);
+    persist_chat_history_jsonl_sync(&session_info, &conversation).await;
     chat_state_handle.replace_conversation(conversation);
     let feedback_client = feedback_proxy_url.map(|base_url| {
         let mut client =
@@ -1650,9 +1652,10 @@ pub(crate) async fn spawn_session_actor(
         workspace_ops: workspace_ops.clone(),
         trace_config_template: std::cell::RefCell::new(None),
         ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new(
-            &session_info.id.0.to_string(),
+            session_info.id.0.as_ref(),
             &sampling_config.model,
         )),
+        config_cache: std::cell::RefCell::new(None),
     });
     if goal_was_restored {
         let current_tokens = session.chat_state_handle.get_total_tokens().await as i64;

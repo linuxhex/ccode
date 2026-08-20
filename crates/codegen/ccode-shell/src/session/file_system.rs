@@ -108,23 +108,35 @@ pub async fn list(
     params: &FsListParams,
     confine_to_canonical_root: Option<PathBuf>,
 ) -> Result<FsListData> {
-    // Confined to the canonical root when set (escaping symlinks not enumerated);
-    // `None` (the default) walks unconfined.
-    let page = wfs::list_directory_paged(
-        abs_path,
-        wfs::ListOptions {
-            depth: params.depth,
-            follow_symlinks: params.follow_symlinks,
-            respect_git_ignore: params.respect_git_ignore,
-            include_hidden: params.include_hidden,
-            include_globs: &params.include_globs,
-            exclude_globs: &params.exclude_globs,
-            offset: params.offset,
-            limit: params.limit,
-            confine_to_canonical_root,
-        },
-        wfs::MAX_LIST_COLLECT,
-    );
+    let abs_path = abs_path.to_path_buf();
+    let depth = params.depth;
+    let follow_symlinks = params.follow_symlinks;
+    let respect_git_ignore = params.respect_git_ignore;
+    let include_hidden = params.include_hidden;
+    let include_globs = params.include_globs.clone();
+    let exclude_globs = params.exclude_globs.clone();
+    let offset = params.offset;
+    let limit = params.limit;
+
+    let page = tokio::task::spawn_blocking(move || {
+        wfs::list_directory_paged(
+            &abs_path,
+            wfs::ListOptions {
+                depth,
+                follow_symlinks,
+                respect_git_ignore,
+                include_hidden,
+                include_globs: &include_globs,
+                exclude_globs: &exclude_globs,
+                offset,
+                limit,
+                confine_to_canonical_root,
+            },
+            wfs::MAX_LIST_COLLECT,
+        )
+    })
+    .await
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     let nodes: Vec<FsListNode> = page
         .entries

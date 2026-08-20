@@ -54,6 +54,8 @@ pub struct NodeLauncher {
     episodic_memory: std::sync::Arc<crate::memory::episodic::EpisodicMemoryStore>,
     /// HookDispatcher 桥接（可选，由产品层注入 ccode-hooks 适配器）
     hook_dispatcher: Option<Arc<dyn HookDispatcher>>,
+    /// Skills 数量（用于 Thinker 系统提示构建）
+    skills_count: usize,
     /// 已启动的 Node 描述
     launched_nodes: Vec<NodeDescriptor>,
     /// 已启动的 Node 任务 JoinHandle（用于优雅关闭）
@@ -71,6 +73,7 @@ impl NodeLauncher {
             runtime_config,
             episodic_memory,
             hook_dispatcher: None,
+            skills_count: 0,
             launched_nodes: Vec::new(),
             task_handles: Vec::new(),
         }
@@ -79,6 +82,16 @@ impl NodeLauncher {
     /// 设置 HookDispatcher（由产品层注入 ccode-hooks 适配器）
     pub fn set_hook_dispatcher(&mut self, dispatcher: Arc<dyn HookDispatcher>) {
         self.hook_dispatcher = Some(dispatcher);
+    }
+
+    /// 设置 Skills 数量（用于 Thinker 系统提示构建）
+    pub fn set_skills_count(&mut self, count: usize) {
+        self.skills_count = count;
+    }
+
+    /// 取出已启动的 Node 任务 JoinHandle（转移所有权）
+    pub fn take_task_handles(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut self.task_handles)
     }
 
     /// 获取 NodeContext（供各 Node 连接消息总线）

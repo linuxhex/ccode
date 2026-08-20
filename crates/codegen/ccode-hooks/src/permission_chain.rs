@@ -90,8 +90,8 @@ pub fn pre_filter(tool_name: &str, input: &serde_json::Value) -> Option<Permissi
     ];
 
     // 检查危险 shell 命令
-    if tool_name == "Bash" || tool_name == "Shell" {
-        if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+    if (tool_name == "Bash" || tool_name == "Shell")
+        && let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
             let cmd_lower = cmd.to_lowercase();
             for dangerous in &dangerous_commands {
                 if cmd_lower.contains(dangerous) {
@@ -109,15 +109,13 @@ pub fn pre_filter(tool_name: &str, input: &serde_json::Value) -> Option<Permissi
                 }
             }
         }
-    }
 
     // 检查敏感文件写入
-    if tool_name == "FileWrite"
+    if (tool_name == "FileWrite"
         || tool_name == "Write"
         || tool_name == "FileEdit"
-        || tool_name == "Edit"
-    {
-        if let Some(path) = input
+        || tool_name == "Edit")
+        && let Some(path) = input
             .get("file_path")
             .or_else(|| input.get("path"))
             .and_then(|v| v.as_str())
@@ -139,7 +137,6 @@ pub fn pre_filter(tool_name: &str, input: &serde_json::Value) -> Option<Permissi
                 }
             }
         }
-    }
 
     None
 }

@@ -493,21 +493,26 @@ pub fn render_turn_status(
                 left_spans.push(Span::styled(prefix, Style::default().fg(theme.gray)));
                 left_spans.push(Span::styled(display, Style::default().fg(theme.command)));
             } else {
-                // Normal tool: "Run " (muted) + command (syntax-highlighted).
-                // For qualified MCP tool names the activity title is the
-                // raw `server__action` string from ACP; prettify it to
-                // `(Server) Action` so the spinner doesn't show the ugly
-                // delimiter form. Non-MCP titles (bash commands etc.) are
-                // returned untouched by `mcp_pretty_name_if_qualified`.
-                let prefix = "Run ";
-                let pretty = mcp_pretty_name_if_qualified(title.as_str());
-                let detail = pretty.as_str();
-                let prefix_width = prefix.width();
-                let max_cmd = available_for_label.saturating_sub(prefix_width).max(5);
-                let first_line = detail.lines().next().unwrap_or(detail);
-                let display = truncate_str(first_line, max_cmd);
-                left_spans.push(Span::styled(prefix, Style::default().fg(theme.gray)));
-                left_spans.extend(crate::views::tasks_pane::highlight_bash_command(&display));
+                // Contextual tool action: "Reading path", "Searching query", etc.
+                // Falls back to "Run command" for unrecognized tools.
+                let (prefix, detail, use_cmd_color) = tool_action_prefix(title.as_str());
+                let pretty_detail = if title.contains("__") {
+                    mcp_pretty_name_if_qualified(detail)
+                } else {
+                    detail.to_string()
+                };
+                let prefix_with_space = format!("{prefix} ");
+                let prefix_width = prefix_with_space.width();
+                let max_detail = available_for_label.saturating_sub(prefix_width).max(5);
+                let first_line = pretty_detail.lines().next().unwrap_or(&pretty_detail);
+                let display = truncate_str(first_line, max_detail);
+                let prefix_style = Style::default().fg(theme.gray);
+                left_spans.push(Span::styled(prefix_with_space, prefix_style));
+                if use_cmd_color {
+                    left_spans.extend(crate::views::tasks_pane::highlight_bash_command(&display));
+                } else {
+                    left_spans.push(Span::styled(display, Style::default().fg(theme.text_secondary)));
+                }
             }
         }
     } else {
@@ -539,6 +544,23 @@ pub fn render_turn_status(
     // Phase timer (gray, never truncates)
     if !phase_timer_str.is_empty() {
         left_spans.push(Span::styled(phase_timer_str, timer_style));
+    }
+
+    // Show "connecting to model…" hint when the turn has been running for a
+    // while without any model response — the user needs to know the agent is
+    // working, not frozen. Only show when activity is Thinking (no model
+    // response yet) and elapsed time exceeds the threshold.
+    let show_connecting_hint = matches!(activity, Some(TurnActivity::Thinking) | None)
+        && turn_elapsed.is_some_and(|d| d.as_secs() >= 3)
+        && !is_tool;
+    if show_connecting_hint {
+        let elapsed_secs = turn_elapsed.unwrap().as_secs();
+        let hint = if elapsed_secs >= 10 {
+            " (still connecting… check network)"
+        } else {
+            " (connecting to model…)"
+        };
+        left_spans.push(Span::styled(hint, Style::default().fg(theme.gray)));
     }
 
     // After the phase timer, so the elapsed time reads as the wait's, not the hint's.
@@ -638,7 +660,7 @@ fn compute_activity(
         ),
         (AgentState::TurnRunning, Some(TurnActivity::Responding)) => (
             Style::default().fg(theme.text_secondary),
-            "Responding…".to_string(),
+            "Generating…".to_string(),
             false,
         ),
         (AgentState::TurnRunning, Some(TurnActivity::ToolRunning { title, description })) => {
@@ -684,11 +706,10 @@ fn compute_activity(
             false,
         ),
         (AgentState::TurnRunning, None) => (
-            // Fallback: a running inference turn with no resolved activity. The
-            // view resolves this gap into Waiting(Model/Subagent) before render,
-            // so this is now a rarely-hit safety net.
+            // Immediate feedback after Enter: show "Thinking…" so the user
+            // knows the agent is working, even before the model API responds.
             Style::default().fg(theme.text_secondary),
-            "Waiting…".to_string(),
+            "Thinking…".to_string(),
             false,
         ),
         (
@@ -713,6 +734,54 @@ fn compute_activity(
         ),
         (AgentState::Idle, _) => (Style::default(), String::new(), false),
     }
+}
+
+/// Map a tool title/name to a contextual action prefix for the status line.
+///
+/// Returns `(prefix, detail, use_command_color)` where:
+/// - `prefix` is the muted action verb (e.g. "Reading", "Searching")
+/// - `detail` is the highlighted target (e.g. file path, query)
+/// - `use_command_color` selects between command-yellow and text-secondary
+///
+/// Falls back to `("Run", title, true)` for unrecognized tools.
+fn tool_action_prefix(title: &str) -> (&'static str, &str, bool) {
+    // File-path patterns: /foo/bar.rs, ./relative, ~/home
+    let is_path = title.starts_with('/')
+        || title.starts_with("./")
+        || title.starts_with("~/")
+        || title.starts_with("../");
+
+    // Read / View tools
+    if title.contains("read") || title.contains("view") || title.contains("cat") {
+        let detail = if is_path { title } else { title };
+        return ("Reading", detail, false);
+    }
+    // Edit / Write / Create tools
+    if title.contains("edit") || title.contains("write") || title.contains("create") || title.contains("patch") {
+        return ("Writing", title, false);
+    }
+    // Search / Grep tools
+    if title.contains("grep") || title.contains("search") || title.contains("find") || title.contains("rg") {
+        return ("Searching", title, false);
+    }
+    // Glob / file listing
+    if title.contains("glob") || title.contains("list") || title.contains("ls") {
+        return ("Listing", title, false);
+    }
+    // Agent / Task delegation
+    if title.contains("agent") || title.contains("task") || title.contains("subagent") {
+        return ("Running agent", title, false);
+    }
+    // Fetch / HTTP
+    if title.starts_with("http://") || title.starts_with("https://") {
+        return ("Fetching", title, false);
+    }
+    // MCP qualified names: server__action → show action
+    if title.contains("__") {
+        return ("Run", title, true);
+    }
+    // Default: command execution
+    ("Run", title, true)
 }
 
 /// Whether the idle "Starting session…" indicator wants the turn-status row.

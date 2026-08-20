@@ -649,6 +649,7 @@ async fn drive_l2(
                         SamplingEvent::FirstToken { .. }
                             | SamplingEvent::ChannelToken { .. }
                             | SamplingEvent::ToolCallDelta { .. }
+                            | SamplingEvent::ToolCallReady { .. }
                             | SamplingEvent::BackendToolCallStarted { .. }
                             | SamplingEvent::BackendToolCallCompleted { .. }
                     ) {

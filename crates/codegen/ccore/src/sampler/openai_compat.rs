@@ -49,7 +49,10 @@ pub struct OpenAICompatProvider {
 impl OpenAICompatProvider {
     pub fn new(config: OpenAICompatConfig) -> Self {
         let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(300))
+            .pool_idle_timeout(std::time::Duration::from_secs(600))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { config, client }
@@ -527,6 +530,20 @@ impl Provider for OpenAICompatProvider {
 
     fn name(&self) -> &str {
         &self.config.name
+    }
+
+    async fn warm_up(&self) -> Result<()> {
+        let url = self.chat_url();
+        tracing::info!("预热 Provider {} 连接：{}", self.config.name, url);
+        match self.client.head(&url).send().await {
+            Ok(resp) => {
+                tracing::info!("Provider {} 连接预热完成，status={}", self.config.name, resp.status());
+            }
+            Err(e) => {
+                tracing::warn!("Provider {} 连接预热失败（非致命）：{}", self.config.name, e);
+            }
+        }
+        Ok(())
     }
 }
 

@@ -84,6 +84,12 @@ pub struct MetaCognitiveController {
     strategy_effectiveness: RwLock<HashMap<String, f64>>,
 }
 
+impl Default for MetaCognitiveController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetaCognitiveController {
     pub fn new() -> Self {
         Self {

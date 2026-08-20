@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio::task::JoinSet;
 
 use crate::message::frame::FrameCodec;
 use crate::message::payloads::{PermissionRequest, PermissionResponse};
@@ -48,12 +49,12 @@ const DEFAULT_MAX_CONCURRENT_TOOLS: usize = 20;
 /// Tool Node 实现
 pub struct ToolNode {
     id: NodeId,
-    /// 工具桥接器
-    bridge: ToolBridge,
+    /// 工具桥接器（Arc 包裹，便于在并发任务中共享）
+    bridge: Arc<ToolBridge>,
     /// 全局权限模式
     permission_mode: PermissionMode,
-    /// 并发限流信号量（对应 ANS 的 tool_semaphore）
-    concurrency_semaphore: Semaphore,
+    /// 并发限流信号量（对应 ANS 的 tool_semaphore，Arc 包裹以支持并发任务获取许可）
+    concurrency_semaphore: Arc<Semaphore>,
     /// 待处理的权限请求（tool_call_id → oneshot sender）
     pending_permissions: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// Hook 桥接 dispatcher（解耦 ccode-hooks 的 trait object，默认 NoOp）
@@ -64,20 +65,23 @@ pub struct ToolNode {
     permission_rules: Option<ccode_hooks::permission_rules::PermissionRuleSet>,
     /// 是否启用 Auto Mode（ML 分类器自动审批）
     auto_mode: bool,
+    /// 只读工具并发执行任务集（借鉴 Claude Code 只读工具并发机制）
+    read_only_tasks: JoinSet<()>,
 }
 
 impl ToolNode {
     pub fn new(id: NodeId) -> Self {
         Self {
             id,
-            bridge: ToolBridge::new(),
+            bridge: Arc::new(ToolBridge::new()),
             permission_mode: PermissionMode::Trust,
-            concurrency_semaphore: Semaphore::new(DEFAULT_MAX_CONCURRENT_TOOLS),
+            concurrency_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_TOOLS)),
             pending_permissions: Mutex::new(HashMap::new()),
             hook_dispatcher: Arc::new(NoOpHookDispatcher),
             hook_registry: None,
             permission_rules: None,
             auto_mode: false,
+            read_only_tasks: JoinSet::new(),
         }
     }
 
@@ -149,6 +153,68 @@ impl ToolNode {
         Ok(())
     }
 
+    /// 判断工具是否可并发执行（只读 + 无需用户确认）
+    ///
+    /// 借鉴 Claude Code 的并发策略：只读工具（read/grep/glob 等）可并发执行，
+    /// 写操作工具串行执行以保证状态一致性。
+    fn can_spawn_concurrent(&self, tool_name: &str) -> bool {
+        self.bridge
+            .get_entry(tool_name)
+            .is_some_and(|entry| entry.read_only && !self.bridge.needs_confirmation(tool_name, self.permission_mode))
+    }
+
+    /// 在后台任务中执行只读工具调用
+    ///
+    /// 只读工具不修改状态，可安全并发。执行完成后通过消息总线返回结果。
+    /// 并发受 Semaphore(DEFAULT_MAX_CONCURRENT_TOOLS) 限制，防止过载。
+    fn spawn_read_only_tool(
+        &mut self,
+        request: ToolCallRequest,
+        transport: NodeTransportHandle,
+        semaphore: Arc<Semaphore>,
+    ) {
+        let bridge = self.bridge.clone();
+        let node_id = self.id.clone();
+
+        self.read_only_tasks.spawn(async move {
+            // 在任务内获取信号量许可，限制并发只读工具数量
+            let _permit = match semaphore.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tracing::warn!("信号量已关闭，跳过只读工具：tool={}", request.tool_name);
+                    return;
+                }
+            };
+
+            tracing::debug!(
+                "并发执行只读工具：tool={}, tool_call_id={}",
+                request.tool_name, request.tool_call_id
+            );
+
+            let result = bridge.execute(&request).await;
+
+            let tool_result_msg = FrameCodec::new_message(
+                Topic::agent_tool_result(&request.agent_id),
+                node_id.as_str(),
+                &result,
+            );
+
+            if let Ok(msg) = tool_result_msg {
+                if let Err(e) = transport.send_message(&msg).await {
+                    tracing::warn!(
+                        "并发只读工具结果发送失败：tool={}, error={}",
+                        request.tool_name, e
+                    );
+                }
+            }
+
+            tracing::debug!(
+                "并发只读工具完成：tool={}, success={}, duration={}ms",
+                request.tool_name, result.success, result.duration_ms
+            );
+        });
+    }
+
     /// 处理工具调用请求，通过消息总线返回结果
     ///
     /// 完整权限链路：PreToolUse Hook → 权限规则引擎 → 简单权限模式 → 执行 → PostToolUse Hook
@@ -157,7 +223,20 @@ impl ToolNode {
         request: ToolCallRequest,
         transport: &NodeTransportHandle,
     ) -> anyhow::Result<()> {
-        // 并发限流：获取信号量许可
+        // ── 只读工具并发快速路径（借鉴 Claude Code 并发策略）──
+        // 只读工具不修改状态，可安全并发执行，跳过信号量和内联执行路径。
+        // 信号量许可在 spawned 任务内部获取，避免此处浪费许可。
+        if self.can_spawn_concurrent(&request.tool_name) {
+            tracing::info!(
+                "只读工具并发执行：tool={}, tool_call_id={}",
+                request.tool_name, request.tool_call_id
+            );
+            let sem = self.concurrency_semaphore.clone();
+            self.spawn_read_only_tool(request, transport.clone(), sem);
+            return Ok(());
+        }
+
+        // 并发限流：获取信号量许可（写操作工具串行执行）
         let _permit = match self.concurrency_semaphore.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
@@ -197,9 +276,7 @@ impl ToolNode {
                             "duration_ms": 0,
                         }),
                     )?;
-                    if let Err(_) = transport.publish_data(&result_msg).await {
-                        transport.send_message(&result_msg).await?;
-                    }
+                    transport.send_message(&result_msg).await?;
                     return Ok(());
                 }
                 HookDecision::Rewrite { updated_input, additional_context } => {
@@ -280,9 +357,7 @@ impl ToolNode {
                             "duration_ms": 0,
                         }),
                     )?;
-                    if let Err(_) = transport.publish_data(&result_msg).await {
-                        transport.send_message(&result_msg).await?;
-                    }
+                    transport.send_message(&result_msg).await?;
                     return Ok(());
                 }
                 ccode_hooks::result::HookDecision::Allow => {}
@@ -307,9 +382,7 @@ impl ToolNode {
                                 "alternatives": chain.alternatives,
                             }),
                         )?;
-                        if let Err(_) = transport.publish_data(&result_msg).await {
-                            transport.send_message(&result_msg).await?;
-                        }
+                        transport.send_message(&result_msg).await?;
                         return Ok(());
                     }
                     ccode_hooks::permission_rules::PermissionDecision::Allow => {
@@ -338,10 +411,7 @@ impl ToolNode {
                         self.id.as_str(),
                         &perm_req,
                     )?;
-                    if let Err(e) = transport.publish_data(&perm_msg).await {
-                        tracing::warn!("data-plane publish failed: {}, falling back", e);
-                        transport.send_message(&perm_msg).await?;
-                    }
+                    transport.send_message(&perm_msg).await?;
 
                     let allowed = self.wait_permission(&request.tool_call_id).await?;
                     if !allowed {
@@ -356,9 +426,7 @@ impl ToolNode {
                                 "duration_ms": 0,
                             }),
                         )?;
-                        if let Err(_) = transport.publish_data(&result_msg).await {
-                            transport.send_message(&result_msg).await?;
-                        }
+                        transport.send_message(&result_msg).await?;
                         return Ok(());
                     }
                 }
@@ -383,9 +451,7 @@ impl ToolNode {
                             "duration_ms": 0,
                         }),
                     )?;
-                    if let Err(_) = transport.publish_data(&result_msg).await {
-                        transport.send_message(&result_msg).await?;
-                    }
+                    transport.send_message(&result_msg).await?;
                     return Ok(());
                 }
             }
@@ -403,6 +469,11 @@ impl ToolNode {
             let agent_type = effective_request.arguments["agent_type"].as_str().unwrap_or("general-purpose");
             let task_description = effective_request.arguments["description"].as_str().unwrap_or("");
             let model = effective_request.arguments["model"].as_str(); // 可选模型覆盖
+
+            tracing::info!(
+                "ToolNode 执行 task 工具：agent_id={}, tool_call_id={}, task={}",
+                effective_request.agent_id, effective_request.tool_call_id, task_description
+            );
 
             let mut spawn_payload = serde_json::json!({
                 "agent_type": agent_type,
@@ -512,15 +583,20 @@ impl ToolNode {
             ).await;
         }
 
-        // 将结果封装为消息，优先通过数据面 PUB 发送
+        // 将结果封装为消息，通过控制面发送
+        // 注意：topic 含通配符（agent/*/tool_result），数据面 PUB/SUB 直连会过滤掉通配符 topic，
+        // 必须走控制面（Kernel ROUTER 路由），否则 Thinker 永远收不到 tool_result
         let tool_result_msg = FrameCodec::new_message(
             Topic::agent_tool_result(&effective_request.agent_id),
             self.id.as_str(),
             &result,
         )?;
-        if let Err(_) = transport.publish_data(&tool_result_msg).await {
-            transport.send_message(&tool_result_msg).await?;
-        }
+        tracing::info!(
+            "ToolNode 发送 tool_result：target_agent={}, tool_call_id={}, success={}, payload_len={}, payload_bytes={:?}",
+            effective_request.agent_id, result.tool_call_id, result.success,
+            tool_result_msg.payload.len(), &tool_result_msg.payload[..std::cmp::min(100, tool_result_msg.payload.len())]
+        );
+        transport.send_message(&tool_result_msg).await?;
 
         tracing::debug!(
             "工具执行完成：tool_call_id={}, success={}, duration={}ms",
@@ -607,7 +683,12 @@ impl Node for ToolNode {
     }
 
     async fn stop(&mut self) -> anyhow::Result<()> {
-        tracing::info!("Tool Node 关闭：{}", self.id);
+        tracing::info!(
+            "Tool Node 关闭：{} (中止 {} 个并发只读任务)",
+            self.id,
+            self.read_only_tasks.len()
+        );
+        self.read_only_tasks.abort_all();
         Ok(())
     }
 }
@@ -659,5 +740,38 @@ mod tests {
         assert!(result.is_err(), "should timeout when no response");
         // pending 中条目仍在（超时后应清理）
         assert!(pending.contains_key("tc-3"));
+    }
+
+    #[test]
+    fn can_spawn_concurrent_read_only_tools() {
+        let node = super::ToolNode::new(crate::node::NodeId::new());
+        // Trust 模式下只读工具可并发（无需确认）
+        assert!(node.can_spawn_concurrent("read_file"), "read_file 是只读工具，应可并发");
+        assert!(node.can_spawn_concurrent("grep"), "grep 是只读工具，应可并发");
+        assert!(node.can_spawn_concurrent("list_dir"), "list_dir 是只读工具，应可并发");
+    }
+
+    #[test]
+    fn cannot_spawn_concurrent_write_tools() {
+        let node = super::ToolNode::new(crate::node::NodeId::new());
+        // 写操作工具不可并发
+        assert!(!node.can_spawn_concurrent("bash"), "bash 是写操作工具，不可并发");
+        assert!(!node.can_spawn_concurrent("write_file"), "write_file 是写操作工具，不可并发");
+        assert!(!node.can_spawn_concurrent("search_replace"), "search_replace 是写操作工具，不可并发");
+    }
+
+    #[test]
+    fn cannot_spawn_concurrent_unknown_tool() {
+        let node = super::ToolNode::new(crate::node::NodeId::new());
+        assert!(!node.can_spawn_concurrent("nonexistent"), "未知工具不可并发");
+    }
+
+    #[test]
+    fn can_spawn_concurrent_ask_mode_blocks_all() {
+        let mut node = super::ToolNode::new(crate::node::NodeId::new());
+        // Ask 模式下所有工具都需要确认，包括只读工具
+        node.set_permission_mode(crate::node::PermissionMode::Ask);
+        assert!(!node.can_spawn_concurrent("read_file"), "Ask 模式下只读工具也需要确认，不可并发");
+        assert!(!node.can_spawn_concurrent("grep"), "Ask 模式下 grep 也需要确认，不可并发");
     }
 }

@@ -9,7 +9,7 @@
 //! 1. 快速路径：经验日志关键词匹配（零延迟，适用于明显成功/失败的场景）
 //! 2. LLM 评估：异步发送给 SamplerNode，由 LLM 判断（适用于模糊场景）
 //!    —— SamplerNode 识别请求的 `goal_verify: true` 标志，流式收集完整响应后
-//!       解析 JSON 并将结果发到 cortex/goal_verify_result，闭环验证流程。
+//!    解析 JSON 并将结果发到 cortex/goal_verify_result，闭环验证流程。
 
 use serde::{Deserialize, Serialize};
 

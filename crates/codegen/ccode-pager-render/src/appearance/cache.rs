@@ -352,6 +352,26 @@ pub fn set_collapsed_edit_blocks(enabled: bool) {
     COLLAPSED_EDIT_BLOCKS_LOADED.with(|l| l.set(true));
 }
 
+// -- Side-by-side diff layout ------------------------------------------------
+
+thread_local! {
+    static DIFF_LAYOUT_SIDE_BY_SIDE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Read the runtime side-by-side diff layout toggle.
+pub fn load_diff_layout_side_by_side() -> bool {
+    DIFF_LAYOUT_SIDE_BY_SIDE.with(|c| c.get())
+}
+
+/// Toggle the runtime side-by-side diff layout. Returns the new value.
+pub fn toggle_diff_layout_side_by_side() -> bool {
+    DIFF_LAYOUT_SIDE_BY_SIDE.with(|c| {
+        let new = !c.get();
+        c.set(new);
+        new
+    })
+}
+
 // -- Prompt suggestions (tab autocomplete) -----------------------------------
 
 thread_local! {

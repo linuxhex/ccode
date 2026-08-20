@@ -149,6 +149,9 @@ pub struct BlockViewerPane {
     pub copy_meta_pending: bool,
     /// Set by handle_key when 'y' is pressed on edit blocks. Caller should copy patch.
     pub copy_content_pending: bool,
+    /// Set by handle_key when 'd' is pressed on edit blocks. Caller should toggle
+    /// the diff layout (unified ↔ side-by-side) and rebuild items.
+    pub diff_layout_toggle_pending: bool,
     /// Per-item diff metadata for edit viewer (parallel to `items`).
     /// `None` entries are separator lines between hunks.
     diff_meta: Vec<Option<DiffLineMeta>>,
@@ -267,6 +270,7 @@ impl BlockViewerPane {
             raw_toggle_pending: false,
             copy_meta_pending: false,
             copy_content_pending: false,
+            diff_layout_toggle_pending: false,
             diff_meta: Vec::new(),
             last_generation: generation,
             was_running: entry.is_running,
@@ -321,6 +325,7 @@ impl BlockViewerPane {
             raw_toggle_pending: false,
             copy_meta_pending: false,
             copy_content_pending: false,
+            diff_layout_toggle_pending: false,
             diff_meta: Vec::new(),
             last_generation: last_output_len as u64, // reuse generation field for output length
             was_running: entry.is_running,
@@ -374,6 +379,7 @@ impl BlockViewerPane {
             raw_toggle_pending: false,
             copy_meta_pending: false,
             copy_content_pending: false,
+            diff_layout_toggle_pending: false,
             diff_meta: Vec::new(),
             last_generation: 0,
             was_running: false,
@@ -695,6 +701,7 @@ impl BlockViewerPane {
             raw_toggle_pending: false,
             copy_meta_pending: false,
             copy_content_pending: false,
+            diff_layout_toggle_pending: false,
             diff_meta: Vec::new(),
             last_generation: stdout.len() as u64,
             was_running: is_running,
@@ -764,6 +771,7 @@ impl BlockViewerPane {
             raw_toggle_pending: false,
             copy_meta_pending: false,
             copy_content_pending: false,
+            diff_layout_toggle_pending: false,
             diff_meta: Vec::new(),
             last_generation: 0,
             was_running: false,
@@ -863,6 +871,7 @@ impl BlockViewerPane {
             raw_toggle_pending: false,
             copy_meta_pending: false,
             copy_content_pending: false,
+            diff_layout_toggle_pending: false,
             diff_meta,
             last_generation: 0,
             was_running: false,
@@ -1067,6 +1076,7 @@ impl BlockViewerPane {
             }
             ViewerKind::Edit => {
                 hints.push(HintItem::new(crate::key!('Y'), "copy path"));
+                hints.push(HintItem::new(crate::key!('d'), "diff layout"));
             }
             ViewerKind::WebFetch => {
                 hints.push(HintItem::new(crate::key!('Y'), "copy url"));
@@ -1145,6 +1155,16 @@ impl BlockViewerPane {
             && self.list_state.input_mode().is_none()
         {
             self.copy_content_pending = true;
+            return true;
+        }
+
+        // d: toggle diff layout (edit blocks) — unified ↔ side-by-side
+        if self.kind == ViewerKind::Edit
+            && key.code == KeyCode::Char('d')
+            && key.modifiers == KeyModifiers::NONE
+            && self.list_state.input_mode().is_none()
+        {
+            self.diff_layout_toggle_pending = true;
             return true;
         }
 

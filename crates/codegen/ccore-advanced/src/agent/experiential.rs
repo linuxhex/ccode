@@ -260,10 +260,10 @@ impl ExperientialReflectiveLearner {
         scored
             .into_iter()
             .take(top_k)
-            .filter_map(|(i, score)| {
+            .map(|(i, score)| {
                 let mut h = pool[i].clone();
                 h.relevance_score = score;
-                Some(h)
+                h
             })
             .collect()
     }

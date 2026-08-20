@@ -325,6 +325,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),
                 ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
+                config_cache: std::cell::RefCell::new(None),
             };
             let eleven_minutes_ago_ms = chrono::Utc::now().timestamp_millis() - (11 * 60 * 1000);
             actor

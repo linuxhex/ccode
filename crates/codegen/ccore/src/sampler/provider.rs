@@ -98,7 +98,7 @@ pub struct ChatMessage {
     /// API 侧 prompt cache 断点标记（类似 Claude Code cache_edits）
     /// 插入在 system prompt 末尾和最近 N 轮对话之前，
     /// 让 API 复用已计算的前缀 KV cache
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cache_control: Option<CacheControl>,
 }
 
@@ -175,6 +175,11 @@ pub trait Provider: Send + Sync {
 
     /// Provider 名称
     fn name(&self) -> &str;
+
+    /// 预热连接（默认空实现，各 Provider 可覆盖以预建 HTTP 连接）
+    async fn warm_up(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// 工具选择策略

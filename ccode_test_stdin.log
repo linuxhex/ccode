@@ -1,0 +1,163 @@
+spawn env CCODE_LOG_STDERR=1 CCODE_LOG=info,ccore::node::tui=trace /Users/caomunian/Study/ccode/target/debug/ccode
+[2m2026-08-11T07:39:51.290684Z[0m [32m INFO[0m [2mccode[0m[2m:[0m [ccode] Synced from Claude Code: model=glm-5.2
+[2m2026-08-11T07:39:51.296939Z[0m [33m WARN[0m [2mccore::kernel[0m[2m:[0m ConfigWatcher 创建失败，跳过配置热更新：No path was found. about ["./config.toml"]
+[2m2026-08-11T07:39:51.297405Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m Kernel 启动：router=ipc:///tmp/ccode-router-1211, pub=ipc:///tmp/ccode-pub-1211, working_dir=.
+[2m2026-08-11T07:39:51.300405Z[0m [32m INFO[0m [2mccore::kernel::transport[0m[2m:[0m ROUTER socket 已绑定：ipc:///tmp/ccode-router-1211
+[2m2026-08-11T07:39:51.300590Z[0m [32m INFO[0m [2mccore::kernel::transport[0m[2m:[0m PUB socket 已绑定：ipc:///tmp/ccode-pub-1211
+[2m2026-08-11T07:39:51.300723Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m AutonomicNervousSystem 自主循环已启动（间隔 10 秒）
+[2m2026-08-11T07:39:51.530756Z[0m [32m INFO[0m [2mccore::sampler::router[0m[2m:[0m Provider 路由器初始化完成：2 个 Provider
+[2m2026-08-11T07:40:03.715519Z[0m [32m INFO[0m [2mccode_hooks::discovery[0m[2m:[0m hooks: discovery complete [3mtotal_hooks[0m[2m=[0m0 [3msession_start[0m[2m=[0m0 [3mpre_tool[0m[2m=[0m0 [3mpost_tool[0m[2m=[0m0 [3msession_end[0m[2m=[0m0 [3mstop[0m[2m=[0m0 [3mnotification[0m[2m=[0m0 [3muser_prompt_submit[0m[2m=[0m0 [3msubagent_start[0m[2m=[0m0 [3msubagent_stop[0m[2m=[0m0
+[2m2026-08-11T07:40:03.751750Z[0m [32m INFO[0m [2mccore::kernel::launcher[0m[2m:[0m 仿生架构（路线 A）+ ACP 融合初始 Node 集合启动完成（共 6 个）
+[2m2026-08-11T07:40:03.751803Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m 初始 Node 集合启动完成：6 个
+[2m2026-08-11T07:40:03.751989Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m node started [3mnode[0m[2m=[0msampler-primary [3mduration_ms[0m[2m=[0m0
+[2m2026-08-11T07:40:03.752002Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m node started [3mnode[0m[2m=[0mstate-primary [3mduration_ms[0m[2m=[0m0
+[2m2026-08-11T07:40:03.752010Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m node started [3mnode[0m[2m=[0mtool-primary [3mduration_ms[0m[2m=[0m0
+[2m2026-08-11T07:40:03.752015Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m node started [3mnode[0m[2m=[0mthinker-primary [3mduration_ms[0m[2m=[0m0
+[2m2026-08-11T07:40:03.752020Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m node started [3mnode[0m[2m=[0mtui-primary [3mduration_ms[0m[2m=[0m0
+[2m2026-08-11T07:40:03.752025Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m node started [3mnode[0m[2m=[0macp-primary [3mduration_ms[0m[2m=[0m0
+[2m2026-08-11T07:40:03.752628Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m DEALER socket 已连接：ipc:///tmp/ccode-router-1211
+[2m2026-08-11T07:40:03.752649Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m DEALER socket 已连接：ipc:///tmp/ccode-router-1211
+[2m2026-08-11T07:40:03.752629Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m DEALER socket 已连接：ipc:///tmp/ccode-router-1211
+[2m2026-08-11T07:40:03.752639Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m DEALER socket 已连接：ipc:///tmp/ccode-router-1211
+[2m2026-08-11T07:40:03.752639Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m DEALER socket 已连接：ipc:///tmp/ccode-router-1211
+[2m2026-08-11T07:40:03.752795Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m DEALER socket 已连接：ipc:///tmp/ccode-router-1211
+[2m2026-08-11T07:40:03.753025Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m SUB socket 已连接：ipc:///tmp/ccode-pub-1211 (订阅 4 个前缀)
+[2m2026-08-11T07:40:03.753033Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m SUB socket 已连接：ipc:///tmp/ccode-pub-1211 (订阅 5 个前缀)
+[2m2026-08-11T07:40:03.753035Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m SUB socket 已连接：ipc:///tmp/ccode-pub-1211 (订阅 3 个前缀)
+[2m2026-08-11T07:40:03.753041Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 将绑定到：ipc:///tmp/ccode-pub-58d83954-244b-41f7-9e80-592f9641e52f
+[2m2026-08-11T07:40:03.753048Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 将绑定到：ipc:///tmp/ccode-pub-110f49d8-26db-4748-abe8-cbdaa9085462
+[2m2026-08-11T07:40:03.753085Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m SUB socket 已连接：ipc:///tmp/ccode-pub-1211 (订阅 6 个前缀)
+[2m2026-08-11T07:40:03.753093Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 将绑定到：ipc:///tmp/ccode-pub-61c4213d-9f33-47f2-89e2-b958c73ba54d
+[2m2026-08-11T07:40:03.753161Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m SUB socket 已连接：ipc:///tmp/ccode-pub-1211 (订阅 4 个前缀)
+[2m2026-08-11T07:40:03.753200Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m SUB socket 已连接：ipc:///tmp/ccode-pub-1211 (订阅 16 个前缀)
+[2m2026-08-11T07:40:03.753351Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 将绑定到：ipc:///tmp/ccode-pub-a1e83eda-ad81-4b11-b8d0-dbc3e7cd55be
+[2m2026-08-11T07:40:03.753245Z[0m [32m INFO[0m [2mccore::node::acp[0m[2m:[0m AcpNode started (stdio JSON-RPC mode) [3mnode_id[0m[2m=[0m26b0d66d-e1a9-4694-8520-b36c17b30dde [3magent[0m[2m=[0m82209fb9-8ed5-45a2-9a85-83077031bd13
+[2m2026-08-11T07:40:03.753038Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 将绑定到：ipc:///tmp/ccode-pub-675eea81-8ad1-4e40-8073-d9cf4420f2f3
+[2m2026-08-11T07:40:03.753301Z[0m [32m INFO[0m [2mccore::node::sampler[0m[2m:[0m Sampler Node 启动：a284d430-3b24-4def-8dcd-3aa7d6a9cbae (providers=2, models=["deepseek-chat", "deepseek-r1", "deepseek-reasoner", "deepseek-v3", "glm-5.2"])
+[2m2026-08-11T07:40:03.753351Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 将绑定到：ipc:///tmp/ccode-pub-65136af1-6f34-44c8-b5ed-904f14cf393d
+[2m2026-08-11T07:40:03.753389Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m Node 26b0d66d-e1a9-4694-8520-b36c17b30dde 已启动，进入消息循环
+[2m2026-08-11T07:40:03.753448Z[0m [32m INFO[0m [2mccore::node::tui[0m[2m:[0m TUI Node 启动：5b4f7358-f9cf-4d2d-a760-ace79b0f4afa
+[2m2026-08-11T07:40:03.753438Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m Node a284d430-3b24-4def-8dcd-3aa7d6a9cbae 已启动，进入消息循环
+[2m2026-08-11T07:40:03.753515Z[0m [32m INFO[0m [2mccore::node::tool[0m[2m:[0m Tool Node 启动：216fbcf4-6895-42c1-b233-0dc40a8bc6d4 (工具数=22, 执行器数=11, 权限=Trust)
+[2m2026-08-11T07:40:03.753525Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m Node 216fbcf4-6895-42c1-b233-0dc40a8bc6d4 已启动，进入消息循环
+[2m2026-08-11T07:40:03.753530Z[0m [32m INFO[0m [2mccore::node::tui[0m[2m:[0m TUI raw mode 已启用
+[2m2026-08-11T07:40:03.753519Z[0m [32m INFO[0m [2mccore::node::state[0m[2m:[0m State Node 启动：4375b3f8-9f43-42d8-80a0-bbeb43d38562 (session=3d7043a1-a8b3-4845-9399-a978934d36b0, storage=/Users/caomunian/.ccode/sessions)
+[2m2026-08-11T07:40:03.753554Z[0m [32m INFO[0m [2mccore::node::thinker[0m[2m:[0m Thinker Node 启动：82209fb9-8ed5-45a2-9a85-83077031bd13 (type=Primary, model=glm-5.2)
+[?1049h[2m2026-08-11T07:40:03.753614Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m Node 4375b3f8-9f43-42d8-80a0-bbeb43d38562 已启动，进入消息循环
+[2m2026-08-11T07:40:03.753682Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m Node 82209fb9-8ed5-45a2-9a85-83077031bd13 已启动，进入消息循环
+[2m2026-08-11T07:40:03.753907Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 已绑定：ipc:///tmp/ccode-pub-58d83954-244b-41f7-9e80-592f9641e52f
+[2m2026-08-11T07:40:03.753936Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 已绑定：ipc:///tmp/ccode-pub-110f49d8-26db-4748-abe8-cbdaa9085462
+[2m2026-08-11T07:40:03.753948Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 已绑定：ipc:///tmp/ccode-pub-675eea81-8ad1-4e40-8073-d9cf4420f2f3
+[2m2026-08-11T07:40:03.753958Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 已绑定：ipc:///tmp/ccode-pub-65136af1-6f34-44c8-b5ed-904f14cf393d
+[2m2026-08-11T07:40:03.754040Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 已绑定：ipc:///tmp/ccode-pub-61c4213d-9f33-47f2-89e2-b958c73ba54d
+[2m2026-08-11T07:40:03.754053Z[0m [32m INFO[0m [2mccore::node::tui[0m[2m:[0m TUI Node 5b4f7358-f9cf-4d2d-a760-ace79b0f4afa 已启动，进入交互循环
+[2m2026-08-11T07:40:03.754359Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 数据面 PUB socket 已绑定：ipc:///tmp/ccode-pub-a1e83eda-ad81-4b11-b8d0-dbc3e7cd55be
+[1;1H[38;5;0;48;5;6m ccode [1;9H[1m[38;5;3;49m glm-5.2[1;18H[22m[38;5;8;49m .[1;21H[1m[38;5;7;49m● idle[28;1H[22m[38;5;8;49m                                                                                [29;1H> Enter 发[29;11H送[29;13H · Ctrl+Enter 换[29;29H行[29;31H · Esc 退[29;40H出[29;42H · ↑↓ 历[29;50H史[39m[49m[59m[0m[?25l[2m2026-08-11T07:40:03.758212Z[0m [32m INFO[0m [2mccore::node::tui[0m[2m:[0m TUI 初始渲染完成，等待输入...
+[2m2026-08-11T07:40:03.758255Z[0m [32m INFO[0m [2mccore::node::tui[0m[2m:[0m TUI 键盘输入线程已启动（std::thread + poll/read）
+[2m2026-08-11T07:40:03.758259Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:03.758269Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:03.758274Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:03.758279Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:03.758284Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:03.758343Z[0m [35mTRACE[0m [2mccore::node::tui[0m[2m:[0m TUI 按键: Char('h') ctrl=false
+[2m2026-08-11T07:40:03.758355Z[0m [35mTRACE[0m [2mccore::node::tui[0m[2m:[0m TUI 按键: Char('i') ctrl=false
+[2m2026-08-11T07:40:03.758360Z[0m [35mTRACE[0m [2mccore::node::tui[0m[2m:[0m TUI 按键: Char('j') ctrl=true
+[2m2026-08-11T07:40:03.758363Z[0m [35mTRACE[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 UI 事件
+[2m2026-08-11T07:40:03.758365Z[0m [35mTRACE[0m [2mccore::node::tui[0m[2m:[0m TUI 按键: Esc ctrl=false
+[29;1H[1m[38;5;2;49m> [22m[38;5;15;49mh[5m[38;5;2;49m ▌[25m[39;49m                                              [39m[49m[59m[0m[?25l[2m2026-08-11T07:40:03.759206Z[0m [35mTRACE[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 UI 事件
+[29;4H[38;5;15;49mi[5m[38;5;2;49m ▌[39m[49m[59m[0m[?25l[2m2026-08-11T07:40:03.760034Z[0m [35mTRACE[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 UI 事件
+[29;5H[38;5;15;49mj[5m[38;5;2;49m ▌[39m[49m[59m[0m[?25l[2m2026-08-11T07:40:03.760855Z[0m [35mTRACE[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 UI 事件
+[2m2026-08-11T07:40:03.760861Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 启动后 6ms 内收到 Esc，忽略
+[2m2026-08-11T07:40:03.855246Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m Node 注册成功：5b4f7358-f9cf-4d2d-a760-ace79b0f4afa (TUI)
+[2m2026-08-11T07:40:03.855313Z[0m [32m INFO[0m [2mccore::kernel::autonomic[0m[2m:[0m Agent 已注册到自主神经系统 [3magent_id[0m[2m=[0m5b4f7358-f9cf-4d2d-a760-ace79b0f4afa
+[2m2026-08-11T07:40:03.855462Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m Node 注册成功：216fbcf4-6895-42c1-b233-0dc40a8bc6d4 (Tool)
+[2m2026-08-11T07:40:03.855719Z[0m [32m INFO[0m [2mccore::kernel::autonomic[0m[2m:[0m Agent 已注册到自主神经系统 [3magent_id[0m[2m=[0m216fbcf4-6895-42c1-b233-0dc40a8bc6d4
+[2m2026-08-11T07:40:03.855811Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m Node 注册成功：26b0d66d-e1a9-4694-8520-b36c17b30dde (Acp)
+[2m2026-08-11T07:40:03.855864Z[0m [32m INFO[0m [2mccore::kernel::autonomic[0m[2m:[0m Agent 已注册到自主神经系统 [3magent_id[0m[2m=[0m26b0d66d-e1a9-4694-8520-b36c17b30dde
+[2m2026-08-11T07:40:03.855899Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/publisher_change
+[2m2026-08-11T07:40:03.855959Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m Node 注册成功：a284d430-3b24-4def-8dcd-3aa7d6a9cbae (Sampler)
+[2m2026-08-11T07:40:03.855996Z[0m [32m INFO[0m [2mccore::kernel::autonomic[0m[2m:[0m Agent 已注册到自主神经系统 [3magent_id[0m[2m=[0ma284d430-3b24-4def-8dcd-3aa7d6a9cbae
+[2m2026-08-11T07:40:03.856065Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m Node 注册成功：4375b3f8-9f43-42d8-80a0-bbeb43d38562 (State)
+[2m2026-08-11T07:40:03.856084Z[0m [32m INFO[0m [2mccore::kernel::autonomic[0m[2m:[0m Agent 已注册到自主神经系统 [3magent_id[0m[2m=[0m4375b3f8-9f43-42d8-80a0-bbeb43d38562
+[2m2026-08-11T07:40:03.856201Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m Node 注册成功：82209fb9-8ed5-45a2-9a85-83077031bd13 (Thinker)
+[2m2026-08-11T07:40:03.856361Z[0m [32m INFO[0m [2mccore::kernel::autonomic[0m[2m:[0m Agent 已注册到自主神经系统 [3magent_id[0m[2m=[0m82209fb9-8ed5-45a2-9a85-83077031bd13
+[2m2026-08-11T07:40:03.856415Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m DEALER 通知 TUI 5b4f7358-f9cf-4d2d-a760-ace79b0f4afa 关于 Thinker 82209fb9-8ed5-45a2-9a85-83077031bd13
+[2m2026-08-11T07:40:03.856517Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/publisher_change
+[2m2026-08-11T07:40:03.856545Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/spawn
+[2m2026-08-11T07:40:03.856558Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 sys/spawn 消息
+[2m2026-08-11T07:40:03.856556Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m Node 216fbcf4-6895-42c1-b233-0dc40a8bc6d4 收到 publisher_change 通知
+[2m2026-08-11T07:40:03.856568Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m Node 26b0d66d-e1a9-4694-8520-b36c17b30dde 收到 publisher_change 通知
+[2m2026-08-11T07:40:03.856582Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI sys/spawn: node_type=thinker, node_id=82209fb9-8ed5-45a2-9a85-83077031bd13
+[2m2026-08-11T07:40:03.856702Z[0m [32m INFO[0m [2mccore::node::tui[0m[2m:[0m TUI 设置 primary agent：82209fb9-8ed5-45a2-9a85-83077031bd13
+[2m2026-08-11T07:40:03.856590Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 发现新 Publisher：node=82209fb9-8ed5-45a2-9a85-83077031bd13, addr=ipc:///tmp/ccode-pub-65136af1-6f34-44c8-b5ed-904f14cf393d, topics=["agent/82209fb9-8ed5-45a2-9a85-83077031bd13/output", "agent/82209fb9-8ed5-45a2-9a85-83077031bd13/tool_call"]
+[2m2026-08-11T07:40:03.856591Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 发现新 Publisher：node=82209fb9-8ed5-45a2-9a85-83077031bd13, addr=ipc:///tmp/ccode-pub-65136af1-6f34-44c8-b5ed-904f14cf393d, topics=["agent/82209fb9-8ed5-45a2-9a85-83077031bd13/output", "agent/82209fb9-8ed5-45a2-9a85-83077031bd13/tool_call"]
+[2m2026-08-11T07:40:03.856781Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 正在连接 Publisher SUB：ipc:///tmp/ccode-pub-65136af1-6f34-44c8-b5ed-904f14cf393d
+[2m2026-08-11T07:40:03.856941Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m Node 82209fb9-8ed5-45a2-9a85-83077031bd13 收到 publisher_discovery
+[2m2026-08-11T07:40:03.856975Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 发现新 Publisher：node=26b0d66d-e1a9-4694-8520-b36c17b30dde, addr=ipc:///tmp/ccode-pub-58d83954-244b-41f7-9e80-592f9641e52f, topics=["agent/82209fb9-8ed5-45a2-9a85-83077031bd13/input", "agent/82209fb9-8ed5-45a2-9a85-83077031bd13/cancel"]
+[2m2026-08-11T07:40:03.857020Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 发现新 Publisher：node=a284d430-3b24-4def-8dcd-3aa7d6a9cbae, addr=ipc:///tmp/ccode-pub-110f49d8-26db-4748-abe8-cbdaa9085462, topics=["sampler/*/stream"]
+[2m2026-08-11T07:40:03.857043Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 发现新 Publisher：node=216fbcf4-6895-42c1-b233-0dc40a8bc6d4, addr=ipc:///tmp/ccode-pub-675eea81-8ad1-4e40-8073-d9cf4420f2f3, topics=["agent/*/tool_result", "tool/register"]
+[2m2026-08-11T07:40:03.857077Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 正在连接 Publisher SUB：ipc:///tmp/ccode-pub-58d83954-244b-41f7-9e80-592f9641e52f
+[2m2026-08-11T07:40:03.857082Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m 正在连接 Publisher SUB：ipc:///tmp/ccode-pub-675eea81-8ad1-4e40-8073-d9cf4420f2f3
+[2m2026-08-11T07:40:03.857304Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m SUB socket 已连接到 Publisher：ipc:///tmp/ccode-pub-65136af1-6f34-44c8-b5ed-904f14cf393d
+[2m2026-08-11T07:40:03.857366Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m SUB socket 已连接到 Publisher：ipc:///tmp/ccode-pub-675eea81-8ad1-4e40-8073-d9cf4420f2f3
+[2m2026-08-11T07:40:03.857570Z[0m [32m INFO[0m [2mccore::node::transport[0m[2m:[0m SUB socket 已连接到 Publisher：ipc:///tmp/ccode-pub-58d83954-244b-41f7-9e80-592f9641e52f
+[2m2026-08-11T07:40:04.359717Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m 广播 spawn 事件：a284d430-3b24-4def-8dcd-3aa7d6a9cbae (Sampler)
+[2m2026-08-11T07:40:04.359836Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m 广播 spawn 事件：4375b3f8-9f43-42d8-80a0-bbeb43d38562 (State)
+[2m2026-08-11T07:40:04.359892Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m 广播 spawn 事件：216fbcf4-6895-42c1-b233-0dc40a8bc6d4 (Tool)
+[2m2026-08-11T07:40:04.359929Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m 广播 spawn 事件：82209fb9-8ed5-45a2-9a85-83077031bd13 (Thinker)
+[2m2026-08-11T07:40:04.359961Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m 广播 spawn 事件：5b4f7358-f9cf-4d2d-a760-ace79b0f4afa (TUI)
+[2m2026-08-11T07:40:04.359992Z[0m [32m INFO[0m [2mccore::kernel[0m[2m:[0m 广播 spawn 事件：26b0d66d-e1a9-4694-8520-b36c17b30dde (Acp)
+[2m2026-08-11T07:40:04.360251Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/spawn
+[2m2026-08-11T07:40:04.360314Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 sys/spawn 消息
+[2m2026-08-11T07:40:04.360352Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/spawn
+[2m2026-08-11T07:40:04.360379Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 sys/spawn 消息
+[2m2026-08-11T07:40:04.360766Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/spawn
+[2m2026-08-11T07:40:04.360822Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 sys/spawn 消息
+[2m2026-08-11T07:40:04.360854Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/spawn
+[2m2026-08-11T07:40:04.360877Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 sys/spawn 消息
+[2m2026-08-11T07:40:04.360899Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/spawn
+[2m2026-08-11T07:40:04.360917Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 sys/spawn 消息
+[2m2026-08-11T07:40:04.360938Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/spawn
+[2m2026-08-11T07:40:04.360957Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到 sys/spawn 消息
+[2m2026-08-11T07:40:04.362334Z[0m [32m INFO[0m [2mccore::node::tool[0m[2m:[0m Tool Node 广播工具注册：22 个工具
+[2m2026-08-11T07:40:04.363359Z[0m [32m INFO[0m [2mccore::node::tool[0m[2m:[0m Tool Node 广播工具注册：22 个工具
+[2m2026-08-11T07:40:04.363861Z[0m [32m INFO[0m [2mccore::node::tool[0m[2m:[0m Tool Node 广播工具注册：22 个工具
+[2m2026-08-11T07:40:04.364286Z[0m [32m INFO[0m [2mccore::node::tool[0m[2m:[0m Tool Node 广播工具注册：22 个工具
+[2m2026-08-11T07:40:04.364740Z[0m [32m INFO[0m [2mccore::node::tool[0m[2m:[0m Tool Node 广播工具注册：22 个工具
+[2m2026-08-11T07:40:04.365144Z[0m [32m INFO[0m [2mccore::node::tool[0m[2m:[0m Tool Node 广播工具注册：22 个工具
+[2m2026-08-11T07:40:04.367044Z[0m [32m INFO[0m [2mccore::node::thinker[0m[2m:[0m Thinker 82209fb9-8ed5-45a2-9a85-83077031bd13 收到工具注册，共 22 个工具
+[2m2026-08-11T07:40:04.367792Z[0m [32m INFO[0m [2mccore::node::thinker[0m[2m:[0m Thinker 82209fb9-8ed5-45a2-9a85-83077031bd13 收到工具注册，共 22 个工具
+[2m2026-08-11T07:40:04.368443Z[0m [32m INFO[0m [2mccore::node::thinker[0m[2m:[0m Thinker 82209fb9-8ed5-45a2-9a85-83077031bd13 收到工具注册，共 22 个工具
+[2m2026-08-11T07:40:04.369078Z[0m [32m INFO[0m [2mccore::node::thinker[0m[2m:[0m Thinker 82209fb9-8ed5-45a2-9a85-83077031bd13 收到工具注册，共 22 个工具
+[2m2026-08-11T07:40:04.369733Z[0m [32m INFO[0m [2mccore::node::thinker[0m[2m:[0m Thinker 82209fb9-8ed5-45a2-9a85-83077031bd13 收到工具注册，共 22 个工具
+[2m2026-08-11T07:40:04.370497Z[0m [32m INFO[0m [2mccore::node::thinker[0m[2m:[0m Thinker 82209fb9-8ed5-45a2-9a85-83077031bd13 收到工具注册，共 22 个工具
+[2m2026-08-11T07:40:13.757691Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:13.757791Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:13.757817Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:13.757835Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:13.757850Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:23.755627Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:23.755676Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:23.755687Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:23.755834Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:23.755846Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:33.755760Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:33.755800Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:33.755808Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:33.755816Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:33.755862Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:43.755150Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:43.755184Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:43.755190Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:43.755196Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:43.755201Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:53.755858Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:53.755950Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:53.755957Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:53.755964Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:40:53.755970Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:41:03.756013Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:41:03.756055Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:41:03.756060Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:41:03.756065Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack
+[2m2026-08-11T07:41:03.756111Z[0m [34mDEBUG[0m [2mccore::node::tui[0m[2m:[0m TUI 收到消息：sys/ack

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 /// - blocked：是否应该阻止此操作
 /// - block_reason：阻止原因
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct HookRewriteResult {
     /// 改写后的工具输入（None 表示不修改）
     pub updated_input: Option<serde_json::Value>,
@@ -30,16 +31,6 @@ pub struct HookRewriteResult {
     pub block_reason: Option<String>,
 }
 
-impl Default for HookRewriteResult {
-    fn default() -> Self {
-        Self {
-            updated_input: None,
-            additional_context: None,
-            blocked: false,
-            block_reason: None,
-        }
-    }
-}
 
 /// Hook 输出解析
 ///

@@ -321,10 +321,12 @@ mod tests {
 
     #[test]
     fn test_proactive_scan_after_idle() {
-        let mut spec = ProactiveSpec::default();
-        spec.enabled = true;
-        spec.idle_timeout = Duration::from_secs(0); // 立即触发
-        spec.scan_interval = Duration::from_secs(0);
+        let spec = ProactiveSpec {
+            enabled: true,
+            idle_timeout: Duration::from_secs(0), // 立即触发
+            scan_interval: Duration::from_secs(0),
+            ..Default::default()
+        };
 
         let mut proactive = ProactiveLoop::new(spec);
         assert!(proactive.should_scan());
@@ -339,10 +341,12 @@ mod tests {
 
     #[test]
     fn test_proactive_repair_flow() {
-        let mut spec = ProactiveSpec::default();
-        spec.enabled = true;
-        spec.idle_timeout = Duration::from_secs(0);
-        spec.scan_interval = Duration::from_secs(0);
+        let spec = ProactiveSpec {
+            enabled: true,
+            idle_timeout: Duration::from_secs(0),
+            scan_interval: Duration::from_secs(0),
+            ..Default::default()
+        };
 
         let mut proactive = ProactiveLoop::new(spec);
         proactive.on_start_scan();

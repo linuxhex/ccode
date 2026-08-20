@@ -583,6 +583,11 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_ccode_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// Cache-aware microcompact edits: fingerprints of content that was
+    /// micro-compacted in this request, to be injected as `cache_edits` in
+    /// the API call for prompt-cache savings. Empty when cache-aware
+    /// microcompact is disabled or found nothing new to compact.
+    pub cache_edits: Vec<String>,
 }
 
 impl ConversationRequest {
@@ -4086,6 +4091,7 @@ mod tests {
             previous_response_id: None,
             prompt: None,
             prompt_cache_key: None,
+            cache_edits: vec![],
             prompt_cache_retention: None,
             reasoning: None,
             safety_identifier: None,
@@ -4142,6 +4148,7 @@ mod tests {
             previous_response_id: None,
             prompt: None,
             prompt_cache_key: None,
+            cache_edits: vec![],
             prompt_cache_retention: None,
             reasoning: None,
             safety_identifier: None,
@@ -4196,6 +4203,7 @@ mod tests {
             previous_response_id: None,
             prompt: None,
             prompt_cache_key: None,
+            cache_edits: vec![],
             prompt_cache_retention: None,
             reasoning: Some(rs::Reasoning {
                 effort: Some(rs::ReasoningEffort::Xhigh),
@@ -4546,6 +4554,7 @@ mod tests {
             previous_response_id: None,
             prompt: None,
             prompt_cache_key: None,
+            cache_edits: vec![],
             prompt_cache_retention: None,
             reasoning: None,
             safety_identifier: None,
@@ -4619,6 +4628,7 @@ mod tests {
             previous_response_id: None,
             prompt: None,
             prompt_cache_key: None,
+            cache_edits: vec![],
             prompt_cache_retention: None,
             reasoning: None,
             safety_identifier: None,
@@ -4707,6 +4717,7 @@ mod tests {
             previous_response_id: None,
             prompt: None,
             prompt_cache_key: None,
+            cache_edits: vec![],
             prompt_cache_retention: None,
             reasoning: None,
             safety_identifier: None,
@@ -8359,6 +8370,7 @@ mod tests {
             previous_response_id: None,
             prompt: None,
             prompt_cache_key: None,
+            cache_edits: vec![],
             prompt_cache_retention: None,
             reasoning: None,
             safety_identifier: None,
@@ -8568,6 +8580,7 @@ mod tests {
             previous_response_id: None,
             prompt: None,
             prompt_cache_key: None,
+            cache_edits: vec![],
             prompt_cache_retention: None,
             reasoning: None,
             safety_identifier: None,

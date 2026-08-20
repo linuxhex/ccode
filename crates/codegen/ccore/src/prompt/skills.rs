@@ -127,30 +127,28 @@ fn extract_first_paragraph(content: &str) -> Option<String> {
     let mut paragraph_lines = Vec::new();
     let mut in_paragraph = false;
 
-    for line_result in reader.lines() {
-        if let Ok(line) = line_result {
-            // 跳过空行
-            if line.trim().is_empty() {
-                if in_paragraph {
-                    // 第一段结束
-                    break;
-                }
-                continue;
+    for line in reader.lines().map_while(Result::ok) {
+        // 跳过空行
+        if line.trim().is_empty() {
+            if in_paragraph {
+                // 第一段结束
+                break;
             }
-
-            // 跳过标题（以 # 开头的行）
-            if line.trim().starts_with('#') {
-                if in_paragraph {
-                    // 第一段结束
-                    break;
-                }
-                continue;
-            }
-
-            // 收集段落内容
-            in_paragraph = true;
-            paragraph_lines.push(line.trim().to_string());
+            continue;
         }
+
+        // 跳过标题（以 # 开头的行）
+        if line.trim().starts_with('#') {
+            if in_paragraph {
+                // 第一段结束
+                break;
+            }
+            continue;
+        }
+
+        // 收集段落内容
+        in_paragraph = true;
+        paragraph_lines.push(line.trim().to_string());
     }
 
     if paragraph_lines.is_empty() {

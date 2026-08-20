@@ -30,11 +30,13 @@
 //! 读取 O(1)，避免每次全量遍历。
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use super::embedding::{EmbeddingIndex, EmbeddingVector};
 use super::mmr::mmr_select;
 
-use ccode_compaction::micro_compact::{micro_compact_messages, MicroCompactable, MicroCompactConfig};
+use ccode_compaction::cache_aware::{cached_micro_compact, default_fingerprint, CacheAwareState};
+use ccode_compaction::micro_compact::{MicroCompactable, MicroCompactConfig};
 
 /// LLM 摘要客户端 trait
 ///
@@ -168,6 +170,10 @@ pub struct CompactionPolicy {
     ///
     /// 0.5 表示保留首尾各 25%，中间替换为 [...已省略...]
     pub micro_compact_retain_ratio: f64,
+    /// 最大连续压缩失败次数（超过后停止自动压缩，类似断路器）
+    ///
+    /// 借鉴 Claude Code MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+    pub max_consecutive_compact_failures: u32,
 }
 
 impl Default for CompactionPolicy {
@@ -182,6 +188,19 @@ impl Default for CompactionPolicy {
             stable_prefix_enabled: true,
             tool_output_snip_threshold: 2000,
             micro_compact_retain_ratio: 0.5,
+            max_consecutive_compact_failures: 3,
+        }
+    }
+}
+
+impl From<&CompactionPolicy> for MicroCompactConfig {
+    fn from(policy: &CompactionPolicy) -> Self {
+        // micro_compact_retain_ratio 用于控制保留比例，但 MicroCompactConfig
+        // 使用 summary_max_chars（绝对字符数）。将 ratio 映射到 200~600 字符范围。
+        let summary_max_chars = (200.0 + policy.micro_compact_retain_ratio * 400.0) as usize;
+        Self {
+            max_age: Duration::from_secs(policy.wall_clock_budget_secs.max(60)),
+            summary_max_chars,
         }
     }
 }
@@ -235,6 +254,8 @@ pub enum WorkingEntry {
         role: MessageRole,
         content: String,
         token_count: u32,
+        /// 原始工具名（仅工具结果条目有值，用于微压缩指纹区分）
+        tool_name: Option<String>,
         /// 创建时间（用于微压缩的年龄判断；不参与序列化）
         #[serde(skip, default = "default_created_at")]
         created_at: std::time::Instant,
@@ -294,13 +315,14 @@ impl MicroCompactable for WorkingEntry {
     }
 
     fn tool_name(&self) -> Option<&str> {
-        // WorkingEntry 不存工具名。为让 micro_compact_messages 能按年龄处理
-        // Hot User 条目（工具结果），返回一个在 COMPACTABLE_TOOLS 白名单中的
-        // 名字作为务实降级。这样超龄的工具结果会被清除，新条目保持原样。
-        if matches!(self, Self::Hot { role: MessageRole::User, .. }) {
-            Some("FileRead")
-        } else {
-            None
+        match self {
+            Self::Hot {
+                role: MessageRole::User,
+                tool_name: Some(ref name),
+                ..
+            } => Some(name.as_str()),
+            // Warm/Cold 已是压缩态，不参与微压缩处理
+            _ => None,
         }
     }
 
@@ -317,6 +339,7 @@ impl MicroCompactable for WorkingEntry {
             Self::Hot {
                 role,
                 token_count,
+                tool_name,
                 created_at,
                 ..
             } => {
@@ -326,6 +349,7 @@ impl MicroCompactable for WorkingEntry {
                     role: *role,
                     content: new_content,
                     token_count: new_tokens.min(*token_count),
+                    tool_name: tool_name.clone(),
                     created_at: *created_at,
                 }
             }
@@ -356,6 +380,10 @@ pub struct WorkingMemory {
     /// 压缩操作只影响前缀之后的条目，最大化 API 侧 Prompt Cache 命中率。
     /// 在首次 push_system 后锁定，后续 push 操作不增加前缀长度。
     stable_prefix_len: usize,
+    /// Cache-Aware 压缩状态（追踪已压缩内容指纹，避免重复压缩）
+    cache_state: CacheAwareState,
+    /// 连续压缩失败次数（断路器，超过阈值后停止自动压缩）
+    consecutive_compact_failures: u32,
 }
 
 impl WorkingMemory {
@@ -368,6 +396,8 @@ impl WorkingMemory {
             embedding_index: EmbeddingIndex::new(),
             summarizer: None,
             stable_prefix_len: 0,
+            cache_state: CacheAwareState::default(),
+            consecutive_compact_failures: 0,
         }
     }
 
@@ -429,15 +459,27 @@ impl WorkingMemory {
         self.max_tokens
     }
 
-    /// 添加热消息（显式角色）
-    pub fn push_hot(&mut self, role: MessageRole, content: String, token_count: u32) {
+    /// 添加工具结果消息（显式角色 + 工具名）
+    pub fn push_hot_with_tool(
+        &mut self,
+        role: MessageRole,
+        content: String,
+        token_count: u32,
+        tool_name: Option<String>,
+    ) {
         self.used_tokens_cached += token_count;
         self.entries.push(WorkingEntry::Hot {
             role,
             content,
             token_count,
+            tool_name,
             created_at: std::time::Instant::now(),
         });
+    }
+
+    /// 添加热消息（显式角色）
+    pub fn push_hot(&mut self, role: MessageRole, content: String, token_count: u32) {
+        self.push_hot_with_tool(role, content, token_count, None);
     }
 
     /// 添加系统消息（便捷方法）
@@ -520,18 +562,34 @@ impl WorkingMemory {
         self.compaction_policy = policy;
     }
 
-    /// 判断是否需要压缩
+    /// 判断是否需要压缩（含断路器：连续失败超过阈值后停止自动压缩）
     pub fn should_compact(&self) -> bool {
         if self.max_tokens == 0 {
+            return false;
+        }
+        // 断路器：连续压缩失败次数超过阈值则停止自动压缩
+        if self.consecutive_compact_failures >= self.compaction_policy.max_consecutive_compact_failures {
             return false;
         }
         let usage_percent = (self.used_tokens_cached as u64 * 100) / self.max_tokens as u64;
         usage_percent >= self.compaction_policy.auto_compact_threshold_percent as u64
     }
 
-    /// 使用当前策略执行压缩
+    /// 使用当前策略执行压缩（含断路器计数）
     pub fn compact(&mut self) -> CompactionResult {
-        self.compact_with_policy(&self.compaction_policy.clone())
+        let result = self.compact_with_policy(&self.compaction_policy.clone());
+        // 断路器：压缩后 token 未减少则视为失败，超过阈值后停止自动压缩
+        if result.tokens_after >= result.tokens_before {
+            self.consecutive_compact_failures += 1;
+            tracing::warn!(
+                consecutive_failures = self.consecutive_compact_failures,
+                max_failures = self.compaction_policy.max_consecutive_compact_failures,
+                "compact: no tokens saved, incrementing failure counter"
+            );
+        } else {
+            self.consecutive_compact_failures = 0;
+        }
+        result
     }
 
     /// 使用指定策略执行压缩（同步版本，4 级策略 + stable prefix 保护）
@@ -547,7 +605,6 @@ impl WorkingMemory {
     /// - 这些条目（system prompt + 工具定义）保持不变，最大化 Prompt Cache 命中率
     pub fn compact_with_policy(&mut self, policy: &CompactionPolicy) -> CompactionResult {
         let tokens_before = self.used_tokens_cached;
-        let _total = self.entries.len();
 
         // 根据使用率选择压缩级别
         let usage_ratio = if self.max_tokens > 0 {
@@ -619,6 +676,7 @@ impl WorkingMemory {
                 role: MessageRole::User,
                 content,
                 token_count,
+                tool_name,
                 created_at,
             } = &entry
             {
@@ -638,6 +696,7 @@ impl WorkingMemory {
                         role: MessageRole::User,
                         content: snipped,
                         token_count: snipped_tokens,
+                        tool_name: tool_name.clone(),
                         created_at: *created_at,
                     };
                     entries_compacted += 1;
@@ -663,9 +722,9 @@ impl WorkingMemory {
     /// 委托给 `ccode_compaction::micro_compact_messages`：对前缀之后的条目，
     /// 超过 `max_age` 的可压缩工具结果会被替换为清除标记或截断摘要。
     /// 相比原先的首尾截断，此实现按时间年龄清除，更贴近 Claude Code 的微压缩语义。
-    fn compact_micro(&mut self, _policy: &CompactionPolicy, prefix_end: usize) -> CompactionResult {
+    fn compact_micro(&mut self, policy: &CompactionPolicy, prefix_end: usize) -> CompactionResult {
         let tokens_before = self.used_tokens_cached;
-        let config = MicroCompactConfig::default();
+        let config = MicroCompactConfig::from(policy);
         let now = std::time::Instant::now();
 
         let prefix_len = prefix_end.min(self.entries.len());
@@ -677,15 +736,22 @@ impl WorkingMemory {
         let old_contents: Vec<String> =
             rest.iter().map(|e| e.content().to_string()).collect();
 
-        let compacted_rest = micro_compact_messages::<WorkingEntry>(&rest, &config, now);
+        // 使用 cache-aware 微压缩：跳过已压缩内容的指纹匹配
+        let result = cached_micro_compact::<WorkingEntry>(
+            &rest,
+            &config,
+            now,
+            &mut self.cache_state,
+            default_fingerprint::<WorkingEntry>,
+        );
 
         let entries_compacted = old_contents
             .iter()
-            .zip(compacted_rest.iter())
+            .zip(result.items.iter())
             .filter(|(old, new)| old.as_str() != new.content())
             .count();
 
-        all_entries.extend(compacted_rest);
+        all_entries.extend(result.items);
         self.entries = all_entries;
 
         self.recalc_used_tokens();
@@ -1060,7 +1126,7 @@ mod tests {
         // 搜索与 [1, 0, 0] 最相似的
         // 注意：search 过滤 score <= 0.0，正交向量相似度为 0 被过滤，
         // 仅返回 entry-1（与 query 完全匹配）
-        let results = index.search_with_metadata(&vec![1.0, 0.0, 0.0], 2);
+        let results = index.search_with_metadata(&[1.0, 0.0, 0.0], 2);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "entry-1"); // 应该是第一个，因为完全匹配
@@ -1091,7 +1157,7 @@ mod tests {
         });
 
         // 使用 MMR 搜索
-        let selected = mmr_select(&index, &vec![1.0, 0.0, 0.0], 2, 0.7);
+        let selected = mmr_select(&index, &[1.0, 0.0, 0.0], 2, 0.7);
 
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0], 0); // 第一个总是最相关的

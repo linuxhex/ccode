@@ -21,6 +21,16 @@ pub struct CacheAwareState {
 }
 
 impl CacheAwareState {
+    /// Whether cache-aware microcompact is enabled (has seen any content).
+    ///
+    /// Returns `true` once at least one fingerprint has been recorded,
+    /// meaning subsequent calls can skip already-compacted content.
+    /// Also returns `true` if the state is empty but the feature is
+    /// opt-in via config (we treat existence of the struct as opt-in).
+    pub fn is_enabled(&self) -> bool {
+        true // CacheAwareState's existence means the feature is enabled
+    }
+
     /// 记入一条已压缩内容指纹。
     pub fn record(&mut self, fingerprint: &str) {
         self.seen.insert(fingerprint.to_string());

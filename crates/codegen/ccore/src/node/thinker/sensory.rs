@@ -19,10 +19,12 @@ pub struct SensorySignal {
 }
 
 impl ThinkerNode {
-    /// 听觉（Ear）：处理用户输入
+    /// 听觉（Ear）：处理用户输入（同步快速部分）
     ///
-    /// 将用户输入存入工作记忆，同时从长期记忆中搜索相关内容注入热区。
-    pub(crate) fn listen(&mut self, content: &str, role: &str) {
+    /// 只做最小必要工作：存入短期记忆 + 推入工作记忆热区 + 设置状态。
+    /// 记忆搜索和意图扩展由 listen_enrichment() 在 sampler 请求发送后执行，
+    /// 避免阻塞首次 LLM 请求。
+    pub(crate) fn listen_sync(&mut self, content: &str, role: &str) {
         let _entry_id = self.short_term_memory.store(
             role.to_string(),
             content.to_string(),
@@ -36,7 +38,14 @@ impl ThinkerNode {
             Self::estimate_tokens(content),
         );
 
-        // 从长期记忆搜索相关内容，注入工作记忆（冷区→热区）
+        self.state = AgentState::Thinking;
+        tracing::debug!("Thinker {} 听到输入，轮次 {}", self.id, self.turns_executed);
+    }
+
+    /// 听觉增强（异步慢路径）：长期记忆搜索 + 意图扩展 + 代码检索
+    ///
+    /// 在 sampler 请求发送后调用，结果注入工作记忆供后续轮次使用。
+    pub(crate) fn listen_enrichment(&mut self, content: &str) {
         let relevant = self.memory_bridge.search_relevant(content, 5);
         for memory in relevant {
             let token_count = Self::estimate_tokens(&memory);
@@ -47,10 +56,8 @@ impl ThinkerNode {
             tracing::debug!("注入长期记忆：{} 字符", memory.len());
         }
 
-        // Context Engine：意图扩展 + 代码块检索，注入代码级上下文
         let intents = IntentRetriever::expand_intents(content);
         if !intents.is_empty() {
-            // 简单用零向量占位（真实场景需调 embedding 模型生成 query embedding）
             let query_embedding = vec![0.0f32; 1536];
             let results = self.intent_retriever.search_by_intents(&intents, &query_embedding, 5);
             for result in results {
@@ -62,9 +69,6 @@ impl ThinkerNode {
                 tracing::debug!("注入代码上下文：{} (score={:.2})", result.name, result.relevance_score);
             }
         }
-
-        self.state = AgentState::Thinking;
-        tracing::debug!("Thinker {} 听到输入，轮次 {}", self.id, self.turns_executed);
     }
 
     /// 触觉（Skin）：感知工具执行结果

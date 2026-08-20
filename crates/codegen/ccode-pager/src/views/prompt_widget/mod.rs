@@ -1417,7 +1417,7 @@ impl PromptWidget {
     /// Suppresses the context if the cursor is on or immediately after a
     /// file reference element — the `@` belongs to the atomic block and
     /// the dropdown can't edit it.
-    fn update_file_search_context(&mut self) {
+    pub(crate) fn update_file_search_context(&mut self) {
         let cursor = self.textarea.cursor();
 
         // Check if cursor is adjacent to a file ref element (on it or right after it).
