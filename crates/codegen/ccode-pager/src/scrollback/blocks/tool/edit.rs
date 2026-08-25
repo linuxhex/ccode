@@ -180,6 +180,160 @@ pub fn render_diff_hunks_highlighted(
 /// construction. Every line renders its per-hunk syntect spans (keeping the
 /// highlighter state exactly as in the hunk-only phase); when `by_new_line`
 /// is given, matching Equal/Insert lines swap in the full-file styles.
+/// Compute word-level changed ranges between old and new text.
+///
+/// Returns `(old_changed_ranges, new_changed_ranges)` as byte offset ranges
+/// within the respective strings. Used to highlight intra-line changes in
+/// diff views (e.g., which specific words changed within a modified line).
+fn compute_word_diff_ranges(
+    old: &str,
+    new: &str,
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let diff = similar::TextDiff::from_words(old, new);
+    let mut old_ranges = Vec::new();
+    let mut new_ranges = Vec::new();
+    let mut old_offset = 0usize;
+    let mut new_offset = 0usize;
+
+    for change in diff.iter_all_changes() {
+        let len = change.value().len();
+        match change.tag() {
+            ChangeTag::Equal => {
+                old_offset += len;
+                new_offset += len;
+            }
+            ChangeTag::Delete => {
+                if !change.value().trim().is_empty() {
+                    old_ranges.push(old_offset..old_offset + len);
+                }
+                old_offset += len;
+            }
+            ChangeTag::Insert => {
+                if !change.value().trim().is_empty() {
+                    new_ranges.push(new_offset..new_offset + len);
+                }
+                new_offset += len;
+            }
+        }
+    }
+    (old_ranges, new_ranges)
+}
+
+/// Apply word-level background highlights to spans.
+///
+/// Takes rendered content spans and a list of byte ranges that should receive
+/// a stronger background color (indicating intra-line changes). Splits spans
+/// at range boundaries and applies `highlight_bg` to the changed portions.
+fn apply_word_highlights(
+    spans: Vec<Span<'static>>,
+    changed_ranges: &[Range<usize>],
+    highlight_bg: Color,
+) -> Vec<Span<'static>> {
+    if changed_ranges.is_empty() {
+        return spans;
+    }
+
+    let mut result = Vec::new();
+    let mut byte_offset = 0usize;
+
+    for span in spans {
+        let span_len = span.content.len();
+        let span_start = byte_offset;
+        let span_end = byte_offset + span_len;
+
+        for range in changed_ranges {
+            if range.end <= span_start || range.start >= span_end {
+                continue;
+            }
+            let overlap_start = range.start.max(span_start) - span_start;
+            let overlap_end = range.end.min(span_end) - span_start;
+
+            if overlap_start > 0 {
+                result.push(Span {
+                    content: span.content[..overlap_start].to_string().into(),
+                    style: span.style,
+                    ..Default::default()
+                });
+            }
+            result.push(Span {
+                content: span.content[overlap_start..overlap_end].to_string().into(),
+                style: span.style.bg(highlight_bg),
+                ..Default::default()
+            });
+            if overlap_end < span_len {
+                result.push(Span {
+                    content: span.content[overlap_end..].to_string().into(),
+                    style: span.style,
+                    ..Default::default()
+                });
+            }
+        }
+
+        if !changed_ranges.iter().any(|r| r.start < span_end && r.end > span_start) {
+            result.push(span);
+        }
+
+        byte_offset = span_end;
+    }
+
+    if result.is_empty() {
+        spans
+    } else {
+        result
+    }
+}
+
+/// Pre-compute word-level highlights for Delete/Insert pairs in a hunk.
+///
+/// Scans the hunk for consecutive groups of Delete followed by Insert lines.
+/// Within each group, pairs up lines by index and computes word-level diffs.
+/// Returns a map from `(tag, line_index_within_hunk)` to changed byte ranges.
+fn compute_hunk_word_highlights(
+    hunk: &DiffHunk,
+    _theme: &Theme,
+) -> HashMap<(ChangeTag, usize), Vec<Range<usize>>> {
+    let mut result = HashMap::new();
+    let lines: Vec<_> = hunk.iter().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        // Find start of a Delete/Insert group
+        if lines[i].tag == ChangeTag::Delete {
+            let mut deletes = Vec::new();
+            let mut inserts = Vec::new();
+
+            // Collect consecutive Delete lines
+            while i < lines.len() && lines[i].tag == ChangeTag::Delete {
+                deletes.push((i, lines[i].text.trim_end_matches(['\r', '\n'])));
+                i += 1;
+            }
+            // Collect consecutive Insert lines
+            while i < lines.len() && lines[i].tag == ChangeTag::Insert {
+                inserts.push((i, lines[i].text.trim_end_matches(['\r', '\n'])));
+                i += 1;
+            }
+
+            // Pair up lines and compute word-level diffs
+            let pair_count = deletes.len().min(inserts.len());
+            for j in 0..pair_count {
+                let (del_idx, del_text) = deletes[j];
+                let (ins_idx, ins_text) = inserts[j];
+                let (old_ranges, new_ranges) = compute_word_diff_ranges(del_text, ins_text);
+                if !old_ranges.is_empty() {
+                    result.insert((ChangeTag::Delete, del_idx), old_ranges);
+                }
+                if !new_ranges.is_empty() {
+                    result.insert((ChangeTag::Insert, ins_idx), new_ranges);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    result
+}
+
 fn render_diff_hunks_core(
     hunks: &[DiffHunk],
     path: &Path,
@@ -225,17 +379,32 @@ fn render_diff_hunks_core(
         // the new side and advance both.
         let mut old_highlighter = syntect.highlight_lines_by_file_path(path);
         let mut new_highlighter = syntect.highlight_lines_by_file_path(path);
-        for line in hunk {
+
+        // Pre-compute word-level diffs for Delete/Insert pairs within this hunk.
+        // Keyed by (tag, line_index_within_hunk) → changed byte ranges.
+        let word_highlights = compute_hunk_word_highlights(hunk, theme);
+
+        for (line_idx, line) in hunk.iter().enumerate() {
             let trimmed = line.text.trim_end_matches(['\r', '\n']);
             let text = expand_tabs(trimmed);
             // Cold spans render unconditionally so Delete lines and any map
             // miss (text drift) paint exactly like the hunk-only phase.
             let mut content_spans = match line.tag {
                 ChangeTag::Delete => {
-                    render_content_spans(&text, line.tag, theme, &mut old_highlighter, syntect)
+                    let spans = render_content_spans(&text, line.tag, theme, &mut old_highlighter, syntect);
+                    if let Some(ranges) = word_highlights.get(&(ChangeTag::Delete, line_idx)) {
+                        apply_word_highlights(spans, ranges, theme.diff_delete_bg)
+                    } else {
+                        spans
+                    }
                 }
                 ChangeTag::Insert => {
-                    render_content_spans(&text, line.tag, theme, &mut new_highlighter, syntect)
+                    let spans = render_content_spans(&text, line.tag, theme, &mut new_highlighter, syntect);
+                    if let Some(ranges) = word_highlights.get(&(ChangeTag::Insert, line_idx)) {
+                        apply_word_highlights(spans, ranges, theme.diff_insert_bg)
+                    } else {
+                        spans
+                    }
                 }
                 ChangeTag::Equal => {
                     let spans =

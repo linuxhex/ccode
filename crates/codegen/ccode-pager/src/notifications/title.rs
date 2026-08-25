@@ -220,7 +220,7 @@ fn write_activity(buf: &mut String, activity: &TurnActivity) {
     match activity {
         TurnActivity::Thinking => buf.push_str("Thinking"),
         TurnActivity::Responding => buf.push_str("Generating"),
-        TurnActivity::ToolRunning { title, description } => {
+        TurnActivity::ToolRunning { title, description, .. } => {
             if let Some(desc) = description
                 .as_deref()
                 .map(str::trim)
@@ -487,6 +487,7 @@ mod tests {
         let activity = TurnActivity::ToolRunning {
             title: "cargo build".to_owned(),
             description: None,
+            started_at: std::time::Instant::now(),
         };
         let state = TitleState {
             activity: Some(&activity),
@@ -503,6 +504,7 @@ mod tests {
         let activity = TurnActivity::ToolRunning {
             title: String::new(),
             description: None,
+            started_at: std::time::Instant::now(),
         };
         let state = TitleState {
             activity: Some(&activity),
@@ -867,6 +869,7 @@ mod tests {
         let activity = TurnActivity::ToolRunning {
             title: long_tool,
             description: None,
+            started_at: std::time::Instant::now(),
         };
         let state = TitleState {
             activity: Some(&activity),

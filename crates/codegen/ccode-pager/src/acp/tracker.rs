@@ -170,6 +170,9 @@ pub enum TurnActivity {
         /// `description`). Prefer this over `Run <command>` when set
         /// (renders as `{desc}…`).
         description: Option<String>,
+        /// When the tool started executing. Used for spinner color warming
+        /// (green → amber → red) to convey elapsed time to the user.
+        started_at: std::time::Instant,
     },
     /// Auto-compaction in progress (mid-turn, agent-initiated).
     AutoCompacting,
@@ -441,7 +444,11 @@ impl AcpUpdateTracker {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| tool.base.title.clone());
             let title = peeled_if_changed(&title, self.session_cwd.as_deref()).unwrap_or(title);
-            return Some(TurnActivity::ToolRunning { title, description });
+            return Some(TurnActivity::ToolRunning {
+                title,
+                description,
+                started_at: std::time::Instant::now(),
+            });
         }
         if self.current_agent_msg.is_some() {
             return Some(TurnActivity::Responding);
@@ -4806,6 +4813,7 @@ mod tests {
             Some(TurnActivity::ToolRunning {
                 title: "cargo test".into(),
                 description: None,
+                ..
             })
         );
     }
@@ -4838,6 +4846,7 @@ mod tests {
             Some(TurnActivity::ToolRunning {
                 title: "sleep 5 && echo done".into(),
                 description: Some("Wait 5 seconds then print done".into()),
+                ..
             })
         );
     }
@@ -4863,7 +4872,8 @@ mod tests {
             tracker.activity(),
             Some(TurnActivity::ToolRunning {
                 title: "gt stack submit --no-edit".into(),
-                description: None
+                description: None,
+                ..
             }),
         );
     }
@@ -4890,7 +4900,8 @@ mod tests {
             tracker.activity(),
             Some(TurnActivity::ToolRunning {
                 title: "echo hi".into(),
-                description: None
+                description: None,
+                ..
             }),
         );
     }
@@ -4917,7 +4928,8 @@ mod tests {
             tracker.activity(),
             Some(TurnActivity::ToolRunning {
                 title: "cargo test".into(),
-                description: None
+                description: None,
+                ..
             }),
         );
     }

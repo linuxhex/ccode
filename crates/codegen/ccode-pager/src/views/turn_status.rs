@@ -452,7 +452,7 @@ pub fn render_turn_status(
     // Activity label (potentially truncated)
     let mut queued_hint: Option<Span<'static>> = None;
     if is_tool {
-        if let Some(TurnActivity::ToolRunning { title, description }) = activity {
+        if let Some(TurnActivity::ToolRunning { title, description, .. }) = activity {
             if is_asking {
                 // Ask tools: render as a unified gray label (like Thinking/Responding),
                 // not as a command invocation — yellow is reserved for shell commands.
@@ -663,7 +663,7 @@ fn compute_activity(
             "Generating…".to_string(),
             false,
         ),
-        (AgentState::TurnRunning, Some(TurnActivity::ToolRunning { title, description })) => {
+        (AgentState::TurnRunning, Some(TurnActivity::ToolRunning { title, description, started_at })) => {
             // "Ask" tools (AskUserQuestion) use gray spinner like Thinking —
             // green feels out of place when the user is answering questions.
             // Human descriptions (e.g. bash `description`) also use muted
@@ -677,7 +677,7 @@ fn compute_activity(
             let style = if is_ask || has_desc {
                 Style::default().fg(theme.text_secondary)
             } else {
-                Style::default().fg(theme.accent_success)
+                Style::default().fg(warmed_tool_color(theme, *started_at))
             };
             (style, String::new(), true)
         }
@@ -733,6 +733,47 @@ fn compute_activity(
             false,
         ),
         (AgentState::Idle, _) => (Style::default(), String::new(), false),
+    }
+}
+
+/// Compute warmed tool spinner color based on elapsed time.
+///
+/// Interpolates from green → amber → red to convey urgency:
+/// - 0–10s: green (accent_success) — normal operation
+/// - 10–30s: green → amber (warning) — getting long
+/// - 30–60s: amber → red (accent_error) — very long
+/// - 60s+: red — potentially stuck
+fn warmed_tool_color(theme: &Theme, started_at: std::time::Instant) -> ratatui::style::Color {
+    let elapsed = started_at.elapsed().as_secs_f32();
+    if elapsed < 10.0 {
+        theme.accent_success
+    } else if elapsed < 30.0 {
+        let t = (elapsed - 10.0) / 20.0;
+        lerp_color(theme.accent_success, theme.warning, t)
+    } else if elapsed < 60.0 {
+        let t = (elapsed - 30.0) / 30.0;
+        lerp_color(theme.warning, theme.accent_error, t)
+    } else {
+        theme.accent_error
+    }
+}
+
+/// Linearly interpolate between two RGB colors.
+fn lerp_color(
+    a: ratatui::style::Color,
+    b: ratatui::style::Color,
+    t: f32,
+) -> ratatui::style::Color {
+    let t = t.clamp(0.0, 1.0);
+    match (a, b) {
+        (ratatui::style::Color::Rgb(r1, g1, b1), ratatui::style::Color::Rgb(r2, g2, b2)) => {
+            ratatui::style::Color::Rgb(
+                (r1 as f32 + (r2 as f32 - r1 as f32) * t) as u8,
+                (g1 as f32 + (g2 as f32 - g1 as f32) * t) as u8,
+                (b1 as f32 + (b2 as f32 - b1 as f32) * t) as u8,
+            )
+        }
+        _ => b,
     }
 }
 
