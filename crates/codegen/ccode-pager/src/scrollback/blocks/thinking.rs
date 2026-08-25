@@ -372,7 +372,7 @@ impl BlockContent for ThinkingBlock {
         if ctx.mode == DisplayMode::Collapsed {
             return None;
         }
-        if cfg.animate && ctx.is_running {
+        if cfg.animate && ctx.is_running && !ctx.appearance.animation.reduced_motion {
             Some(AccentStyle::animated(cfg.accent))
         } else {
             Some(AccentStyle::static_color(cfg.accent))

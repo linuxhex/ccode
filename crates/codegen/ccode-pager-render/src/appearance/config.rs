@@ -388,6 +388,11 @@ pub struct AnimationConfig {
     /// Show an FPS counter overlay in the top-right corner (debug/dev builds only).
     /// Also enabled by the `CCODE_FPS=1` env var. Default: false.
     pub show_fps: bool,
+    /// Disable all animations for accessibility (vestibular disorders, motion sensitivity).
+    /// When true: spinners show static "●", wave accents are disabled, thinking blocks
+    /// show static accents. Honors the `REDUCED_MOTION` environment variable as fallback.
+    /// Default: false.
+    pub reduced_motion: bool,
 }
 
 impl Default for AnimationConfig {
@@ -396,6 +401,7 @@ impl Default for AnimationConfig {
             fps: 30,
             wave_rows: 32,
             show_fps: false,
+            reduced_motion: false,
         }
     }
 }
@@ -405,6 +411,19 @@ impl AnimationConfig {
     pub fn tick_interval(&self) -> std::time::Duration {
         let fps = self.fps.max(1) as u64;
         std::time::Duration::from_millis(1000 / fps)
+    }
+
+    /// Whether animations should be suppressed.
+    ///
+    /// Returns true when `reduced_motion` is set OR the `REDUCED_MOTION`
+    /// environment variable is truthy (`1`, `true`, `yes`).
+    pub fn is_reduced(&self) -> bool {
+        if self.reduced_motion {
+            return true;
+        }
+        std::env::var("REDUCED_MOTION")
+            .as_deref()
+            .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
     }
 }
 
@@ -1088,6 +1107,11 @@ pub struct RawAnimationConfig {
     /// Show an FPS counter overlay in the top-right corner.
     /// Requires a debug build. Also enabled by CCODE_FPS=1 env var. Default: false.
     pub show_fps: bool,
+    /// Disable all animations for accessibility (vestibular disorders, motion sensitivity).
+    /// When true: spinners show static "●", wave accents are static, thinking blocks
+    /// show static accents. Also honors the REDUCED_MOTION environment variable.
+    /// Default: false.
+    pub reduced_motion: bool,
 }
 
 impl Default for RawAnimationConfig {
@@ -1096,6 +1120,7 @@ impl Default for RawAnimationConfig {
             fps: 30,
             wave_rows: 32,
             show_fps: false,
+            reduced_motion: false,
         }
     }
 }
@@ -1451,6 +1476,7 @@ impl From<RawAnimationConfig> for AnimationConfig {
             fps: raw.fps.clamp(1, 60),
             wave_rows: raw.wave_rows.max(1),
             show_fps: raw.show_fps,
+            reduced_motion: raw.reduced_motion,
         }
     }
 }
