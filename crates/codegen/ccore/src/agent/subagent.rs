@@ -26,7 +26,7 @@ use crate::node::{Node, NodeContext, NodeId, NodeType};
 use crate::memory::working::WorkingMemory;
 use crate::memory::short_term::ShortTermMemory;
 use crate::sampler::provider::{
-    ChatMessage, SampleRequest, StreamChannel, StreamChunk,
+    CacheControl, ChatMessage, SampleRequest, StreamChannel, StreamChunk,
     ToolDefinition as SamplerToolDefinition,
 };
 use std::collections::HashSet;
@@ -182,12 +182,29 @@ impl SubAgentNode {
 
     /// 构建采样请求
     fn build_sample_request(&mut self) -> SampleRequest {
-        let messages: Vec<ChatMessage> = self
+        let mut messages: Vec<ChatMessage> = self
             .working_memory
             .to_chat_messages()
             .into_iter()
             .map(|(role, content)| ChatMessage { role, content, cache_control: None })
             .collect();
+
+        // Prompt cache 断点：与 ThinkerNode 对齐，让 sub-agent 也能命中 API 侧 KV cache
+        if !messages.is_empty() {
+            // Breakpoint 1: system prompt（最稳定的前缀）
+            if let Some(first) = messages.first_mut() {
+                if first.role == "system" {
+                    first.cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+            // Breakpoint 2: 倒数第 2 轮之前（保留最近对话可编辑）
+            let mid_idx = messages.len().saturating_sub(5);
+            if mid_idx > 0 {
+                if let Some(msg) = messages.get_mut(mid_idx) {
+                    msg.cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+        }
 
         let request_id = uuid::Uuid::new_v4().to_string();
         self.current_sample_request_id = Some(request_id.clone());
@@ -226,7 +243,7 @@ impl SubAgentNode {
             thinking: None,
             system_prompt: None,
             tool_choice: None,
-            prompt_cache_key: None,
+            prompt_cache_key: Some(self.id.to_string()),
             goal_verify: false,
             extra_headers: std::collections::HashMap::new(),
         }

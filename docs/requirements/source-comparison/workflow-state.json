@@ -1,0 +1,13 @@
+{
+  "requirement_id": "CCODE-004",
+  "phase": "implemented",
+  "main_service": "ccode",
+  "multi_service_mode": false,
+  "description": "6 款 CLI Coding Agent 源码对比分析（Claude Code / Codex / OpenCode / deepcode-cli / Qoder / Harness CLI）",
+  "changes": [
+    "完成 6 款工具的全面架构分析",
+    "编写全维度对比分析文档 analysis.md",
+    "提炼 3 Phase 改进计划 plan.md",
+    "新克隆 deepcode-cli 和 harness-cli 到 ref-agents"
+  ]
+}

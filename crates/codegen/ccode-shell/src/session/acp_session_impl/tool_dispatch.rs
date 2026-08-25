@@ -241,6 +241,7 @@ impl SessionActor {
             timeout: None,
             description: title_command.clone().into_owned(),
             is_background: false,
+            side_effects: None,
         });
         // Bash mode has no model-issued wire name; resolve the toolset's
         // execute tool by kind so the ccode.dev/tool identity still stamps.

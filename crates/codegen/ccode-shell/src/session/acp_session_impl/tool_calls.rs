@@ -526,6 +526,7 @@ impl SessionActor {
         let pending_interjections = self.pending_interjections.clone();
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
         let ccore_state = self.ccore_state.clone();
+        let speculative_cache = self.speculative_tool_results.clone();
         let dispatch_futures: Vec<_> = approved
             .iter()
             .enumerate()
@@ -538,53 +539,91 @@ impl SessionActor {
                 let ccore_state = ccore_state.clone();
                 let pending_interjections = pending_interjections.clone();
                 let blocking_wait_depth = self.tool_context.blocking_wait_depth.clone();
+                let speculative_cache = speculative_cache.clone();
                 let interruptible =
                     is_interruptible_wait_tool(&prepared.tool_name, &prepared.parsed_args);
                 let lock = lock_path_for_args(&prepared.parsed_args)
                     .and_then(|fp| file_locks.get(fp).cloned());
                 async move {
                     let exec_start = std::time::Instant::now();
-                    let run_tool = || {
-                        let prepared = Arc::clone(&prepared);
-                        let workspace_ops = workspace_ops.clone();
-                        let session_id = session_id.clone();
-                        let ccore_state = ccore_state.clone();
-                        let lock = lock.clone();
-                        async move {
-                            let _guard = if let Some(ref l) = lock {
-                                Some(l.lock().await)
-                            } else {
-                                None
-                            };
-                            dispatch_tool(&workspace_ops, &prepared, &session_id, &ccore_state).await
-                        }
+                    let cached = if prepared.is_read_only {
+                        speculative_cache.lock().remove(prepared.tool_call_id.0.as_ref())
+                    } else {
+                        None
                     };
-                    let result = if interruptible {
-                        let _wait_guard = BlockingWaitGuard::enter(blocking_wait_depth.clone());
-                        tokio::select! {
-                            biased;
-                            result = call_with_auth_retry(
+                    let result = if let Some(entry) = cached
+                        && entry.args == prepared.parsed_args
+                    {
+                        ccode_telemetry::unified_log::info(
+                            "shell.tool.speculative_dispatch_hit",
+                            Some(session_id.as_ref()),
+                            Some(serde_json::json!({
+                                "tool_name": prepared.tool_name.as_str(),
+                            })),
+                        );
+                        tracing::debug!(
+                            tool = %prepared.tool_name,
+                            "speculative: using pre-executed result from cache"
+                        );
+                        // ccore side effects: record_read for file-reading tools
+                        // 投机执行跳过了 dispatch_tool，需补 record_read 维持读后写检查
+                        if matches!(prepared.tool_name.as_str(), "read_file" | "read" | "search" | "grep" | "glob" | "list_dir") {
+                            if let Some(path) = prepared.parsed_args.get("file_path")
+                                .or_else(|| prepared.parsed_args.get("path"))
+                                .or_else(|| prepared.parsed_args.get("target_file"))
+                                .and_then(|v| v.as_str())
+                            {
+                                ccore_state.record_read(path);
+                            }
+                        }
+                        // ccore side effects: route_reflex for sensory signals
+                        if let Some(reflex_msg) = ccore_state.route_reflex(&prepared.tool_name, &entry.result.prompt_text, true) {
+                            tracing::debug!(tool = %prepared.tool_name, "{}", reflex_msg);
+                        }
+                        Ok(entry.result)
+                    } else {
+                        let run_tool = || {
+                            let prepared = Arc::clone(&prepared);
+                            let workspace_ops = workspace_ops.clone();
+                            let session_id = session_id.clone();
+                            let ccore_state = ccore_state.clone();
+                            let lock = lock.clone();
+                            async move {
+                                let _guard = if let Some(ref l) = lock {
+                                    Some(l.lock().await)
+                                } else {
+                                    None
+                                };
+                                dispatch_tool(&workspace_ops, &prepared, &session_id, &ccore_state).await
+                            }
+                        };
+                        if interruptible {
+                            let _wait_guard = BlockingWaitGuard::enter(blocking_wait_depth.clone());
+                            tokio::select! {
+                                biased;
+                                result = call_with_auth_retry(
+                                    am.as_ref(),
+                                    Some(&shared_recovery),
+                                    &prepared.tool_name,
+                                    run_tool,
+                                ) => result,
+                                _ = wait_for_pending_interjection(&pending_interjections) => {
+                                    tracing::info!(
+                                        tool = %prepared.tool_name,
+                                        "abort wait tool: interjection pending"
+                                    );
+                                    Ok(interrupted_wait_tool_result(&prepared.parsed_args))
+                                }
+                            }
+                        } else {
+                            call_with_auth_retry(
                                 am.as_ref(),
                                 Some(&shared_recovery),
                                 &prepared.tool_name,
                                 run_tool,
-                            ) => result,
-                            _ = wait_for_pending_interjection(&pending_interjections) => {
-                                tracing::info!(
-                                    tool = %prepared.tool_name,
-                                    "abort wait tool: interjection pending"
-                                );
-                                Ok(interrupted_wait_tool_result(&prepared.parsed_args))
-                            }
+                            )
+                            .await
                         }
-                    } else {
-                        call_with_auth_retry(
-                            am.as_ref(),
-                            Some(&shared_recovery),
-                            &prepared.tool_name,
-                            run_tool,
-                        )
-                        .await
                     };
                     let success = match &result {
                         Ok(tool_result) => !tool_result.output.is_error(),
@@ -2806,6 +2845,70 @@ impl SessionActor {
                 );
                 let raw_input = serde_json::from_str::<serde_json::Value>(arguments).ok();
                 let tool_call_id = acp::ToolCallId::new(std::sync::Arc::from(id.as_str()));
+
+                let is_read_only = self
+                    .agent
+                    .borrow()
+                    .tool_bridge()
+                    .tool_kind(name)
+                    .map(|k| k.is_read_only())
+                    .unwrap_or(false);
+
+                if is_read_only {
+                    if let Some(ref args) = raw_input {
+                        let wops = self.workspace_ops.clone();
+                        let cache = self.speculative_tool_results.clone();
+                        let call_id = id.clone();
+                        let tool_name = name.clone();
+                        let sid = self.session_info.id.0.to_string();
+                        let args_snapshot = args.clone();
+                        let args = args.clone();
+                        tokio::spawn(async move {
+                            let t0 = std::time::Instant::now();
+                            match wops.call_tool(&tool_name, args, &call_id, Some(&sid)).await {
+                                Ok(result) => {
+                                    let elapsed_ms = t0.elapsed().as_millis() as u64;
+                                    cache.lock().insert(
+                                        call_id.clone(),
+                                        SpeculativeCacheEntry {
+                                            result,
+                                            args: args_snapshot,
+                                        },
+                                    );
+                                    ccode_telemetry::unified_log::info(
+                                        "shell.tool.speculative_hit",
+                                        Some(&sid),
+                                        Some(serde_json::json!({
+                                            "tool_name": tool_name.as_str(),
+                                            "elapsed_ms": elapsed_ms,
+                                        })),
+                                    );
+                                    tracing::debug!(
+                                        tool = %tool_name,
+                                        elapsed_ms,
+                                        "speculative: read-only tool pre-executed and cached"
+                                    );
+                                }
+                                Err(e) => {
+                                    ccode_telemetry::unified_log::info(
+                                        "shell.tool.speculative_miss",
+                                        Some(&sid),
+                                        Some(serde_json::json!({
+                                            "tool_name": tool_name.as_str(),
+                                            "error": e.to_string(),
+                                        })),
+                                    );
+                                    tracing::debug!(
+                                        tool = %tool_name,
+                                        error = %e,
+                                        "speculative: pre-execution failed, will re-execute normally"
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
+
                 let meta = self.stamp_tool_meta(None, name, None);
                 self.send_update(
                     acp::SessionUpdate::ToolCall(
@@ -3234,6 +3337,7 @@ mod plan_mode_edit_gate_tests {
                     timeout: None,
                     description: "write via bash".into(),
                     is_background: false,
+                    side_effects: None,
                 })
             ),
             PlanEditGate::Allow,

@@ -130,6 +130,65 @@ pub struct PermissionChecker {
     mode: PermissionMode,
     /// 已批准的操作（会话级缓存）
     approved: std::collections::HashSet<String>,
+    /// 已批准的副作用作用域（会话级，借鉴 deepcode-cli）
+    approved_scopes: std::collections::HashSet<String>,
+}
+
+/// 副作用作用域（借鉴 deepcode-cli PermissionScope）
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SideEffectScope {
+    ReadInCwd,
+    ReadOutCwd,
+    WriteInCwd,
+    WriteOutCwd,
+    DeleteInCwd,
+    DeleteOutCwd,
+    QueryGitLog,
+    MutateGitLog,
+    Network,
+}
+
+impl SideEffectScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadInCwd => "read-in-cwd",
+            Self::ReadOutCwd => "read-out-cwd",
+            Self::WriteInCwd => "write-in-cwd",
+            Self::WriteOutCwd => "write-out-cwd",
+            Self::DeleteInCwd => "delete-in-cwd",
+            Self::DeleteOutCwd => "delete-out-cwd",
+            Self::QueryGitLog => "query-git-log",
+            Self::MutateGitLog => "mutate-git-log",
+            Self::Network => "network",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "read-in-cwd" => Some(Self::ReadInCwd),
+            "read-out-cwd" => Some(Self::ReadOutCwd),
+            "write-in-cwd" => Some(Self::WriteInCwd),
+            "write-out-cwd" => Some(Self::WriteOutCwd),
+            "delete-in-cwd" => Some(Self::DeleteInCwd),
+            "delete-out-cwd" => Some(Self::DeleteOutCwd),
+            "query-git-log" => Some(Self::QueryGitLog),
+            "mutate-git-log" => Some(Self::MutateGitLog),
+            "network" => Some(Self::Network),
+            _ => None,
+        }
+    }
+
+    /// 只读作用域（不会修改任何状态）
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::ReadInCwd | Self::ReadOutCwd | Self::QueryGitLog)
+    }
+}
+
+/// 副作用评估结果
+#[derive(Debug, Clone)]
+pub struct SideEffectEvaluation {
+    pub decision: PermissionDecision,
+    pub denied_scopes: Vec<String>,
 }
 
 impl PermissionChecker {
@@ -137,10 +196,69 @@ impl PermissionChecker {
         Self {
             mode,
             approved: std::collections::HashSet::new(),
+            approved_scopes: std::collections::HashSet::new(),
         }
     }
 
-    /// 检查工具权限
+    /// 评估模型声明的副作用作用域（借鉴 deepcode-cli evaluatePermissionScopes）
+    ///
+    /// 如果模型声明了 side_effects，优先使用作用域评估：
+    /// - 所有作用域都是只读的 → Allow
+    /// - 所有作用域都已批准 → Allow
+    /// - 存在未批准的危险作用域 → AskUser
+    pub fn evaluate_side_effects(
+        &self,
+        side_effects: &[String],
+    ) -> SideEffectEvaluation {
+        if side_effects.is_empty() {
+            return SideEffectEvaluation {
+                decision: PermissionDecision::AskUser,
+                denied_scopes: vec![],
+            };
+        }
+
+        let mut denied_scopes = Vec::new();
+        let mut all_read_only = true;
+
+        for scope_str in side_effects {
+            if let Some(scope) = SideEffectScope::from_str(scope_str) {
+                if !scope.is_read_only() {
+                    all_read_only = false;
+                }
+                if !scope.is_read_only() && !self.approved_scopes.contains(scope_str) {
+                    denied_scopes.push(scope_str.clone());
+                }
+            } else {
+                // 未知作用域视为危险
+                all_read_only = false;
+                denied_scopes.push(scope_str.clone());
+            }
+        }
+
+        if all_read_only || denied_scopes.is_empty() {
+            SideEffectEvaluation {
+                decision: PermissionDecision::Allow,
+                denied_scopes: vec![],
+            }
+        } else {
+            SideEffectEvaluation {
+                decision: PermissionDecision::AskUser,
+                denied_scopes,
+            }
+        }
+    }
+
+    /// 批准副作用作用域（用户确认后调用）
+    pub fn approve_scopes(&mut self, scopes: &[String]) {
+        for scope in scopes {
+            self.approved_scopes.insert(scope.clone());
+        }
+    }
+
+    /// 检查工具权限（带副作用声明快速路径）
+    ///
+    /// 当 bash 工具提供了 side_effects 声明时，优先使用作用域评估，
+    /// 跳过静态 shell 安全检查。未声明时回退到原有逻辑。
     pub fn check(&self, tool_name: &str, args: &serde_json::Value) -> PermissionDecision {
         // 统一归一化为小写，避免 LLM 发送 "Bash"/"Read" 等大小写变体导致权限静默失效
         let tool_name = tool_name.to_lowercase();
@@ -160,12 +278,30 @@ impl PermissionChecker {
                 match level {
                     PermissionLevel::Safe => PermissionDecision::Allow,
                     PermissionLevel::Dangerous => {
-                        // 先做 Shell 安全检查
+                        // bash 工具：优先使用副作用声明快速路径
                         if tool_name == "bash" {
+                            // 副作用声明制快速路径（借鉴 deepcode-cli）
+                            if let Some(side_effects) = args.get("side_effects").and_then(|v| v.as_array()) {
+                                let scopes: Vec<String> = side_effects
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect();
+                                if !scopes.is_empty() {
+                                    let evaluation = self.evaluate_side_effects(&scopes);
+                                    match evaluation.decision {
+                                        PermissionDecision::Allow => return PermissionDecision::Allow,
+                                        PermissionDecision::Deny => return PermissionDecision::Deny,
+                                        PermissionDecision::AskUser => {
+                                            // 有未批准的作用域，仍需 shell 安全检查
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 回退：静态 Shell 安全检查
                             if let Some(cmd) = args["command"].as_str() {
                                 let safety = Self::check_shell_safety(cmd);
                                 if !safety.safe {
-                                    // 存在安全风险，直接拒绝
                                     tracing::warn!(
                                         target: "ccore::permission",
                                         command = %cmd,
