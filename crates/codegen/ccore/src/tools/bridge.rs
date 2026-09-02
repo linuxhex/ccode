@@ -148,6 +148,20 @@ pub trait PostExecuteHook: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>;
 }
 
+/// 工具执行前钩子
+/// 在工具执行前触发，用于快照/备份等场景
+pub trait PreExecuteHook: Send + Sync {
+    /// 是否对该工具触发
+    fn should_run(&self, tool_name: &str) -> bool;
+
+    /// 执行钩子，返回追加到工具结果的信息（空字符串表示无追加）
+    fn run<'a>(
+        &'a self,
+        tool_name: &str,
+        args: &'a serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>;
+}
+
 use super::sandbox::{ToolSandbox, SandboxProfile, SandboxCheckResult, FileAccessOperation};
 use super::permission::{PermissionChecker, PermissionMode as ToolPermissionMode, PermissionDecision};
 
@@ -164,6 +178,8 @@ pub struct ToolBridge {
     entries: HashMap<String, ToolEntry>,
     /// 工具执行器（实际执行逻辑，后续集成 ccode 工具时填充）
     executors: HashMap<String, Box<dyn ToolExecutor>>,
+    /// 工具执行前钩子（用于快照/备份，如 Write/Edit 前的 git 快照）
+    pre_hooks: Vec<Box<dyn PreExecuteHook>>,
     /// 工具执行后钩子（用于增量验证，如 Write/Edit 后的 rustfmt 检查）
     post_hooks: Vec<Box<dyn PostExecuteHook>>,
     /// 工具执行超时（秒）
@@ -185,14 +201,15 @@ impl ToolBridge {
         let mut bridge = Self {
             entries: HashMap::new(),
             executors: HashMap::new(),
+            pre_hooks: Vec::new(),
             post_hooks: Vec::new(),
             execution_timeout_secs: 120,
             retry_config: ToolRetryConfig::default(),
             sandbox: ToolSandbox::new(SandboxProfile::default()),
         };
         bridge.register_defaults();
-        // 注册内置工具执行器（bash/read/write/edit/grep/glob/list_dir）
-        // 以及 post_hook（Write/Edit 后的 rustfmt 检查）
+        // 注册内置工具执行器（bash/read_file/write_file/search_replace/grep/glob/list_dir 等）
+        // 以及 post_hook（write_file/search_replace 后的 rustfmt 检查）
         super::builtin::register_builtin_executors(&mut bridge);
         bridge
     }
@@ -385,16 +402,38 @@ replace="println!(\"Hello, World!\");"
 
 **注意事项**:
 - 必须精确匹配要替换的内容,包括空格和缩进
-- 如果搜索文本在文件中出现多次,会替换所有匹配项
+- 如果搜索文本在文件中出现多次,默认会报错；设置 `replace_all=true` 可替换所有匹配项
 - 搜索文本不匹配时会返回错误,不会修改文件
 - 支持多行搜索,但需要包含完整的文本块
+- 匹配会尝试四级模糊阶梯：精确 → 行尾归一(CRLF/LF) → 首尾空白容忍 → Unicode 标点归一
+- `mode=insert` 可按行号插入内容（需提供 `after_line` 和 `content`）
+- `mode=write` 可完全覆盖文件内容（需提供 `content`）
 - 建议先用 `read_file` 查看文件内容,确保搜索文本准确"###.into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "文件路径" },
-                        "search": { "type": "string", "description": "要搜索的文本" },
-                        "replace": { "type": "string", "description": "替换文本" }
+                        "search": { "type": "string", "description": "要搜索的文本（replace 模式必填）" },
+                        "replace": { "type": "string", "description": "替换文本（replace 模式必填）" },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["replace", "insert", "write"],
+                            "description": "编辑模式：replace=搜索替换(默认), insert=按行号插入, write=完全覆盖",
+                            "default": "replace"
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "replace 模式下，是否替换所有匹配项（默认 false，多处匹配时报错）",
+                            "default": false
+                        },
+                        "after_line": {
+                            "type": "integer",
+                            "description": "insert 模式：在此行号后插入 content（0=文件开头）"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "insert/write 模式：要插入或写入的内容"
+                        }
                     },
                     "required": ["path", "search", "replace"]
                 }),
@@ -553,25 +592,6 @@ path="tests"
             read_only: true,
         });
 
-        // ---- 用户交互 ----
-        self.register(ToolEntry {
-            definition: ToolDefinition {
-                name: "ask_user_question".into(),
-                description: "向用户提问，等待用户回答。".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "question": { "type": "string", "description": "问题内容" },
-                        "options": { "type": "array", "items": { "type": "object" }, "description": "选项列表" }
-                    },
-                    "required": ["question"]
-                }),
-            },
-            category: ToolCategory::UserInteraction,
-            requires_confirmation: false,
-            read_only: true,
-        });
-
         // ---- 任务管理 ----
         self.register(ToolEntry {
             definition: ToolDefinition {
@@ -592,41 +612,6 @@ path="tests"
             read_only: false,
         });
 
-        self.register(ToolEntry {
-            definition: ToolDefinition {
-                name: "scheduler".into(),
-                description: "定时执行命令或监控文件变化。".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "action": { "type": "string", "enum": ["create", "delete", "list"], "description": "操作类型" }
-                    },
-                    "required": ["action"]
-                }),
-            },
-            category: ToolCategory::Task,
-            requires_confirmation: true,
-            read_only: false,
-        });
-
-        self.register(ToolEntry {
-            definition: ToolDefinition {
-                name: "monitor".into(),
-                description: "监控文件变化并报告。".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "监控路径" },
-                        "action": { "type": "string", "enum": ["start", "stop", "list"], "description": "操作类型" }
-                    },
-                    "required": ["action"]
-                }),
-            },
-            category: ToolCategory::Task,
-            requires_confirmation: false,
-            read_only: true,
-        });
-
         // ---- 代码分析 ----
         self.register(ToolEntry {
             definition: ToolDefinition {
@@ -645,76 +630,37 @@ path="tests"
             read_only: true,
         });
 
-        // ---- 记忆 ----
+        // glob：按文件名模式查找文件（GlobExecutor 已实现，此前漏了声明导致模型不可见）
         self.register(ToolEntry {
             definition: ToolDefinition {
-                name: "memory_search".into(),
-                description: "搜索记忆（短期/长期）。".into(),
+                name: "glob".into(),
+                description: "按 glob 模式查找文件路径，适合按文件名/扩展名定位文件。查找文件内容请用 grep。".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "搜索查询" }
+                        "pattern": { "type": "string", "description": "glob 模式，如 **/*.rs" },
+                        "path": { "type": "string", "description": "搜索起始目录，默认当前目录" },
+                        "exclude": { "type": "string", "description": "要排除的 glob 模式" }
                     },
-                    "required": ["query"]
+                    "required": ["pattern"]
                 }),
             },
-            category: ToolCategory::Memory,
+            category: ToolCategory::FileSystem,
             requires_confirmation: false,
             read_only: true,
         });
 
+        // skill：调用预置技能（SkillExecutor 已实现，此前漏了声明导致模型不可见）
         self.register(ToolEntry {
             definition: ToolDefinition {
-                name: "memory_get".into(),
-                description: "获取指定记忆条目的完整内容。".into(),
+                name: "skill".into(),
+                description: "调用预置技能，执行封装好的领域流程。".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "id": { "type": "string", "description": "记忆条目 ID" }
+                        "skill": { "type": "string", "description": "技能名称" }
                     },
-                    "required": ["id"]
-                }),
-            },
-            category: ToolCategory::Memory,
-            requires_confirmation: false,
-            read_only: true,
-        });
-
-        // ---- 计划模式 ----
-        self.register(ToolEntry {
-            definition: ToolDefinition {
-                name: "enter_plan_mode".into(),
-                description: "进入 Plan 模式，Agent 只生成计划不执行。".into(),
-                parameters: serde_json::json!({ "type": "object", "properties": {} }),
-            },
-            category: ToolCategory::UserInteraction,
-            requires_confirmation: false,
-            read_only: true,
-        });
-
-        self.register(ToolEntry {
-            definition: ToolDefinition {
-                name: "exit_plan_mode".into(),
-                description: "退出 Plan 模式，恢复执行。".into(),
-                parameters: serde_json::json!({ "type": "object", "properties": {} }),
-            },
-            category: ToolCategory::UserInteraction,
-            requires_confirmation: false,
-            read_only: true,
-        });
-
-        // ---- TODO/目标 ----
-        self.register(ToolEntry {
-            definition: ToolDefinition {
-                name: "todo".into(),
-                description: "管理 TODO 列表。".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "action": { "type": "string", "enum": ["add", "complete", "list"], "description": "操作类型" },
-                        "content": { "type": "string", "description": "TODO 内容" }
-                    },
-                    "required": ["action"]
+                    "required": ["skill"]
                 }),
             },
             category: ToolCategory::Task,
@@ -722,76 +668,26 @@ path="tests"
             read_only: false,
         });
 
+        // tool_search：按需获取其他工具的完整参数 schema，减少每轮工具定义的 token 消耗
         self.register(ToolEntry {
             definition: ToolDefinition {
-                name: "update_goal".into(),
-                description: "更新当前目标。".into(),
+                name: "tool_search".into(),
+                description: "按需获取工具的完整参数定义。当你需要使用某个工具但不确定其参数格式时，调用此工具获取完整 schema。".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "goal": { "type": "string", "description": "目标描述" }
+                        "tool_names": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "要获取完整定义的工具名称列表"
+                        }
                     },
-                    "required": ["goal"]
+                    "required": ["tool_names"]
                 }),
             },
-            category: ToolCategory::Task,
+            category: ToolCategory::Search,
             requires_confirmation: false,
-            read_only: false,
-        });
-
-        // ---- 媒体生成 ----
-        self.register(ToolEntry {
-            definition: ToolDefinition {
-                name: "image_gen".into(),
-                description: "生成图像。".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "prompt": { "type": "string", "description": "图像描述" }
-                    },
-                    "required": ["prompt"]
-                }),
-            },
-            category: ToolCategory::MediaGeneration,
-            requires_confirmation: true,
-            read_only: false,
-        });
-
-        self.register(ToolEntry {
-            definition: ToolDefinition {
-                name: "video_gen".into(),
-                description: "生成视频。".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "prompt": { "type": "string", "description": "视频描述" }
-                    },
-                    "required": ["prompt"]
-                }),
-            },
-            category: ToolCategory::MediaGeneration,
-            requires_confirmation: true,
-            read_only: false,
-        });
-
-        // ---- MCP ----
-        self.register(ToolEntry {
-            definition: ToolDefinition {
-                name: "mcp".into(),
-                description: "调用 MCP 外部工具。".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "server": { "type": "string", "description": "MCP 服务名称" },
-                        "tool": { "type": "string", "description": "工具名称" },
-                        "arguments": { "type": "object", "description": "工具参数" }
-                    },
-                    "required": ["server", "tool"]
-                }),
-            },
-            category: ToolCategory::Shell,
-            requires_confirmation: true,
-            read_only: false,
+            read_only: true,
         });
     }
 
@@ -807,6 +703,10 @@ path="tests"
     }
 
     /// 注册工具执行后钩子（用于增量验证，如 Write/Edit 后的 rustfmt 检查）
+    pub fn register_pre_hook(&mut self, hook: Box<dyn PreExecuteHook>) {
+        self.pre_hooks.push(hook);
+    }
+
     pub fn register_post_hook(&mut self, hook: Box<dyn PostExecuteHook>) {
         self.post_hooks.push(hook);
     }
@@ -932,6 +832,19 @@ path="tests"
 
         let mut attempt = 0u32;
 
+        // 工具执行前，遍历 pre_hooks 做快照/备份
+        // 钩子自身的失败不阻塞工具执行，仅把提示信息追加到结果
+        let mut pre_hook_output = String::new();
+        for hook in &self.pre_hooks {
+            if !hook.should_run(&request.tool_name) {
+                continue;
+            }
+            let info = hook.run(&request.tool_name, &request.arguments).await;
+            if !info.is_empty() {
+                pre_hook_output.push_str(&info);
+            }
+        }
+
         loop {
             attempt += 1;
 
@@ -964,6 +877,10 @@ path="tests"
                             "\n[重试成功：第 {} 次尝试成功]",
                             attempt
                         ));
+                    }
+                    // 将 pre_hook 输出（如 git 快照信息）前置到工具结果
+                    if !pre_hook_output.is_empty() {
+                        final_output = format!("{}{}", pre_hook_output, final_output);
                     }
                     let elapsed = start.elapsed().as_millis() as u64;
                     tracing::debug!(
@@ -1207,8 +1124,55 @@ mod tests {
     #[test]
     fn test_default_tools_registered() {
         let bridge = ToolBridge::new();
-        // 至少 20 个默认工具
-        assert!(bridge.tool_count() >= 20, "默认工具数量不足：{}", bridge.tool_count());
+        // 至少覆盖文件读写/搜索/执行等核心能力
+        assert!(bridge.tool_count() >= 10, "默认工具数量不足：{}", bridge.tool_count());
+    }
+
+    /// 每个声明给模型的工具都必须真能执行。
+    ///
+    /// 只数工具条数无法暴露「声明了但没有 executor」的断裂——模型会调用一个
+    /// 不存在的工具并拿到「未知工具」。这里断言声明与执行能力严格对齐。
+    /// `task` / `tool_search` 由 ToolNode 在到达 bridge 前单独拦截，属于例外。
+    #[test]
+    fn test_every_declared_tool_is_executable() {
+        const INTERCEPTED_BY_TOOL_NODE: &[&str] = &["task", "tool_search"];
+
+        let bridge = ToolBridge::new();
+        let phantom: Vec<&str> = bridge
+            .tool_definitions()
+            .iter()
+            .map(|d| d.name.as_str())
+            .filter(|name| !INTERCEPTED_BY_TOOL_NODE.contains(name))
+            .filter(|name| !bridge.executors.contains_key(*name))
+            .collect();
+
+        assert!(
+            phantom.is_empty(),
+            "以下工具声明给了模型但没有 executor，调用必然失败：{phantom:?}"
+        );
+    }
+
+    /// 有 executor 却没声明的工具，模型永远看不到，等于白实现。
+    #[test]
+    fn test_every_executor_is_declared() {
+        let bridge = ToolBridge::new();
+        let declared: std::collections::HashSet<&str> = bridge
+            .tool_definitions()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+
+        let undeclared: Vec<&str> = bridge
+            .executors
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|name| !declared.contains(*name))
+            .collect();
+
+        assert!(
+            undeclared.is_empty(),
+            "以下工具有 executor 但未声明，模型不可见：{undeclared:?}"
+        );
     }
 
     #[test]

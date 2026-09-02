@@ -12,7 +12,7 @@
 //! - web_fetch: 网页抓取（HTML→文本转换）
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::bridge::ToolExecutor;
@@ -20,7 +20,7 @@ use super::output_formatter;
 use super::path_validator;
 use super::read_tracker;
 use super::gitignore_filter::GitignoreFilter;
-use super::file_transaction::TempFileGuard;
+use super::temp_guard::TempFileGuard;
 
 /// 全局 Gitignore 过滤器
 static GITIGNORE: std::sync::OnceLock<GitignoreFilter> = std::sync::OnceLock::new();
@@ -263,7 +263,7 @@ impl ToolExecutor for ReadExecutor {
     async fn execute(&self, args: &serde_json::Value) -> anyhow::Result<String> {
         let path = args["path"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("read: 缺少 path 参数"))?;
+            .ok_or_else(|| anyhow::anyhow!("read_file: 缺少 path 参数"))?;
 
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
         let limit = args["limit"].as_u64().unwrap_or(2000) as usize;
@@ -362,7 +362,7 @@ impl ToolExecutor for ReadExecutor {
         Ok(result)
     }
 
-    fn name(&self) -> &str { "read" }
+    fn name(&self) -> &str { "read_file" }
 }
 
 // ─── WriteExecutor ───────────────────────────────────────────────────────────
@@ -374,10 +374,10 @@ impl ToolExecutor for WriteExecutor {
     async fn execute(&self, args: &serde_json::Value) -> anyhow::Result<String> {
         let path = args["path"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("write: 缺少 path 参数"))?;
+            .ok_or_else(|| anyhow::anyhow!("write_file: 缺少 path 参数"))?;
         let content = args["content"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("write: 缺少 content 参数"))?;
+            .ok_or_else(|| anyhow::anyhow!("write_file: 缺少 content 参数"))?;
 
         // 先读后写约束：检查文件是否已被读取
         // 如果文件已存在，必须先读取
@@ -415,13 +415,13 @@ impl ToolExecutor for WriteExecutor {
         }
 
         // 原子写入：先写临时文件，再 rename
-        let tmp_path = validation.canonical.with_extension("tmp");
+        let tmp_path = unique_tmp_path(&validation.canonical);
         let _guard = TempFileGuard::new(&tmp_path);
         tokio::fs::write(&tmp_path, content).await
-            .map_err(|e| anyhow::anyhow!("write: 写入临时文件失败：{}", e))?;
+            .map_err(|e| anyhow::anyhow!("write_file: 写入临时文件失败：{}", e))?;
 
         tokio::fs::rename(&tmp_path, &validation.canonical).await
-            .map_err(|e| anyhow::anyhow!("write: 重命名到目标路径失败：{}", e))?;
+            .map_err(|e| anyhow::anyhow!("write_file: 重命名到目标路径失败：{}", e))?;
 
         // rename 成功，标记 guard 已提交（临时文件不再存在，无需清理）
         // _guard 在此处 drop，但文件已 rename 走，TempFileGuard 检查 exists() 为 false
@@ -429,7 +429,7 @@ impl ToolExecutor for WriteExecutor {
 
         // 写入后验证
         let verified = tokio::fs::read_to_string(&validation.canonical).await
-            .map_err(|e| anyhow::anyhow!("write: 验证写入失败：{}", e))?;
+            .map_err(|e| anyhow::anyhow!("write_file: 验证写入失败：{}", e))?;
 
         if verified.len() != content.len() {
             return Err(anyhow::anyhow!(
@@ -441,7 +441,244 @@ impl ToolExecutor for WriteExecutor {
         Ok(format!("已写入 {} ({} bytes, 已验证)", path, content.len()))
     }
 
-    fn name(&self) -> &str { "write" }
+    fn name(&self) -> &str { "write_file" }
+}
+
+// ─── 唯一临时文件路径（不用 with_extension，照抄 ccode-update unique_temp_sibling）────────
+
+/// 生成唯一临时文件路径：`<base>.{pid}-{seq}.tmp`
+///
+/// 不用 `Path::with_extension("tmp")`——它会**替换**最后一段扩展名而非追加
+/// （`data.json` → `data.tmp`），若仓里已有 `data.tmp` 会静默覆盖。
+/// PID + per-process counter 保证唯一，不会撞到既有文件。
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    path.with_file_name(name)
+}
+
+// ─── 模糊匹配（借鉴 codex seek_sequence 四级阶梯）──────────────────────────────
+
+/// 归一化行尾：`\r\n` / `\r` → `\n`
+fn normalize_line_endings(s: &str) -> String {
+    // 快速路径：无 \r 则原样返回
+    if !s.contains('\r') {
+        return s.to_string();
+    }
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            result.push('\n');
+            if chars.peek() == Some(&'\n') {
+                chars.next(); // 消费 \r\n 中的 \n
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// 检测文件主导行尾风格，返回 `\r\n` 或 `\n`
+#[allow(dead_code)]
+fn detect_line_ending(s: &str) -> &str {
+    let crlf_count = s.matches("\r\n").count();
+    let lf_count = s.matches('\n').count();
+    // 多数 \n 是 \r\n 的一部分 → CRLF 主导
+    if crlf_count > 0 && crlf_count * 2 >= lf_count {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// Unicode 标点归一化（照抄 codex seek_sequence.rs:81-99 的 normalise）
+fn unicode_normalise(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| match c {
+            // 各种 dash/hyphen → ASCII '-'
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            // 花单引号 → '\''
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            // 花双引号 → '"'
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            // 不间断空格等 → 普通空格
+            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+            | '\u{3000}' => ' ',
+            other => other,
+        })
+        .collect::<String>()
+}
+
+/// 在 content 中模糊查找 search 的**第一个**匹配。
+///
+/// 四级阶梯（从严到宽），与 codex `seek_sequence` 同构：
+/// 1. 精确子串匹配
+/// 2. 行尾归一化后匹配（解决 CRLF vs LF）
+/// 3. 逐行 trim 后匹配（解决首尾空白差异）
+/// 4. 逐行 Unicode 归一化后匹配（解决花引号/破折号等）
+///
+/// 返回 `(匹配起始字节偏移, 匹配字节长度)` 或 `None`。
+fn fuzzy_match_one(content: &str, search: &str) -> Option<(usize, usize)> {
+    // 1. 精确匹配
+    if let Some(byte_pos) = content.find(search) {
+        return Some((byte_pos, search.len()));
+    }
+
+    // 2. 行尾归一化后匹配
+    let norm_content = normalize_line_endings(content);
+    let norm_search = normalize_line_endings(search);
+    if norm_content != content || norm_search != search {
+        if let Some(pos) = norm_content.find(&norm_search) {
+            // 把归一化后的偏移映射回原文：在原文中找到对应位置
+            return map_normalized_offset(content, &norm_content, pos, norm_search.len());
+        }
+    }
+
+    // 3. 逐行 trim 匹配
+    if let Some(result) = fuzzy_match_linewise(content, search, |a, b| a.trim() == b.trim()) {
+        return Some(result);
+    }
+
+    // 4. 逐行 Unicode 归一化匹配
+    if let Some(result) = fuzzy_match_linewise(content, search, |a, b| {
+        unicode_normalise(a) == unicode_normalise(b)
+    }) {
+        return Some(result);
+    }
+
+    None
+}
+
+/// 把归一化内容中的字节偏移映射回原始内容。
+/// 因为归一化只可能缩短（\r\n → \n），所以原文偏移 ≥ 归一化偏移。
+fn map_normalized_offset(original: &str, _normalized: &str, norm_pos: usize, norm_len: usize) -> Option<(usize, usize)> {
+    // 逐字符对齐：归一化后的每个字符对应原文中一个或两个字符（\r\n → \n）
+    let mut orig_idx = 0usize;
+    let mut norm_idx = 0usize;
+    let mut orig_start = None;
+    let mut orig_end = None;
+
+    let orig_bytes = original.as_bytes();
+
+    while orig_idx < original.len() && norm_idx <= norm_pos + norm_len {
+        if norm_idx == norm_pos {
+            orig_start = Some(orig_idx);
+        }
+        if norm_idx == norm_pos + norm_len {
+            orig_end = Some(orig_idx);
+            break;
+        }
+
+        // 原文是 \r\n 而归一化是 \n
+        if orig_bytes[orig_idx] == b'\r' && orig_idx + 1 < original.len() && orig_bytes[orig_idx + 1] == b'\n' {
+            orig_idx += 2; // \r\n
+        } else {
+            orig_idx += 1;
+        }
+        norm_idx += 1;
+    }
+
+    // 处理 norm_pos + norm_len 恰好在末尾的情况
+    if orig_start.is_some() && orig_end.is_none() && norm_idx == norm_pos + norm_len {
+        orig_end = Some(orig_idx);
+    }
+
+    match (orig_start, orig_end) {
+        (Some(s), Some(e)) if e > s => Some((s, e - s)),
+        _ => None,
+    }
+}
+
+/// 逐行模糊匹配：把 content 和 search 都按行切分，用 `line_eq` 比较行对。
+/// 返回第一个匹配的起始字节偏移和字节长度。
+fn fuzzy_match_linewise<F>(content: &str, search: &str, line_eq: F) -> Option<(usize, usize)>
+where
+    F: Fn(&str, &str) -> bool,
+{
+    let content_lines: Vec<&str> = content.lines().collect();
+    let search_lines: Vec<&str> = search.lines().collect();
+    if search_lines.is_empty() || search_lines.len() > content_lines.len() {
+        return None;
+    }
+
+    // 逐行起始字节偏移表
+    let mut line_start_offsets: Vec<usize> = Vec::with_capacity(content_lines.len() + 1);
+    let mut current_offset = 0usize;
+    for line in &content_lines {
+        line_start_offsets.push(current_offset);
+        current_offset += line.len();
+        // 跳过行尾分隔符
+        if current_offset < content.len() {
+            if content.as_bytes().get(current_offset) == Some(&b'\r') {
+                current_offset += 1;
+                if current_offset < content.len() && content.as_bytes().get(current_offset) == Some(&b'\n') {
+                    current_offset += 1;
+                }
+            } else if content.as_bytes().get(current_offset) == Some(&b'\n') {
+                current_offset += 1;
+            }
+        }
+    }
+    line_start_offsets.push(current_offset); // 末尾哨兵
+
+    for start_line in 0..=content_lines.len() - search_lines.len() {
+        let mut matched = true;
+        for (i, search_line) in search_lines.iter().enumerate() {
+            if !line_eq(content_lines[start_line + i], search_line) {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            let byte_start = line_start_offsets[start_line];
+            // 匹配区域到 search 最后一行结尾（含行尾）
+            let last_line_end = line_start_offsets[start_line + search_lines.len() - 1]
+                + content_lines[start_line + search_lines.len() - 1].len();
+            return Some((byte_start, last_line_end - byte_start));
+        }
+    }
+    None
+}
+
+/// 查找 search 在 content 中的所有匹配位置（用于 replace_all）。
+/// 先尝试精确匹配，若命中则直接返回所有精确位置；
+/// 否则用 `fuzzy_match_one` 找到第一个模糊匹配，返回单元素列表。
+fn fuzzy_find_all(content: &str, search: &str) -> Vec<(usize, usize)> {
+    // 精确匹配：收集所有出现位置
+    let mut exact_positions = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(pos) = content[search_from..].find(search) {
+        let abs_pos = search_from + pos;
+        exact_positions.push((abs_pos, search.len()));
+        search_from = abs_pos + search.len();
+        if search_from >= content.len() {
+            break;
+        }
+    }
+    if !exact_positions.is_empty() {
+        return exact_positions;
+    }
+
+    // 模糊匹配：只返回第一个（多模糊匹配替换风险太大）
+    if let Some(match_info) = fuzzy_match_one(content, search) {
+        vec![match_info]
+    } else {
+        Vec::new()
+    }
 }
 
 // ─── EditExecutor ────────────────────────────────────────────────────────────
@@ -459,7 +696,7 @@ impl ToolExecutor for EditExecutor {
     async fn execute(&self, args: &serde_json::Value) -> anyhow::Result<String> {
         let path = args["path"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("edit: 缺少 path 参数"))?;
+            .ok_or_else(|| anyhow::anyhow!("search_replace: 缺少 path 参数"))?;
 
         let mode = args["mode"].as_str().unwrap_or("replace");
 
@@ -469,7 +706,7 @@ impl ToolExecutor for EditExecutor {
 
         if !validation.in_workspace {
             return Err(anyhow::anyhow!(
-                "edit: 路径 {} 在工作目录外，操作被拒绝", path
+                "search_replace: 路径 {} 在工作目录外，操作被拒绝", path
             ));
         }
 
@@ -480,46 +717,57 @@ impl ToolExecutor for EditExecutor {
             "replace" => self.execute_replace(args, &validation.canonical).await,
             "insert" => self.execute_insert(args, &validation.canonical).await,
             "write" => self.execute_write(args, &validation.canonical).await,
-            _ => Err(anyhow::anyhow!("edit: 未知模式 '{}'，支持: replace/insert/write", mode)),
+            _ => Err(anyhow::anyhow!("search_replace: 未知模式 '{}'，支持: replace/insert/write", mode)),
         }
     }
 
-    fn name(&self) -> &str { "edit" }
+    fn name(&self) -> &str { "search_replace" }
 }
 
 impl EditExecutor {
     /// 替换模式（原有逻辑升级，含 diff 展示）
     async fn execute_replace(&self, args: &serde_json::Value, canonical: &Path) -> anyhow::Result<String> {
-        let old_text = args["old_text"]
+        // 参数名以工具声明（bridge.rs 的 search_replace 定义）为权威：search / replace。
+        // 同时回退兼容 old_text / new_text，避免既有调用方在改名后失效。
+        let old_text = args["search"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("edit: 缺少 old_text 参数"))?;
-        let new_text = args["new_text"]
+            .or_else(|| args["old_text"].as_str())
+            .ok_or_else(|| anyhow::anyhow!("search_replace: 缺少 search 参数"))?;
+        let new_text = args["replace"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("edit: 缺少 new_text 参数"))?;
+            .or_else(|| args["new_text"].as_str())
+            .ok_or_else(|| anyhow::anyhow!("search_replace: 缺少 replace 参数"))?;
 
         let content = tokio::fs::read_to_string(canonical).await
-            .map_err(|e| anyhow::anyhow!("edit: 读取 {} 失败：{}", canonical.display(), e))?;
+            .map_err(|e| anyhow::anyhow!("search_replace: 读取 {} 失败：{}", canonical.display(), e))?;
 
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
+        // 模糊查找所有匹配（四级阶梯：精确 → 行尾归一 → trim → Unicode 归一）
+        let matches = fuzzy_find_all(&content, old_text);
+        if matches.is_empty() {
+            return Err(anyhow::anyhow!("search_replace: 未找到搜索文本（已尝试精确/行尾归一/空白容忍/Unicode 归一四级匹配）"));
+        }
+
         let (new_content, _match_count) = if replace_all {
-            let count = content.matches(old_text).count();
-            if count == 0 {
-                return Err(anyhow::anyhow!("edit: 未找到搜索文本"));
+            // 从后往前替换，避免偏移失效
+            let mut result = content.clone();
+            let count = matches.len();
+            for (pos, len) in matches.iter().rev() {
+                result.replace_range(*pos..*pos + *len, new_text);
             }
-            (content.replace(old_text, new_text), count)
+            (result, count)
         } else {
-            let count = content.matches(old_text).count();
-            if count == 0 {
-                return Err(anyhow::anyhow!("edit: 未找到搜索文本"));
-            }
-            if count > 1 {
+            if matches.len() > 1 {
                 return Err(anyhow::anyhow!(
-                    "edit: 找到 {} 处匹配，请提供更具体的上下文或设置 replace_all=true",
-                    count
+                    "search_replace: 找到 {} 处匹配，请提供更具体的上下文或设置 replace_all=true",
+                    matches.len()
                 ));
             }
-            (content.replacen(old_text, new_text, 1), 1)
+            let (pos, len) = matches[0];
+            let mut result = content.clone();
+            result.replace_range(pos..pos + len, new_text);
+            (result, 1)
         };
 
         // 生成 diff（借鉴 Claude Code 编辑后的 diff 展示）
@@ -555,12 +803,12 @@ impl EditExecutor {
             .ok_or_else(|| anyhow::anyhow!("edit(insert): 缺少 content 参数"))?;
 
         let file_content = tokio::fs::read_to_string(canonical).await
-            .map_err(|e| anyhow::anyhow!("edit: 读取 {} 失败：{}", canonical.display(), e))?;
+            .map_err(|e| anyhow::anyhow!("search_replace: 读取 {} 失败：{}", canonical.display(), e))?;
 
         let lines: Vec<&str> = file_content.lines().collect();
         if after_line > lines.len() {
             return Err(anyhow::anyhow!(
-                "edit: after_line {} 超出文件行数 {}",
+                "search_replace: after_line {} 超出文件行数 {}",
                 after_line, lines.len()
             ));
         }
@@ -596,7 +844,7 @@ impl EditExecutor {
 
     /// 原子写入
     async fn atomic_write(&self, path: &Path, content: &str) -> anyhow::Result<()> {
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = unique_tmp_path(path);
         let _guard = TempFileGuard::new(&tmp_path);
         tokio::fs::write(&tmp_path, content).await
             .map_err(|e| anyhow::anyhow!("写入临时文件失败：{}", e))?;
@@ -1080,6 +1328,8 @@ pub fn register_builtin_executors(bridge: &mut super::bridge::ToolBridge) {
     bridge.register_executor(Box::new(super::lsp::LspExecutor));
     bridge.register_executor(Box::new(super::skill::SkillExecutor));
 
+    // 注册 pre_hook：Write/Edit 前自动创建 git 快照，支持 undo
+    bridge.register_pre_hook(Box::new(super::git_snapshot_hook::GitSnapshotHook));
     // 注册 post_hook：Write/Edit 后对 .rs 文件运行 rustfmt --check 做增量验证
     bridge.register_post_hook(Box::new(super::rustfmt_hook::RustfmtHook));
 }
@@ -1204,5 +1454,138 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    // ── fuzzy_match 测试 ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_fuzzy_match_exact() {
+        let content = "fn main() {\n    println!(\"hello\");\n}\n";
+        let search = "println!(\"hello\");";
+        let result = fuzzy_match_one(content, search);
+        assert!(result.is_some());
+        let (pos, len) = result.unwrap();
+        assert_eq!(&content[pos..pos + len], search);
+    }
+
+    #[test]
+    fn test_fuzzy_match_crlf_content_lf_search() {
+        // 文件用 CRLF，模型给 LF search —— 这是 P0-1 的核心场景
+        let content = "fn main() {\r\n    println!(\"hello\");\r\n}\r\n";
+        let search = "println!(\"hello\");";
+        let result = fuzzy_match_one(content, search);
+        assert!(result.is_some(), "CRLF 内容 + LF search 应通过行尾归一化命中");
+    }
+
+    #[test]
+    fn test_fuzzy_match_crlf_multiline() {
+        // 多行 search，文件用 CRLF
+        let content = "fn old() {\r\n    42\r\n}\r\nfn new() {}\r\n";
+        let search = "fn old() {\n    42\n}";
+        let result = fuzzy_match_one(content, search);
+        assert!(result.is_some(), "多行 CRLF 内容 + LF search 应命中");
+    }
+
+    #[test]
+    fn test_fuzzy_match_trim_whitespace() {
+        // 文件行尾有空格，search 没有
+        let content = "fn main() {   \n    let x = 1;   \n}\n";
+        let search = "fn main() {\n    let x = 1;\n}";
+        let result = fuzzy_match_one(content, search);
+        assert!(result.is_some(), "首尾空白差异应通过 trim 级命中");
+    }
+
+    #[test]
+    fn test_fuzzy_match_unicode_normalise() {
+        // 文件用花引号和 en-dash，search 用直引号和 ASCII dash
+        let content = "let s = \u{201c}hello\u{201d}; // range 1\u{2013}3";
+        let search = "let s = \"hello\"; // range 1-3";
+        let result = fuzzy_match_one(content, search);
+        assert!(result.is_some(), "Unicode 标点差异应通过归一化级命中");
+    }
+
+    #[test]
+    fn test_fuzzy_match_no_match() {
+        let content = "fn main() {}\n";
+        let search = "fn missing() {}";
+        assert!(fuzzy_match_one(content, search).is_none());
+    }
+
+    #[test]
+    fn test_fuzzy_find_all_multiple_exact() {
+        let content = "let x = 1;\nlet x = 1;\nlet x = 1;\n";
+        let search = "let x = 1;";
+        let matches = fuzzy_find_all(content, search);
+        assert_eq!(matches.len(), 3, "精确匹配应找到全部 3 处");
+    }
+
+    #[test]
+    fn test_fuzzy_find_all_none() {
+        let content = "fn main() {}\n";
+        let search = "missing";
+        let matches = fuzzy_find_all(content, search);
+        assert!(matches.is_empty());
+    }
+
+    // ── unique_tmp_path 测试 ──────────────────────────────────────────────
+
+    #[test]
+    fn test_unique_tmp_path_preserves_extension() {
+        let path = std::path::Path::new("/tmp/data.json");
+        let tmp = unique_tmp_path(path);
+        let name = tmp.file_name().unwrap().to_str().unwrap();
+        // 应该是 data.json.{pid}-{seq}.tmp，不是 data.tmp
+        assert!(name.starts_with("data.json."), "扩展名应保留: {}", name);
+        assert!(name.ends_with(".tmp"), "应以 .tmp 结尾: {}", name);
+    }
+
+    #[test]
+    fn test_unique_tmp_path_no_extension() {
+        let path = std::path::Path::new("/tmp/Makefile");
+        let tmp = unique_tmp_path(path);
+        let name = tmp.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("Makefile."), "无扩展名文件应保留全名: {}", name);
+        assert!(name.ends_with(".tmp"));
+    }
+
+    #[test]
+    fn test_unique_tmp_path_unique() {
+        let path = std::path::Path::new("/tmp/data.json");
+        let tmp1 = unique_tmp_path(path);
+        let tmp2 = unique_tmp_path(path);
+        assert_ne!(tmp1, tmp2, "连续调用应产生不同路径（seq 递增）");
+    }
+
+    #[test]
+    fn test_unique_tmp_path_not_with_extension() {
+        // 对比 with_extension 的行为：它会替换扩展名
+        let path = std::path::Path::new("/tmp/data.json");
+        let with_ext = path.with_extension("tmp");
+        let unique = unique_tmp_path(path);
+        // with_extension 给 "data.tmp"，unique 给 "data.json.*.tmp"
+        assert_eq!(with_ext.file_name().unwrap(), "data.tmp");
+        assert_ne!(unique, with_ext, "unique_tmp_path 不应等于 with_extension");
+    }
+
+    // ── normalize_line_endings 测试 ───────────────────────────────────────
+
+    #[test]
+    fn test_normalize_line_endings_crlf() {
+        assert_eq!(normalize_line_endings("a\r\nb\r\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn test_normalize_line_endings_cr_only() {
+        assert_eq!(normalize_line_endings("a\rb\r"), "a\nb\n");
+    }
+
+    #[test]
+    fn test_normalize_line_endings_already_lf() {
+        assert_eq!(normalize_line_endings("a\nb\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn test_normalize_line_endings_no_newlines() {
+        assert_eq!(normalize_line_endings("hello"), "hello");
     }
 }

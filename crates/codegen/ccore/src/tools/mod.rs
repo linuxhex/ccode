@@ -12,10 +12,10 @@
 
 pub mod bridge;
 pub mod builtin;
-pub mod checkpoint;
 pub mod compile_feedback;
-pub mod file_transaction;
 pub mod gitignore_filter;
+pub mod hook_adapter;
+pub mod git_snapshot_hook;
 pub mod hook_bridge;
 pub mod lsp;
 pub mod output_formatter;
@@ -27,12 +27,14 @@ pub mod read_tracker;
 pub mod rustfmt_hook;
 pub mod sandbox;
 pub mod skill;
+pub mod temp_guard;
 pub mod verify;
 
 pub use compile_feedback::{
-    format_for_injection, run_cargo_check, run_rustfmt_check, CompileError, CompileReport,
+    detect_project_type, format_for_injection, run_cargo_check, run_compile_check,
+    run_go_check, run_python_syntax_check, run_rustfmt_check, run_typecheck_check,
+    CompileError, CompileReport, ProjectType,
 };
-pub use file_transaction::FileTransaction;
 pub use sandbox::{ToolSandbox, SandboxProfile, SandboxProfileName, SandboxCheckResult, FileAccessOperation};
 
 use serde::{Deserialize, Serialize};
