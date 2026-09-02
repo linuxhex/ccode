@@ -9,6 +9,10 @@
 | `docs/requirements/source-comparison/changes.md` | 新增 | 本文件 |
 | `docs/requirements/source-comparison/workflow-state.json` | 新增 | 工作流状态 |
 | `docs/requirements/source-comparison/tui-comparison.md` | 新增 | TUI 交互对比分析（修正版） |
+| `docs/requirements/source-comparison/deep-comparison.md` | 新增 | Phase B/C 深度对比：沙箱安全、Sub-Agent 生命周期、错误处理、流式/Prompt、配置/插件 |
+| `docs/requirements/source-comparison/phase-d-comparison.md` | 新增 | Phase D 深度对比：记忆系统、工具执行管线、上下文压缩 + 优化方案 |
+| `docs/requirements/source-comparison/phase-e1-comparison.md` | 新增 | Phase E1 深度对比：Plugin / Hook / Skill 系统 + 改进方案 |
+| `docs/requirements/source-comparison/phase-f-comparison.md` | 新增 | Phase F 深度对比：编辑工具与补丁算法 / 会话持久化恢复回溯 / 代码检索与 repo map + 跨维度合并差距清单 |
 
 ## 源码获取记录
 
@@ -78,6 +82,138 @@
 | 文件 | 改动 |
 |------|------|
 | `ccode-pager/src/scrollback/blocks/tool/edit.rs` | 添加 `compute_word_diff_ranges()` + `compute_hunk_word_highlights()` + `apply_word_highlights()` |
+
+## Phase B 代码改动（已完成）
+
+### B3: 流空闲超时
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/sampler/idle_timeout.rs` | 新建 — `IdleTimeoutStream` 包裹器，默认 300s |
+| `ccore/src/sampler/mod.rs` | 注册 `idle_timeout` 模块 |
+| `ccore/src/sampler/provider.rs` | `SampleRequest` 添加 `idle_timeout_secs` 字段 |
+| `ccore/src/sampler/{openai_compat,claude_compat,gemini}.rs` | 包裹流 + 测试更新 |
+| `ccore/src/agent/subagent.rs` | 添加 `idle_timeout_secs: None` |
+| `ccore/src/node/thinker/mod.rs` | 添加 `idle_timeout_secs: None` |
+
+### B1: Side Effects → 生产权限
+
+| 文件 | 改动 |
+|------|------|
+| `ccode-workspace/src/permission/side_effect_eval.rs` | 新建 — 10 种 scope 风险评估 + 10 个测试 |
+| `ccode-workspace/src/permission/mod.rs` | 注册 `side_effect_eval` 模块 |
+| `ccode-workspace/src/permission/types.rs` | `PermissionCommand::Request` 添加 `side_effects` 字段 |
+| `ccode-workspace/src/permission/manager.rs` | actor 中接入 side_effect_eval 快速判定 + 所有构造点更新 |
+| `ccode-shell/src/session/acp_session_impl/tool_calls.rs` | 提取 `BashToolInput.side_effects` 传入权限请求 |
+| `ccode-shell/tests/test_mcp_permission_persistence.rs` | 添加 `side_effects: None` |
+
+### B2: 4-Breakpoint 缓存策略
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/sampler/cache_placement.rs` | 新建 — 4-breakpoint 放置策略 + 7 个测试 |
+| `ccore/src/sampler/mod.rs` | 注册 `cache_placement` 模块 |
+| `ccore/src/node/thinker/mod.rs` | 替换硬编码 2-breakpoint → `place_breakpoints()` |
+| `ccore/src/agent/subagent.rs` | 同上 |
+
+### B4: 子代理图持久化
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/agent/graph_store.rs` | 新建 — 图存储 + LRU 驻留 + 树查询 + JSON 序列化 + 10 个测试 |
+| `ccore/src/agent/mod.rs` | 注册 `graph_store` 模块 |
+
+### B5: 子代理邮箱通信
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/agent/mailbox.rs` | 新建 — 有界邮箱 + Progress/Cancel/Custom 消息 + 11 个测试 |
+| `ccore/src/agent/mod.rs` | 注册 `mailbox` 模块 |
+
+### P0: 字节稳定工具 Schema
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/sampler/tool_stability.rs` | 新建 — 规范序列化 + schema hash + 稳定性追踪器 + 10 个测试 |
+| `ccore/src/sampler/mod.rs` | 注册 `tool_stability` 模块 |
+| `ccore/src/sampler/gemini.rs` | 工具按名称排序（与 Claude/OpenAI 对齐） |
+| `ccore/src/node/thinker/mod.rs` | 接入 `ToolStabilityTracker` |
+
+## Phase D 代码改动（已完成）
+
+### D1: 上下文压缩管线
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/node/thinker/mod.rs` | 添加 `stable_prefix_locked` 标志，首次 `build_sample_request` 时调用 `lock_stable_prefix()` |
+| `ccore/src/memory/working.rs` | 新增 `compact_reactive_llm()` async 方法 — Level 4 LLM 摘要压缩 + `recalculate_tokens()` 辅助 |
+| `ccode-shell/src/session/acp_session_impl/tool_calls.rs` | 添加 `Semaphore(20)` 全局工具并发上限 |
+
+### D2: 运行时自适应
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/node/thinker/mod.rs` | 添加 TokenBudgetReminder 注入：上下文 ≥70% 时在最后 user 消息追加预算提醒 |
+| `common/ccode-compaction/src/micro_compact.rs` | 新增 `adaptive_max_age(pressure)` — 根据 token 压力线性插值 1.0x→0.2x |
+| `ccode-shell/src/session/acp_session_impl/sampler_turn.rs` | 新增 `call_with_transient_retry()` — 瞬态错误指数退避重试（1s base, 2x/attempt） |
+| `common/ccode-compaction/src/context_collapse.rs` | 新增 `compaction_quality_score()` — 检查文件路径/错误关键词/代码标识符保留率 |
+
+### D3: 记忆系统增强
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/memory/short_term.rs` | 新增 `EmbeddingProvider` trait + `set_embedding_provider()` 方法 |
+| `common/ccode-compaction/src/context_collapse.rs` | 新增 `INCREMENTAL_COLLAPSE_PROMPT` + `incremental_summary()` 增量摘要函数 |
+| `ccore/src/memory/world_state.rs` | 新建 — Fragment + FNV-1a 指纹 + Priority 排序 + 变更检测 + 7 个测试 |
+| `ccore/src/memory/mod.rs` | 注册 `world_state` 模块 |
+
+## Phase E1 代码改动（已完成）
+
+### E1.1: asyncRewake Hook
+
+| 文件 | 改动 |
+|------|------|
+| `ccode-hooks/src/config.rs` | `RawHandler` + `HookSpec` 添加 `async_run`、`async_rewake`、`rewake_message` 字段 |
+| `ccode-hooks/src/dispatcher.rs` | 测试辅助 `make_command_spec` 更新新字段默认值 |
+| `ccode-hooks/src/runner/command.rs` | 7 处 `HookSpec` 测试构造更新 |
+| `ccode-hooks/src/runner/http.rs` | 2 处 `HookSpec` 测试构造更新 |
+| `ccode-hooks/src/discovery.rs` | 1 处 `HookSpec` 测试构造更新 |
+
+### E1.2: 新增 Hook 事件（6 个）
+
+| 文件 | 改动 |
+|------|------|
+| `ccode-hooks/src/event.rs` | `HookEventName` 新增 `TaskCreated`/`TaskCompleted`/`FileChanged`/`ConfigChange`/`PermissionRequest`/`CwdChanged` 变体 + `HookPayload` 对应变体 + Display/Deserialize/traits() |
+| `ccode-hooks-types/src/lib.rs` | `HookEvent` 新增 6 个 ACP 线路格式变体 + Display |
+| `ccode-hooks/src/discovery.rs` | `ALL_EVENTS` 常量添加 6 个新事件；测试穷举匹配更新 |
+| `ccode-hooks/src/config.rs` | 测试 `claude_settings_with_unknown_hook_events_skipped_leniently` 更新断言（2→5） |
+| `ccode-hooks/src/dispatcher.rs` | `total_variants` 15→21；`hub_hook_kind` 测试添加新事件（`PermissionRequest` hub_forward=false） |
+| `ccode-shell/src/extensions/hooks.rs` | `hook_spec_to_info` 添加 6 个新 `HookEventName → HookEvent` 映射 |
+
+### E1.3: if 条件过滤
+
+| 文件 | 改动 |
+|------|------|
+| `ccode-hooks/src/config.rs` | `RawHandler` + `HookSpec` 添加 `condition: Option<String>` 字段 |
+
+### E1.4: enabledSkills 开关
+
+| 文件 | 改动 |
+|------|------|
+| `ccode-tools/src/implementations/skills/discovery.rs` | 新增 `filter_skills_by_config()` — 按 enabled/disabled 列表过滤 skill + 名称归一化 |
+
+### E1.5: 插件本地设置
+
+| 文件 | 改动 |
+|------|------|
+| `ccode-agent/src/plugins/local_settings.rs` | 新建 — `PluginLocalSettings` 结构 + `find_local_setting()` + `split_frontmatter()` + 4 个测试 |
+| `ccode-agent/src/plugins/mod.rs` | 注册 `local_settings` 模块 + re-export |
+
+### E1.6: 并行 Hook 调度
+
+| 文件 | 改动 |
+|------|------|
+| `ccode-hooks/src/dispatcher.rs` | 新增 `dispatch_non_blocking_parallel()` — `tokio::task::JoinSet` 并发执行 observe-only hook |
 
 ## 关键发现
 
