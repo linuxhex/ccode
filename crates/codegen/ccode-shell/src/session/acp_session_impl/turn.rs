@@ -1554,11 +1554,9 @@ impl SessionActor {
     /// Active), both branches are skipped: neither streak moves and the
     /// existing pause cause is preserved.
     pub(crate) async fn handle_turn_end(&self, turn_succeeded: bool) {
-        // A+ 编译反馈闭环：本轮若调用过 write/edit，则运行 cargo check，
+        // A+ 编译反馈闭环：本轮若调用过 write/edit，则根据项目类型和编辑文件运行对应语言的编译检查，
         // 将错误摘要存入 pending_compile_feedback 供下一轮注入。
         // auto_review 开启时追加自审提醒。任何异常仅记录 warn，不阻塞主流程。
-        // 注意：cargo check 在此同步 await——handle_turn_end 位于 actor 串行循环中，
-        // 下一轮 prompt 通常等待用户输入，故 inline 等待不会拖慢交互。
         let aplus_cfg = ccore::config::APlusConfig::default();
         let has_write_edit = self
             .current_turn_has_write_edit
@@ -1566,7 +1564,8 @@ impl SessionActor {
         if has_write_edit {
             if aplus_cfg.cargo_check_on_turn_end {
                 let workdir = self.tool_context.cwd.as_path();
-                match ccore::tools::run_cargo_check(workdir).await {
+                let edited_files = self.current_turn_edited_files.lock().clone();
+                match ccore::tools::run_compile_check(workdir, &edited_files).await {
                     Ok(report) => {
                         if !report.success {
                             let hint = ccore::tools::format_for_injection(&report);
@@ -1580,7 +1579,7 @@ impl SessionActor {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("cargo check 执行失败：{}", e);
+                        tracing::warn!("编译检查执行失败：{}", e);
                     }
                 }
             }
@@ -2118,10 +2117,12 @@ impl SessionActor {
             );
         }
         // A+ 编译反馈闭环：本轮开始前注入上一轮 handle_turn_end 产出的编译错误摘要，
-        // 并复位 write/edit 标志。注入失败不影响主流程——take() 后即使后续注入抛错，
-        // 反馈也已被消费，下一轮重新走 cargo check 即可。
+        // 并复位 write/edit 标志和编辑文件列表。注入失败不影响主流程。
         self.current_turn_has_write_edit
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.current_turn_edited_files.lock().clear();
+        // 清理上一轮投机执行缓存，防止取消/未使用的工具结果残留到本轮
+        self.speculative_tool_results.lock().clear();
         if let Some(feedback) = self.pending_compile_feedback.lock().take() {
             self.push_system_reminder(&feedback);
             tracing::info!("已注入上一轮编译反馈到本轮 system reminder");
@@ -2639,11 +2640,18 @@ impl SessionActor {
                     span.record("mcp_tool.name", tool.as_str());
                 }
                 turn_tools_called.push(tc.name.clone());
-                // A+ 编译反馈闭环：检测 write/edit 工具调用，置位本轮标志。
-                // handle_turn_end 读取该标志决定是否触发 cargo check。
+                // A+ 编译反馈闭环：检测 write/edit 工具调用，置位本轮标志并记录编辑文件路径。
+                // handle_turn_end 读取标志决定是否触发编译检查，根据文件路径选择对应语言检查器。
                 if tc.name == "write" || tc.name == "edit" {
                     self.current_turn_has_write_edit
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                        if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
+                            self.current_turn_edited_files
+                                .lock()
+                                .push(path.to_string());
+                        }
+                    }
                 }
             }
             let step_signature = tool_calls

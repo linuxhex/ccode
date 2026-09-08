@@ -43,9 +43,19 @@ pub struct SampleRequest {
     /// 流式收集完整响应并解析 JSON，结果发到 cortex/goal_verify_result）
     #[serde(default)]
     pub goal_verify: bool,
+    /// 是否为上下文摘要请求（压缩管道 L4 用）
+    ///
+    /// SamplerNode 识别后收集完整响应，结果发到 `cortex/summary_result`，
+    /// 不走常规的流式转发（摘要过程不应显示给用户）。
+    #[serde(default)]
+    pub summarize: bool,
     /// 额外的 HTTP 请求头（如 x-api-key、anthropic-version 等）
     #[serde(default)]
     pub extra_headers: std::collections::HashMap<String, String>,
+    /// 流空闲超时（秒），超过此时间无新 chunk 则返回超时错误。
+    /// None 时使用 DEFAULT_IDLE_TIMEOUT_SECS（300s）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 /// 思维链/推理模式配置

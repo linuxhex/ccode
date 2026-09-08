@@ -188,7 +188,7 @@ impl SessionReadTracker {
     /// 记录文件已被读取。
     pub fn record_read(&self, path: &str) {
         if let Ok(mut tracker) = self.inner.lock() {
-            tracker.mark_read(path);
+            tracker.mark_read_simple(std::path::Path::new(path));
         }
     }
 
@@ -196,7 +196,7 @@ impl SessionReadTracker {
     pub fn has_been_read(&self, path: &str) -> bool {
         self.inner
             .lock()
-            .map(|t| t.has_been_read(path))
+            .map(|t| t.has_been_read(std::path::Path::new(path)))
             .unwrap_or(false)
     }
 
@@ -526,39 +526,14 @@ impl CcoreSessionState {
     ///
     /// 返回检索结果列表，每个结果包含文件路径、符号名、相关度分数和代码预览。
     /// 可用于在 turn 开始时注入上下文，类似 Claude Code 的 repo-map 工具。
+    ///
+    /// 注意：当前使用占位零向量，检索结果恒为空。待接入真实 embedding 模型后生效。
     pub fn search_by_intent(&self, query: &str, top_k: usize) -> Vec<RetrievalResult> {
         let intents = IntentRetriever::expand_intents(query);
         let query_embedding: Vec<f32> = vec![0.0; 64]; // 占位：真实场景需调用 embedding 模型
         self.intent_retriever
             .lock()
             .search_by_intents(&intents, &query_embedding, top_k)
-    }
-
-    /// 便捷方法：注册代码块到意图检索器。
-    ///
-    /// 在文件读取后调用，将文件中的函数/类/方法注册到检索索引。
-    pub fn register_code_blocks(&self, blocks: Vec<CodeBlock>) {
-        self.intent_retriever.lock().register_blocks(blocks);
-    }
-
-    /// 便捷方法：初始化仓库地图（首次使用时延迟创建）。
-    pub fn init_repo_map(&self, root: std::path::PathBuf) {
-        let mut guard = self.repo_map.write();
-        if guard.is_none() {
-            *guard = Some(RepoMap::new(root));
-        }
-    }
-
-    /// 便捷方法：获取仓库地图的文件列表摘要。
-    pub fn repo_map_summary(&self) -> String {
-        let guard = self.repo_map.read();
-        match guard.as_ref() {
-            Some(_rm) => {
-                // RepoMap 文件信息暂不暴露公共接口，返回占位
-                "RepoMap 已加载".to_string()
-            }
-            None => String::new(),
-        }
     }
 
     /// 便捷方法：获取仓库地图中指定文件的依赖。

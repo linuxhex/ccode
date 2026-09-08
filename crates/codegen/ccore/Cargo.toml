@@ -95,6 +95,10 @@ ccode-textarea = { path = "../ccode-textarea" }
 ccode-markdown = { workspace = true }
 anstyle = { workspace = true }
 
+# 工具集（主工具库，ccore 内置工具逐步迁移至此）
+ccode-tools = { path = "../ccode-tools" }
+ccode-tools-api = { path = "../ccode-tools-api" }
+
 # 进阶模块（编译为 cdylib，运行时加载）
 ccore-advanced = { path = "../ccore-advanced" }
 

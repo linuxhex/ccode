@@ -30,7 +30,7 @@ async fn test_read_then_edit_workflow() {
     }
 
     // 3. 验证 read_tracker 已记录
-    assert!(read_tracker::has_file_been_read(file_path.to_str().unwrap()));
+    assert!(read_tracker::has_file_been_read(&file_path));
 
     // 4. 编辑文件（应该成功，因为已读取）
     let edit_args = json!({

@@ -12,12 +12,12 @@ use super::bridge::PostExecuteHook;
 use super::compile_feedback::run_rustfmt_check;
 
 /// rustfmt 检查钩子
-/// Write/Edit 工具执行后，对修改的文件运行 rustfmt --check
+/// write_file/search_replace 工具执行后，对修改的文件运行 rustfmt --check
 pub struct RustfmtHook;
 
 impl PostExecuteHook for RustfmtHook {
     fn should_run(&self, tool_name: &str) -> bool {
-        tool_name == "write" || tool_name == "edit"
+        tool_name == "write_file" || tool_name == "search_replace"
     }
 
     fn run<'a>(

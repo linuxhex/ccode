@@ -32,6 +32,13 @@ pub enum HookEventName {
 
     PreCompact,
     PostCompact,
+
+    TaskCreated,
+    TaskCompleted,
+    FileChanged,
+    ConfigChange,
+    PermissionRequest,
+    CwdChanged,
 }
 
 impl<'de> serde::Deserialize<'de> for HookEventName {
@@ -78,6 +85,14 @@ impl<'de> serde::Deserialize<'de> for HookEventName {
             "SubagentEnd" | "subagent_end" | "subagentEnd" => Ok(Self::SubagentEnd),
             "PreCompact" | "pre_compact" | "preCompact" => Ok(Self::PreCompact),
             "PostCompact" | "post_compact" | "postCompact" => Ok(Self::PostCompact),
+            "TaskCreated" | "task_created" | "taskCreated" => Ok(Self::TaskCreated),
+            "TaskCompleted" | "task_completed" | "taskCompleted" => Ok(Self::TaskCompleted),
+            "FileChanged" | "file_changed" | "fileChanged" => Ok(Self::FileChanged),
+            "ConfigChange" | "config_change" | "configChange" => Ok(Self::ConfigChange),
+            "PermissionRequest" | "permission_request" | "permissionRequest" => {
+                Ok(Self::PermissionRequest)
+            }
+            "CwdChanged" | "cwd_changed" | "cwdChanged" => Ok(Self::CwdChanged),
             other => Err(serde::de::Error::custom(format!(
                 "unknown hook event: '{other}'. Expected one of: \
                  SessionStart, PreToolUse, PostToolUse, PostToolUseFailure, \
@@ -107,6 +122,12 @@ impl std::fmt::Display for HookEventName {
             Self::SubagentStop | Self::SubagentEnd => write!(f, "subagent_stop"),
             Self::PreCompact => write!(f, "pre_compact"),
             Self::PostCompact => write!(f, "post_compact"),
+            Self::TaskCreated => write!(f, "task_created"),
+            Self::TaskCompleted => write!(f, "task_completed"),
+            Self::FileChanged => write!(f, "file_changed"),
+            Self::ConfigChange => write!(f, "config_change"),
+            Self::PermissionRequest => write!(f, "permission_request"),
+            Self::CwdChanged => write!(f, "cwd_changed"),
         }
     }
 }
@@ -173,6 +194,12 @@ impl HookEventName {
             Self::SubagentEnd => unreachable!("canonicalized above"),
             Self::PreCompact => t(Observe, Tested, true),
             Self::PostCompact => t(Observe, Tested, true),
+            Self::TaskCreated => t(Observe, Tested, true),
+            Self::TaskCompleted => t(Observe, Tested, true),
+            Self::FileChanged => t(Observe, Tested, true),
+            Self::ConfigChange => t(Observe, Tested, true),
+            Self::PermissionRequest => t(Observe, Tested, false),
+            Self::CwdChanged => t(Observe, Tested, true),
         }
     }
 }
@@ -448,6 +475,40 @@ pub enum HookPayload {
         /// "manual" or "auto".
         source: String,
     },
+
+    TaskCreated {
+        #[serde(rename = "taskId")]
+        task_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    TaskCompleted {
+        #[serde(rename = "taskId")]
+        task_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+    },
+    FileChanged {
+        path: String,
+        #[serde(rename = "changeType", skip_serializing_if = "Option::is_none")]
+        change_type: Option<String>,
+    },
+    ConfigChange {
+        key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
+    PermissionRequest {
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        #[serde(rename = "accessKind")]
+        access_kind: String,
+    },
+    CwdChanged {
+        path: String,
+        #[serde(rename = "previousPath", skip_serializing_if = "Option::is_none")]
+        previous_path: Option<String>,
+    },
 }
 
 impl HookPayload {
@@ -468,6 +529,15 @@ impl HookPayload {
             | Self::PreCompact { source }
             | Self::PostCompact { source } => source,
             Self::SessionEnd { reason, .. } => reason,
+            Self::PermissionRequest { tool_name, .. } => tool_name,
+            Self::FileChanged { change_type, .. } => {
+                return change_type.as_deref().filter(|v| !v.is_empty());
+            }
+            // Observe-only lifecycle events with no meaningful match target.
+            Self::TaskCreated { .. }
+            | Self::TaskCompleted { .. }
+            | Self::ConfigChange { .. }
+            | Self::CwdChanged { .. } => return None,
             // Always a non-empty name, unlike the free-text arms above.
             Self::StopFailure { error, .. } => return Some(error.as_str()),
             // Ignored events listed explicitly so a new Tested event can't silently return None.

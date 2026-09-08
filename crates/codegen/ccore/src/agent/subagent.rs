@@ -26,7 +26,7 @@ use crate::node::{Node, NodeContext, NodeId, NodeType};
 use crate::memory::working::WorkingMemory;
 use crate::memory::short_term::ShortTermMemory;
 use crate::sampler::provider::{
-    CacheControl, ChatMessage, SampleRequest, StreamChannel, StreamChunk,
+    ChatMessage, SampleRequest, StreamChannel, StreamChunk,
     ToolDefinition as SamplerToolDefinition,
 };
 use std::collections::HashSet;
@@ -189,22 +189,8 @@ impl SubAgentNode {
             .map(|(role, content)| ChatMessage { role, content, cache_control: None })
             .collect();
 
-        // Prompt cache 断点：与 ThinkerNode 对齐，让 sub-agent 也能命中 API 侧 KV cache
-        if !messages.is_empty() {
-            // Breakpoint 1: system prompt（最稳定的前缀）
-            if let Some(first) = messages.first_mut() {
-                if first.role == "system" {
-                    first.cache_control = Some(CacheControl::ephemeral());
-                }
-            }
-            // Breakpoint 2: 倒数第 2 轮之前（保留最近对话可编辑）
-            let mid_idx = messages.len().saturating_sub(5);
-            if mid_idx > 0 {
-                if let Some(msg) = messages.get_mut(mid_idx) {
-                    msg.cache_control = Some(CacheControl::ephemeral());
-                }
-            }
-        }
+        // Prompt cache 断点：4-breakpoint 策略（与 ThinkerNode 对齐）
+        crate::sampler::cache_placement::place_breakpoints(&mut messages);
 
         let request_id = uuid::Uuid::new_v4().to_string();
         self.current_sample_request_id = Some(request_id.clone());
@@ -245,7 +231,9 @@ impl SubAgentNode {
             tool_choice: None,
             prompt_cache_key: Some(self.id.to_string()),
             goal_verify: false,
+            summarize: false,
             extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
         }
     }
 
@@ -1201,7 +1189,7 @@ mod tests {
     fn test_subagent_task() {
         let task = SubAgentTask {
             description: "Test task".to_string(),
-            allowed_tools: vec!["read".to_string(), "write".to_string()],
+            allowed_tools: vec!["read_file".to_string(), "write_file".to_string()],
             max_turns: 10,
             timeout_secs: 300,
         };

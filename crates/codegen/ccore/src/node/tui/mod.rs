@@ -1,6 +1,10 @@
 //! TUI Node — 终端渲染、用户输入
 //!
-//! 参考 opencode 设计：Markdown 渲染 + 主题配色 + 状态栏 + 自动跟随滚动
+//! 交互风格对齐 Claude Code：
+//! - 左侧对话区（流式 Markdown + 代码高亮）
+//! - 右侧工具面板（运行中工具 + 最近工具）
+//! - 底部状态栏（状态 + token/费用 + 快捷键）
+//! - 底部输入框（多行 + 历史记录）
 
 pub mod theme;
 
@@ -14,8 +18,9 @@ use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
+
     Terminal,
 };
 use std::io;
@@ -517,31 +522,46 @@ impl TUINode {
             let max_input_height = (size.height / 3).max(1);
             let input_height = input_text_lines.min(max_input_height);
 
-            // 布局：对话区 | 状态栏 | 输入区
+            // 布局（Claude Code 风格）：
+            // ┌─ 标题栏 ─────────────────────────────────────┐
+            // ├─ 对话区 ────────────────────┼─ 工具侧栏 ────┤
+            // │                            │               │
+            // │                            │               │
+            // ├─ 状态栏 ────────────────────────────────────┤
+            // ├─ 输入区 ────────────────────────────────────┤
             let v_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(3),
+                    Constraint::Length(1),  // 标题栏
+                    Constraint::Min(5),     // 主区（对话 + 工具侧栏）
                     Constraint::Length(1),  // 状态栏
                     Constraint::Length(input_height),
                 ])
                 .split(size);
 
-            let pad = |area: Rect, left: u16, right: u16| -> Rect {
-                let total = left + right;
-                if area.width <= total {
-                    return area;
-                }
-                Rect {
-                    x: area.x + left,
-                    width: area.width - total,
-                    ..area
-                }
+            let title_area = v_chunks[0];
+            let main_area = v_chunks[1];
+            let status_area = v_chunks[2];
+            let input_area = v_chunks[3];
+
+            // 主区分左右：对话区 + 工具侧栏
+            // 终端宽度不足 80 列时隐藏工具侧栏
+            let show_sidebar = main_area.width >= 80;
+            let (conv_area, sidebar_area) = if show_sidebar {
+                let h_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Ratio(3, 4),  // 对话区占 3/4
+                        Constraint::Ratio(1, 4),  // 工具侧栏占 1/4
+                    ])
+                    .split(main_area);
+                (h_chunks[0], Some(h_chunks[1]))
+            } else {
+                (main_area, None)
             };
 
-            let conv_area = pad(v_chunks[0], 1, 1);
-            let status_area = pad(v_chunks[1], 1, 1);
-            let input_area = pad(v_chunks[2], 1, 1);
+            // 标题栏
+            render_title_bar(f, title_area, model_name, agent_status, frame, theme);
 
             // 对话区（使用缓存）
             render_conversation(
@@ -549,7 +569,12 @@ impl TUINode {
                 agent_status, frame, tool_cards, theme, md_style,
             );
 
-            // 状态栏
+            // 工具侧栏
+            if let Some(sa) = sidebar_area {
+                render_tool_sidebar(f, sa, tool_cards, frame, theme);
+            }
+
+            // 状态栏（底部）
             render_status_bar(
                 f, status_area, agent_status, frame,
                 model_name, total_in, total_out, cost, theme,
@@ -612,18 +637,18 @@ fn render_conversation(
     for (idx, msg) in messages.iter().enumerate() {
         match msg.role {
             ChatRole::User => {
+                // 用户消息：上方间距 + "You" 标签 + 内容
                 all_lines.push(Line::from(""));
-                let prefix = Span::styled("❯ ", theme.user_prefix_style());
-                for (i, raw) in msg.content.lines().enumerate() {
-                    let user_span = Span::styled(raw.to_string(), theme.user_text_style());
-                    if i == 0 {
-                        all_lines.push(Line::from(vec![prefix.clone(), user_span]));
-                    } else {
-                        all_lines.push(Line::from(vec![Span::raw("  "), user_span]));
-                    }
+                all_lines.push(Line::from(vec![
+                    Span::styled(" You ", theme.user_label_style()),
+                ]));
+                for raw in msg.content.lines() {
+                    let user_span = Span::styled(format!("  {raw}"), theme.user_text_style());
+                    all_lines.push(Line::from(user_span));
                 }
             }
             ChatRole::Assistant => {
+                // 助手消息：上方间距 + 模型名标签 + Markdown 内容
                 all_lines.push(Line::from(""));
                 // 使用缓存的 Markdown 渲染结果
                 // 最后一条助手消息在流式输出时始终重新渲染，其他消息使用缓存
@@ -649,8 +674,17 @@ fn render_conversation(
                     }
                     lines
                 };
+                // 助手标签
+                all_lines.push(Line::from(vec![
+                    Span::styled(" ccode ", theme.assistant_label_style()),
+                ]));
+                // 内容缩进 2 格
                 for line in md_lines {
-                    all_lines.push(line);
+                    let mut indented = Line::from("  ");
+                    for span in line.spans {
+                        indented.spans.push(span);
+                    }
+                    all_lines.push(indented);
                 }
             }
             ChatRole::System => {
@@ -719,6 +753,140 @@ fn render_conversation(
     }
 }
 
+// ── 标题栏 ──
+
+fn render_title_bar(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    model_name: &str,
+    agent_status: &AgentStatus,
+    frame: usize,
+    theme: &Theme,
+) {
+    if area.height < 1 || area.width < 10 {
+        return;
+    }
+    let buf = f.buffer_mut();
+
+    // 背景条
+    let bg = " ".repeat(area.width as usize);
+    buf.set_string(area.x, area.y, &bg, Style::default().bg(Color::Rgb(0x2a, 0x2a, 0x2a)));
+
+    // 左侧：ccode logo + 状态
+    let spinner = agent_status.spinner(frame);
+    let status_text = agent_status.status_text();
+    let left = format!(" ccode {spinner} {status_text}");
+    buf.set_string(area.x, area.y, &left, theme.status_active_style());
+
+    // 中间：模型名
+    if !model_name.is_empty() && area.width > 40 {
+        let model_display = format!(" {model_name} ");
+        let mid_x = area.x + (area.width.saturating_sub(model_display.len() as u16)) / 2;
+        buf.set_string(mid_x, area.y, &model_display, theme.model_style().add_modifier(Modifier::BOLD));
+    }
+
+    // 右侧：快捷键提示
+    if area.width > 60 {
+        let right = " ? help  Ctrl+C quit ";
+        let right_x = area.x + area.width - right.len() as u16;
+        buf.set_string(right_x, area.y, right, theme.help_style());
+    }
+}
+
+// ── 工具侧栏 ──
+
+fn render_tool_sidebar(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    tool_cards: &[ToolCard],
+    frame: usize,
+    theme: &Theme,
+) {
+    if area.height < 3 || area.width < 20 {
+        return;
+    }
+    let buf = f.buffer_mut();
+
+    // 标题
+    let title = " Tools ";
+    buf.set_string(area.x, area.y, title, theme.primary_style_bold());
+
+    // 分隔线
+    let sep = "─".repeat(area.width as usize);
+    buf.set_string(area.x, area.y + 1, &sep, Style::default().fg(theme.border));
+
+    // 运行中的工具
+    let running: Vec<&ToolCard> = tool_cards.iter().filter(|c| c.status == ToolStatus::Running).collect();
+    let mut y = area.y + 2;
+
+    if running.is_empty() {
+        if y < area.y + area.height {
+            buf.set_string(area.x + 1, y, "  No active tools", theme.text_muted_style());
+        }
+    } else {
+        for card in running.iter().take(10) {
+            if y >= area.y + area.height.saturating_sub(1) {
+                break;
+            }
+            let elapsed = card.started_at
+                .map(|s| s.elapsed().as_secs_f32())
+                .unwrap_or(0.0);
+            let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let spinner = spinner_frames[frame % spinner_frames.len()];
+            let name = truncate_str(&card.name, (area.width as usize).saturating_sub(10));
+            let line = format!(" {spinner} {name} {elapsed:.1}s");
+            buf.set_string(area.x + 1, y, &line, theme.tool_name_style());
+            y += 1;
+        }
+    }
+
+    // 最近完成的工具
+    let done: Vec<&ToolCard> = tool_cards.iter()
+        .rev()
+        .filter(|c| c.status != ToolStatus::Running)
+        .take(5)
+        .collect();
+
+    if !done.is_empty() && y < area.y + area.height.saturating_sub(1) {
+        // 分隔
+        y += 1;
+        if y < area.y + area.height {
+            let recent = " Recent ";
+            buf.set_string(area.x + 1, y, recent, theme.text_muted_style());
+            y += 1;
+        }
+        for card in &done {
+            if y >= area.y + area.height.saturating_sub(1) {
+                break;
+            }
+            let (icon, style) = match card.status {
+                ToolStatus::Done => ("✓", theme.tool_done_style()),
+                ToolStatus::Failed => ("✕", theme.tool_fail_style()),
+                ToolStatus::Running => ("", Style::default()),
+            };
+            let name = truncate_str(&card.name, (area.width as usize).saturating_sub(6));
+            let line = format!("   {icon} {name}");
+            buf.set_string(area.x + 1, y, &line, style);
+            y += 1;
+        }
+    }
+}
+
+/// 按字符宽度截断字符串（视觉截断）
+fn truncate_str(s: &str, max: usize) -> String {
+    if max < 3 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        let mut result: String = chars.into_iter().take(max.saturating_sub(1)).collect();
+        result.push('…');
+        result
+    }
+}
+
 // ── 状态栏 ──
 
 fn render_status_bar(
@@ -784,11 +952,40 @@ fn render_input(
     captured_inner: &mut Option<Rect>,
     theme: &Theme,
 ) {
-    if area.height < 1 || area.width < 4 {
+    if area.height < 3 || area.width < 10 {
         return;
     }
+    let buf = f.buffer_mut();
 
-    *captured_inner = Some(area);
+    // 边框（顶部 + 左右）
+    let top_border = format!("┌{}┐", "─".repeat((area.width as usize).saturating_sub(2)));
+    buf.set_string(area.x, area.y, &top_border, Style::default().fg(theme.border));
+
+    for y in 1..area.height.saturating_sub(1) {
+        buf.set_string(area.x, area.y + y, "│", Style::default().fg(theme.border));
+        buf.set_string(area.x + area.width - 1, area.y + y, "│", Style::default().fg(theme.border));
+    }
+
+    // 底部边框 + 发送提示
+    let bottom_left = "└";
+    let bottom_right = "┘";
+    buf.set_string(area.x, area.y + area.height - 1, bottom_left, Style::default().fg(theme.border));
+    buf.set_string(area.x + area.width - 1, area.y + area.height - 1, bottom_right, Style::default().fg(theme.border));
+
+    // 底部提示（Enter 发送 / Esc 取消）
+    let hint = " Enter to send · Esc to clear ";
+    let hint_x = area.x + area.width.saturating_sub(hint.len() as u16);
+    // 用边框色覆盖底部线的中间部分
+    let bottom_line_len = (area.width as usize).saturating_sub(2 + hint.len() + 2);
+    let bottom_line = "─".repeat(bottom_line_len.max(0));
+    buf.set_string(area.x + 1, area.y + area.height - 1, &bottom_line, Style::default().fg(theme.border));
+    buf.set_string(hint_x.saturating_sub(1), area.y + area.height - 1, hint, theme.help_style());
+
+    // 输入区域（边框内）
+    let inner_x = area.x + 1;
+    let inner_y = area.y + 1;
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2);
 
     let has_text = !textarea.text().is_empty();
     let prefix_style = if has_text {
@@ -798,23 +995,26 @@ fn render_input(
     };
 
     let prefix_w = 2u16;
-    f.buffer_mut().set_string(area.x, area.y, "› ", prefix_style);
+    buf.set_string(inner_x, inner_y, "› ", prefix_style);
 
-    if area.width > prefix_w {
+    if inner_w > prefix_w {
         let textarea_area = Rect {
-            x: area.x + prefix_w,
-            y: area.y,
-            width: area.width - prefix_w,
-            height: area.height,
+            x: inner_x + prefix_w,
+            y: inner_y,
+            width: inner_w - prefix_w,
+            height: inner_h,
         };
 
-        ratatui::widgets::StatefulWidgetRef::render_ref(&textarea, textarea_area, f.buffer_mut(), textarea_state);
+        // 捕获光标位置的区域
+        *captured_inner = Some(textarea_area);
+
+        ratatui::widgets::StatefulWidgetRef::render_ref(&textarea, textarea_area, buf, textarea_state);
 
         if !has_text {
-            f.buffer_mut().set_string(
+            buf.set_string(
                 textarea_area.x,
                 textarea_area.y,
-                "Ask anything...",
+                "Ask anything... (Shift+Enter for newline)",
                 theme.placeholder_style(),
             );
         }

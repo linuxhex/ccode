@@ -230,3 +230,71 @@
 - ✅ 5 主题 + Auto + 量化
 - ✅ Vim 模式 + 外部编辑器
 - ✅ 折叠工具结果 + OSC 9;4 进度
+
+## Phase G 代码改动（进行中）
+
+> 基于 Claude Code 实际源码（~1884 TypeScript 文件）+ grok-build 对比的新一轮改进
+
+### G1: 秘密脱敏（安全 P0）
+
+| 文件 | 改动 |
+|------|------|
+| `ccode-telemetry/Cargo.toml` | 添加 `regex` 依赖 |
+| `ccode-telemetry/src/redact_common.rs` | 实现 `redact_owned()` — 移植 grok-build `sanitizer.rs` 的正则匹配集（API key/AWS/GitHub/GitLab/Slack/Google/PEM/JWT/Bearer/URL 敏感参数/密钥赋值模式）+ 用户路径脱敏 + JSON 遍历脱敏 |
+
+### G3: read_tracker 版本追踪（编辑安全 P1）
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/tools/read_tracker.rs` | `HashSet<String>` → `HashMap<PathBuf, FileStamp>`；新增 `FileStamp` 结构（mtime + len）；`mark_read` 记录文件戳记；`require_read` 严格版本检查（检测外部修改）；新增 `require_read_lenient` 宽松版本（仅检查是否读过）；API 从 `&str` 改为 `&Path` |
+| `ccore/src/tools/builtin.rs` | read_file 使用 `mark_file_read_with_stamp` 记录版本；write_file 使用严格 `require_file_read`；search_replace 使用宽松 `require_file_read_lenient`；所有路径改用 `validation.canonical` |
+| `ccore/tests/integration/tool_chain.rs` | 更新测试使用 `&Path` |
+| `ccore/src/node/thinker/mod.rs` | `mark_read(&path)` → `mark_read_simple(Path::new(&path))` — 适配新 API |
+
+### G7: P1-1 残留修复 + P1-3 路径规范化
+
+| 文件 | 改动 |
+|------|------|
+| `ccode-mcp/src/credentials.rs` | `with_extension("tmp")` → 唯一临时文件名（保留原扩展名） |
+| `ccore/src/persistence/file_storage.rs` | 同上 |
+
+### G2: 文件检查点系统（编辑安全 P0）
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/tools/file_history.rs` | 新建 — `FileHistory` 内存级检查点系统：`capture_before_edit()` 编辑前保存原始内容、版本递增（v1/v2/v3）、LRU 淘汰（MAX_SNAPSHOTS=50）、`restore_version()`/`restore_latest()` 回滚接口、8 个单元测试 |
+| `ccore/src/tools/mod.rs` | 注册 `file_history` 模块 |
+| `ccore/src/tools/builtin.rs` | `WriteExecutor::execute()` 和 `EditExecutor::execute()` 在原子写入前调用 `capture_before_edit()` 保存原始内容 |
+
+### G4: 编辑工具增强（EOL 保真）
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/tools/builtin.rs` | 新增 `preserve_eol()` 函数；`execute_replace()` 检测原文件 EOL 风格并统一替换文本的行尾；`execute_insert()` 使用检测到的 EOL 风格 join 行；移除 `detect_line_ending()` 的 `#[allow(dead_code)]` |
+
+### G5: Context Engine 死代码清理
+
+| 文件 | 改动 |
+|------|------|
+| `ccore/src/memory/intent_retriever.rs` | 移除零调用方法：`set_repo_map()`、`register_block()`、`register_blocks()`、`expand_with_dependencies()`、`block_count()`；移除未使用的 `repo_map` 字段和 `RepoMap` import |
+| `ccode-shell/src/session/ccore_integration.rs` | 移除零调用包装方法：`register_code_blocks()`、`init_repo_map()`、`repo_map_summary()`；为 `search_by_intent()` 添加占位说明注释 |
+
+### G6: 工具结果预算裁剪（已有等效实现）
+
+经分析，ccode 已实现与 Claude Code `applyToolResultBudget()` 等效的功能：
+- ToolNode 层 24K 字符裁剪（head 10K + tail 10K，UTF-8 安全边界）
+- 4 级压缩管线（Snip → MicroCompact → Micro → Auto）
+- Token 预算管理器 + 70% 提醒注入
+
+无需额外改动。
+
+### 编译检查结果（2026-09-04 最终）
+
+| Crate | 结果 |
+|-------|------|
+| `ccore --lib` | ✅ 通过 |
+| `ccore --tests` | ✅ 通过（file_history 8 个测试全部通过） |
+| `ccode-telemetry --lib` | ✅ 通过 |
+| `ccode-mcp --lib` | ✅ 通过 |
+| `ccode-shell --lib` | ✅ 通过 |
+| 全工作区 `--workspace --lib` | ✅ 通过 |

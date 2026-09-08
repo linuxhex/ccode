@@ -912,6 +912,7 @@ impl PermissionHandle {
             access,
             tool_call_update,
             None,
+            None,
             session_id,
             subagent_type,
             subagent_description,
@@ -926,6 +927,7 @@ impl PermissionHandle {
         access: AccessKind,
         tool_call_update: acp::ToolCallUpdate,
         edit_path_context: Option<EditPathContext>,
+        side_effects: Option<Vec<String>>,
         session_id: Option<String>,
         subagent_type: Option<String>,
         subagent_description: Option<String>,
@@ -947,6 +949,7 @@ impl PermissionHandle {
                     session_id,
                     subagent_type,
                     subagent_description,
+                    side_effects,
                 };
                 if let Err(e) = cmd_tx.send(msg) {
                     tracing::error!(?e, "failed to send permission request");
@@ -1414,9 +1417,37 @@ fn spawn_permission_manager_with_pin(
                     session_id: request_session_id,
                     subagent_type: request_subagent_type,
                     subagent_description: request_subagent_description,
+                    side_effects,
                 } => {
                     // wait_ms timer; starts at dequeue so it excludes time queued behind others.
                     let request_received = std::time::Instant::now();
+
+                    // Fast-path: if side_effects are declared, consult side_effect_eval
+                    // before the full bash analysis. A decisive verdict short-circuits
+                    // the rest of the permission flow.
+                    if let Some(ref scopes) = side_effects {
+                        let (decision, reason) = super::side_effect_eval::evaluate_side_effects(scopes);
+                        match decision {
+                            Decision::Allow => {
+                                tracing::info!(reason, "side_effect_eval: allow");
+                                let _ = respond_to.send(Decision::Allow);
+                                continue;
+                            }
+                            Decision::Reject(msg) => {
+                                tracing::info!(reason, %msg, "side_effect_eval: reject");
+                                let _ = respond_to.send(Decision::Reject(msg));
+                                continue;
+                            }
+                            Decision::Ask => {
+                                // Non-decisive: fall through to existing flow.
+                            }
+                            _ => {
+                                // Other variants (FollowupMessage, PolicyDeny, Cancelled)
+                                // are not produced by side_effect_eval; fall through.
+                            }
+                        }
+                    }
+
                     // Effective mode (yolo wins); stable for the arm (single-threaded actor).
                     let permission_mode = if yolo_mode {
                         ccode_telemetry::enums::PermissionMode::AlwaysApprove
@@ -2645,6 +2676,7 @@ mod tests {
                             AccessKind::Edit(displayed.to_string_lossy().into_owned()),
                             tool_call(),
                             Some(context.clone()),
+                            None,
                             None,
                             None,
                             None,
@@ -5250,6 +5282,7 @@ mod tests {
                         session_id: None,
                         subagent_type: None,
                         subagent_description: None,
+                        side_effects: None,
                     })
                     .expect("actor alive");
 
@@ -5348,6 +5381,7 @@ mod tests {
                         session_id: None,
                         subagent_type: None,
                         subagent_description: None,
+                        side_effects: None,
                     })
                     .expect("actor alive");
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -5414,6 +5448,7 @@ mod tests {
                         session_id: None,
                         subagent_type: None,
                         subagent_description: None,
+                        side_effects: None,
                     })
                     .expect("actor alive");
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -8175,6 +8210,7 @@ mod tests {
                         session_id: None,
                         subagent_type: None,
                         subagent_description: None,
+                        side_effects: None,
                     })
                     .expect("actor alive");
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {

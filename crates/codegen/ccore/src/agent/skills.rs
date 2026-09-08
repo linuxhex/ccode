@@ -200,7 +200,18 @@ impl SkillRegistry {
                 3. 提出修复方案并实施\n\
                 4. 验证修复是否有效\n\
                 优先使用只读工具（read, grep）分析问题，确认后再使用编辑工具修复。".into(),
-            tools: vec!["read".into(), "grep".into(), "bash".into(), "edit".into()],
+            // 工具名以 bridge.rs 声明为准（read_file/search_replace/write_file）。
+            // 旧名（read/edit/write）保留双兼容：子代理白名单是精确匹配
+            // （subagent.rs 的 allowed_tools.contains(&t.name)），漏一边就会
+            // 让 skill 子代理被过滤到只剩 bash。
+            tools: vec![
+                "read".into(),
+                "read_file".into(),
+                "grep".into(),
+                "bash".into(),
+                "edit".into(),
+                "search_replace".into(),
+            ],
             recommended_model: None,
         });
 
@@ -214,7 +225,13 @@ impl SkillRegistry {
                 3. 小步重构，每次只改一处\n\
                 4. 每步重构后运行测试验证\n\
                 不要改变外部行为，只改善内部结构。".into(),
-            tools: vec!["read".into(), "edit".into(), "bash".into()],
+            tools: vec![
+                "read".into(),
+                "read_file".into(),
+                "edit".into(),
+                "search_replace".into(),
+                "bash".into(),
+            ],
             recommended_model: None,
         });
 
@@ -228,7 +245,13 @@ impl SkillRegistry {
                 3. 生成测试代码\n\
                 4. 运行测试确保通过\n\
                 测试应覆盖主要路径、边界条件和错误处理。".into(),
-            tools: vec!["read".into(), "write".into(), "bash".into()],
+            tools: vec![
+                "read".into(),
+                "read_file".into(),
+                "write".into(),
+                "write_file".into(),
+                "bash".into(),
+            ],
             recommended_model: None,
         });
 
@@ -243,7 +266,7 @@ impl SkillRegistry {
                 4. 可维护性：命名、结构、复杂度是否合理\n\
                 5. 最佳实践：是否遵循语言和框架的惯用法\n\
                 给出具体的问题和改进建议，按严重程度排序。".into(),
-            tools: vec!["read".into(), "grep".into()],
+            tools: vec!["read".into(), "read_file".into(), "grep".into()],
             recommended_model: None,
         });
     }

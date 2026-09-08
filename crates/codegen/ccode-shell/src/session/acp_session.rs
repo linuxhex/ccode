@@ -566,6 +566,13 @@ impl PreparedToolCall {
             .unwrap_or(&self.tool_name)
     }
 }
+/// 投机执行缓存条目：保存完整工具结果和执行时的参数。
+/// 参数快照用于缓存命中时检测 PreToolUse hook 是否改写了参数——
+/// 若 prepared.parsed_args 与快照不一致，说明 hook 已改写，缓存结果不再有效。
+pub(crate) struct SpeculativeCacheEntry {
+    pub(crate) result: ToolRunResult,
+    pub(crate) args: serde_json::Value,
+}
 #[cfg(test)]
 pub(crate) use crate::session::streaming_capture::STREAMING_CAPTURE_MAX_BYTES;
 pub(crate) use crate::session::streaming_capture::StreamingTurnCapture;
@@ -696,14 +703,23 @@ pub(crate) struct SessionActor {
     /// cancel/idle. The flush also delivers the plan tracker's buffered
     /// mid-turn activation reminder (see `activate_plan_mode_mid_turn`).
     pub(crate) pending_skill_reminders: Mutex<Vec<ConversationItem>>,
-    /// A+ 编译反馈闭环：上一轮 handle_turn_end 运行 cargo check 得到的错误摘要，
+    /// A+ 编译反馈闭环：上一轮 handle_turn_end 运行编译检查得到的错误摘要，
     /// 在下一轮 process_conversation_turn 开始时注入 system reminder，然后清空。
-    /// 注入失败不影响主流程（cargo check 异常时仅记录 warn 日志）。
+    /// 注入失败不影响主流程（编译检查异常时仅记录 warn 日志）。
     pub(crate) pending_compile_feedback: Mutex<Option<String>>,
     /// A+ 编译反馈闭环：当前 turn 是否调用过 write/edit 类工具。
-    /// 在工具调用处理处置位，handle_turn_end 读取后决定是否触发 cargo check，
+    /// 在工具调用处理处置位，handle_turn_end 读取后决定是否触发编译检查，
     /// 并在 handle_turn_end 末尾复位，确保每个 turn 的判定相互独立。
     pub(crate) current_turn_has_write_edit: std::sync::atomic::AtomicBool,
+    /// A+ 编译反馈闭环：当前 turn 编辑过的文件路径列表。
+    /// handle_turn_end 据此判断项目语言，选择对应的编译检查器。
+    pub(crate) current_turn_edited_files: Mutex<Vec<String>>,
+    /// 投机执行缓存：模型流式输出期间提前执行的只读工具结果。
+    /// key = tool_call_id, value = (完整工具结果, 执行时参数)。
+    /// 存储完整 ToolRunResult 保留输出类型（ReadFile/GrepSearch 等），
+    /// 避免降级为纯文本导致下游类型检查失效。
+    /// 同时存储执行参数，用于在缓存命中时检测 PreToolUse hook 是否改写了参数。
+    pub(crate) speculative_tool_results: std::sync::Arc<Mutex<std::collections::HashMap<String, SpeculativeCacheEntry>>>,
     /// Idle flush timeout: `None` = disabled, `Some(duration)` = flush after inactivity.
     pub(crate) idle_flush_timeout: Option<std::time::Duration>,
     /// Periodic dream check interval: `None` = disabled.

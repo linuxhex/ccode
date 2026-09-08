@@ -7486,6 +7486,10 @@ pub(crate) mod tests {
                 timeout_ms: 10_000,
                 source_dir: std::path::PathBuf::from("/tmp"),
                 extra_env: std::collections::HashMap::new(),
+                async_run: false,
+                async_rewake: false,
+                rewake_message: None,
+                condition: None,
             };
             handle.shared.hook_registry.write().append_specs(vec![spec]);
         }

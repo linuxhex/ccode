@@ -28,6 +28,8 @@ pub mod skills;
 pub mod goal_loop;
 pub mod schedule_loop;
 pub mod proactive_loop;
+pub mod graph_store;
+pub mod mailbox;
 
 // 进阶模块（从 ccore-advanced re-export）
 pub use ccore_advanced::agent::{experiential, meta_cognitive, decentralized, goal_verifier};

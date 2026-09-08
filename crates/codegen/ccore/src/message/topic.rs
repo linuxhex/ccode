@@ -266,6 +266,12 @@ impl Topic {
     /// ThinkerNode：说话指令（输出到 MouthNode）
     pub fn cortex_speak(agent_id: &str) -> Self { Self::new(format!("cortex/{agent_id}/speak")) }
 
+    /// GoalLoop：启动目标驱动循环
+    ///
+    /// payload 契约：`{"description": "<目标描述>"}`，description 不可为空。
+    /// 广播式（非 per-agent），由 ThinkerNode 订阅。发布方：Kernel 转发外部指令。
+    pub fn cortex_goal_start() -> Self { Self::new("cortex/goal_start") }
+
     // ---- Param Topic (ROS 风格参数服务器) ----
 
     /// 设置参数

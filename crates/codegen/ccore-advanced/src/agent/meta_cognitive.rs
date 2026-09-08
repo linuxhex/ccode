@@ -28,6 +28,19 @@ pub enum DifficultyLevel {
     Extreme,
 }
 
+impl DifficultyLevel {
+    /// 将难度等级映射为推理力度参数（用于 LLM API 的 reasoning_effort）
+    /// 借鉴 DeepSeek Harness 的 off/high/max 分级设计
+    pub fn to_reasoning_effort(&self) -> Option<f64> {
+        match self {
+            DifficultyLevel::Trivial => None,       // off：简单任务不消耗推理 token
+            DifficultyLevel::Moderate => Some(0.5),  // 中等力度
+            DifficultyLevel::Complex => Some(0.8),   // 较高力度
+            DifficultyLevel::Extreme => Some(1.0),   // 最大力度
+        }
+    }
+}
+
 /// 执行策略
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ExecutionStrategy {

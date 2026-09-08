@@ -293,16 +293,20 @@ impl ToolExecutor for ReadExecutor {
             ));
         }
 
-        // gitignore 过滤
-        if get_gitignore().should_skip(&validation.canonical) {
-            let skipped = path.to_string();
+        // gitignore 状态：**不再拒读**。
+        //
+        // 六家参照（codex/opencode/deepcode-cli/grok-build/claude-code/harness-cli）没有一家
+        // 因为 .gitignore 就拒绝 read_file —— 被忽略的文件恰恰常是要查的东西
+        // （构建产物、本地配置、日志、生成代码）。真正需要拦的是敏感文件，
+        // 那由上面的 `validation.is_sensitive` 负责，与 gitignore 是两件事。
+        // 这里只在输出里挂一条提示，让模型知道该文件不在版本控制内。
+        let gitignored = get_gitignore().should_skip(&validation.canonical);
+        if gitignored {
             tracing::debug!(
                 target: "ccore::tool",
-                path = %skipped,
-                skipped = %skipped,
-                "gitignore filter"
+                path = %path,
+                "reading gitignored file"
             );
-            return Err(anyhow::anyhow!("read: 文件 {} 被 .gitignore 忽略", path));
         }
 
         // 读取文件
@@ -314,8 +318,15 @@ impl ToolExecutor for ReadExecutor {
                 _ => anyhow::anyhow!("read: 读取 {} 失败：{}", path, e),
             })?;
 
-        // 记录文件已被读取（先读后写约束）
-        read_tracker::mark_file_read(path);
+        // 记录文件已被读取（先读后写约束 + 版本追踪）
+        // 使用规范化路径，避免路径别名导致追踪失效
+        if let Ok(metadata) = tokio::fs::metadata(&validation.canonical).await {
+            let stamp = read_tracker::FileStamp::from_metadata(&metadata);
+            read_tracker::mark_file_read_with_stamp(&validation.canonical, stamp);
+        } else {
+            // fallback: 无法获取元数据时只记录路径
+            read_tracker::mark_file_read(&validation.canonical);
+        }
 
         // 文件大小检查
         let total_lines = content.lines().count();
@@ -345,6 +356,10 @@ impl ToolExecutor for ReadExecutor {
 
         // 文件头
         result.push_str(&output_formatter::format_file_header(path, file_size));
+
+        if gitignored {
+            result.push_str("   注意：该文件被 .gitignore 忽略，不在版本控制内\n");
+        }
 
         // 分页信息
         if offset > 0 || end < lines.len() {
@@ -390,16 +405,18 @@ impl ToolExecutor for WriteExecutor {
             ));
         }
 
-        // 如果文件已存在，检查是否已读取
+        // 如果文件已存在，检查是否已读取（严格版本检查）
         if validation.canonical.exists() {
-            let has_been_read = read_tracker::global_read_tracker().has_been_read(path);
+            let has_been_read = read_tracker::global_read_tracker().has_been_read(&validation.canonical);
             tracing::debug!(
                 target: "ccore::tool",
                 path = %path,
+                canonical = %validation.canonical.display(),
                 has_been_read = has_been_read,
                 "read-before-write check"
             );
-            read_tracker::require_file_read(path)?;
+            // write_file 全量覆盖风险高，使用严格版本检查
+            read_tracker::require_file_read(&validation.canonical)?;
         }
 
         // 二进制内容检测
@@ -407,6 +424,14 @@ impl ToolExecutor for WriteExecutor {
             return Err(anyhow::anyhow!(
                 "write: 内容包含 NUL 字节，可能是二进制数据\n  二进制文件请使用 bash: base64/xxd 等工具"
             ));
+        }
+
+        // 文件检查点：编辑前保存原始内容（用于回滚）
+        if validation.canonical.exists() {
+            if let Ok(original) = tokio::fs::read_to_string(&validation.canonical).await {
+                super::file_history::global_file_history()
+                    .capture_before_edit(&validation.canonical, &original);
+            }
         }
 
         // 确保父目录存在
@@ -490,15 +515,25 @@ fn normalize_line_endings(s: &str) -> String {
 }
 
 /// 检测文件主导行尾风格，返回 `\r\n` 或 `\n`
-#[allow(dead_code)]
 fn detect_line_ending(s: &str) -> &str {
     let crlf_count = s.matches("\r\n").count();
     let lf_count = s.matches('\n').count();
-    // 多数 \n 是 \r\n 的一部分 → CRLF 主导
     if crlf_count > 0 && crlf_count * 2 >= lf_count {
         "\r\n"
     } else {
         "\n"
+    }
+}
+
+/// 将内容的行尾统一为目标风格
+///
+/// 先归一化为 LF，再按目标风格转换。
+fn preserve_eol(content: &str, target_eol: &str) -> String {
+    let normalized = normalize_line_endings(content);
+    if target_eol == "\r\n" {
+        normalized.replace('\n', "\r\n")
+    } else {
+        normalized
     }
 }
 
@@ -711,7 +746,14 @@ impl ToolExecutor for EditExecutor {
         }
 
         // 先读后写约束：编辑前必须先读取文件
-        read_tracker::require_file_read(path)?;
+        // search_replace 有精确匹配的天然保护，使用宽松版本检查
+        read_tracker::require_file_read_lenient(&validation.canonical)?;
+
+        // 文件检查点：编辑前保存原始内容（用于回滚）
+        if let Ok(original) = tokio::fs::read_to_string(&validation.canonical).await {
+            super::file_history::global_file_history()
+                .capture_before_edit(&validation.canonical, &original);
+        }
 
         match mode {
             "replace" => self.execute_replace(args, &validation.canonical).await,
@@ -740,6 +782,15 @@ impl EditExecutor {
 
         let content = tokio::fs::read_to_string(canonical).await
             .map_err(|e| anyhow::anyhow!("search_replace: 读取 {} 失败：{}", canonical.display(), e))?;
+
+        // EOL 保真：检测原文件行尾风格，替换文本统一为同一风格
+        let file_eol = detect_line_ending(&content);
+        let new_text = if file_eol == "\r\n" {
+            preserve_eol(new_text, file_eol)
+        } else {
+            new_text.to_string()
+        };
+        let new_text = new_text.as_str();
 
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
@@ -805,6 +856,9 @@ impl EditExecutor {
         let file_content = tokio::fs::read_to_string(canonical).await
             .map_err(|e| anyhow::anyhow!("search_replace: 读取 {} 失败：{}", canonical.display(), e))?;
 
+        // EOL 保真：检测原文件行尾风格
+        let file_eol = detect_line_ending(&file_content);
+
         let lines: Vec<&str> = file_content.lines().collect();
         if after_line > lines.len() {
             return Err(anyhow::anyhow!(
@@ -819,7 +873,7 @@ impl EditExecutor {
         }
         new_lines.extend_from_slice(&lines[after_line..]);
 
-        let new_content = new_lines.join("\n");
+        let new_content = new_lines.join(file_eol);
 
         // 生成 diff
         let diff = output_formatter::generate_unified_diff(
@@ -882,9 +936,42 @@ impl EditExecutor {
     }
 }
 
+// ─── 检索子进程超时 ──────────────────────────────────────────────────────────
+
+/// `rg` / `find` 子进程墙钟上限。
+///
+/// bash 与 web 工具早就有超时，只有检索工具漏了：一个灾难性回溯正则
+/// （如 `(a+)+b` 撞上长行）能让 `rg` 跑到天荒地老，agent 就此挂死且无任何输出。
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 带超时地跑一个检索子进程
+///
+/// `kill_on_drop(true)` 是关键：超时后 `timeout` 丢弃 future，`Child` 随之 drop，
+/// tokio 才会真正给子进程发 kill。缺这一句就只是「我们不等了」而不是「它停了」，
+/// 会留下孤儿 `rg` 继续吃 CPU。
+async fn run_search_command(
+    mut cmd: tokio::process::Command,
+    tool: &str,
+) -> anyhow::Result<Result<std::process::Output, std::io::Error>> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(SEARCH_TIMEOUT, cmd.output()).await {
+        Ok(res) => Ok(res),
+        Err(_) => Err(anyhow::anyhow!(
+            "{}: 检索超过 {} 秒被中止。\n\
+             常见原因：模式在大目录上过于宽泛，或正则存在灾难性回溯。\n\
+             建议：用 path 参数缩小范围，或简化正则（避免嵌套量词如 (a+)+）",
+            tool,
+            SEARCH_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 // ─── GrepExecutor ────────────────────────────────────────────────────────────
 
 pub struct GrepExecutor;
+
+/// grep 结果最多回显多少行（超出部分连同真实总数一起告知模型）
+const GREP_MAX_LINES: usize = 200;
 
 #[async_trait::async_trait]
 impl ToolExecutor for GrepExecutor {
@@ -903,7 +990,6 @@ impl ToolExecutor for GrepExecutor {
         cmd.arg("--line-number")
             .arg("--max-count").arg("200")
             .arg("--glob").arg("!.git");  // 排除 .git 目录（显式 gitignore 兼容）
-
         if case_insensitive {
             cmd.arg("-i");
         }
@@ -930,7 +1016,7 @@ impl ToolExecutor for GrepExecutor {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let output = cmd.output().await;
+        let output = run_search_command(cmd, "grep").await?;
 
         match output {
             Ok(out) => {
@@ -946,7 +1032,15 @@ impl ToolExecutor for GrepExecutor {
                         .len();
 
                     let mut result = format!("在 {} 个文件中找到 {} 处匹配\n\n", file_count, match_count);
-                    result.push_str(&output_formatter::truncate_lines(&stdout, 200));
+                    result.push_str(&output_formatter::truncate_lines(&stdout, GREP_MAX_LINES));
+                    // 截断必须回传模型，否则它会以为已经看完全部匹配并据此下结论
+                    if match_count > GREP_MAX_LINES {
+                        result.push_str(&format!(
+                            "\n\n[仅显示前 {} 行，共 {} 行匹配。另外 rg 对每个文件也最多报 200 处 —— \
+                             结果可能不完整，请用 path/include/file_type 收窄范围后重查]",
+                            GREP_MAX_LINES, match_count
+                        ));
+                    }
                     Ok(result)
                 }
             }
@@ -979,14 +1073,22 @@ impl GrepExecutor {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
 
-        let output = cmd.output().await
+        let output = run_search_command(cmd, "grep").await?
             .map_err(|e| anyhow::anyhow!("grep: 回退搜索也失败：{}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if stdout.is_empty() {
             Ok("未找到匹配结果".into())
         } else {
-            Ok(output_formatter::truncate_lines(&stdout, 200))
+            let match_count = stdout.lines().count();
+            let mut result = output_formatter::truncate_lines(&stdout, GREP_MAX_LINES);
+            if match_count > GREP_MAX_LINES {
+                result.push_str(&format!(
+                    "\n\n[仅显示前 {} 行，共 {} 行匹配 —— 结果不完整，请收窄范围后重查]",
+                    GREP_MAX_LINES, match_count
+                ));
+            }
+            Ok(result)
         }
     }
 }
@@ -994,6 +1096,9 @@ impl GrepExecutor {
 // ─── GlobExecutor ────────────────────────────────────────────────────────────
 
 pub struct GlobExecutor;
+
+/// glob 最多回显多少个文件（超出部分连同真实总数一起告知模型）
+const GLOB_MAX_FILES: usize = 200;
 
 #[async_trait::async_trait]
 impl ToolExecutor for GlobExecutor {
@@ -1004,6 +1109,46 @@ impl ToolExecutor for GlobExecutor {
         let path = args["path"].as_str().unwrap_or(".");
         let exclude = args["exclude"].as_str();
 
+        // 首选 `rg --files`：
+        // - 支持 `**`（`find -name` 只匹配单层 basename，`crates/**/*.rs` 在它下面永远无结果）
+        // - 原生按 .gitignore 过滤，而不是先列全量再事后剔除
+        // 只有 rg 不存在时才退回 `find`。
+        let mut cmd = tokio::process::Command::new("rg");
+        cmd.arg("--files")
+            .arg("--glob").arg(pattern)
+            .arg("--glob").arg("!.git");
+        if let Some(exc) = exclude {
+            cmd.arg("--glob").arg(format!("!{}", exc));
+        }
+        cmd.arg(path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+
+        let stdout = match run_search_command(cmd, "glob").await? {
+            Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return self.fallback_glob(pattern, path, exclude).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("glob: 执行失败：{}", e)),
+        };
+
+        Ok(Self::format_matches(stdout.lines(), pattern, false))
+    }
+
+    fn name(&self) -> &str { "glob" }
+}
+
+impl GlobExecutor {
+    /// `find` 回退（ripgrep 不可用时）
+    ///
+    /// 语义弱于 rg：`-name` 只匹配 basename，`**` 不生效；gitignore 只能事后过滤。
+    /// 这一点会在输出里明确告知模型，避免它把「没找到」当成「不存在」。
+    async fn fallback_glob(
+        &self,
+        pattern: &str,
+        path: &str,
+        exclude: Option<&str>,
+    ) -> anyhow::Result<String> {
         let mut cmd = tokio::process::Command::new("find");
         cmd.arg(path)
             .arg("-name")
@@ -1011,57 +1156,84 @@ impl ToolExecutor for GlobExecutor {
             .arg("-type")
             .arg("f");
 
-        // 排除模式
         if let Some(exc) = exclude {
-            cmd.arg("-not")
-                .arg("-path")
-                .arg(exc);
+            cmd.arg("-not").arg("-path").arg(exc);
         }
 
         // 排除常见忽略目录
-        cmd.arg("-not")
-            .arg("-path")
-            .arg("*/.git/*")
-            .arg("-not")
-            .arg("-path")
-            .arg("*/node_modules/*")
-            .arg("-not")
-            .arg("-path")
-            .arg("*/target/*");
+        cmd.arg("-not").arg("-path").arg("*/.git/*")
+            .arg("-not").arg("-path").arg("*/node_modules/*")
+            .arg("-not").arg("-path").arg("*/target/*");
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
 
-        let output = cmd.output().await
+        let output = run_search_command(cmd, "glob").await?
             .map_err(|e| anyhow::anyhow!("glob: 执行失败：{}", e))?;
-
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.is_empty() {
-            Ok("未找到匹配文件".into())
-        } else {
-            // 使用 gitignore 过滤结果
-            let gitignore = get_gitignore();
-            let mut lines: Vec<&str> = stdout.lines()
-                .filter(|line| {
-                    let path = std::path::Path::new(line);
-                    !gitignore.should_skip(path)
-                })
-                .take(200)
-                .collect();
-            lines.sort();
-            let count = lines.len();
-            let mut result = format!("找到 {} 个文件\n\n", count);
-            result.push_str(&lines.join("\n"));
-            Ok(result)
-        }
+
+        // find 不认 .gitignore，只能列完再剔
+        let gitignore = get_gitignore();
+        let kept: Vec<&str> = stdout
+            .lines()
+            .filter(|line| !gitignore.should_skip(std::path::Path::new(line)))
+            .collect();
+
+        Ok(Self::format_matches(kept.into_iter(), pattern, true))
     }
 
-    fn name(&self) -> &str { "glob" }
+    /// 统一的结果格式化：**先排序再截断**，且总数用真实值
+    ///
+    /// 此前是 `.take(200)` 之后才 sort，于是既拿到的是任意子集、
+    /// 又把「找到 200 个」当成总数报给模型 —— 5000 个匹配时这是错误信息，
+    /// 模型会据此认定已看全。
+    fn format_matches<'a>(
+        lines: impl Iterator<Item = &'a str>,
+        pattern: &str,
+        degraded: bool,
+    ) -> String {
+        let mut all: Vec<&str> = lines.filter(|l| !l.trim().is_empty()).collect();
+        if all.is_empty() {
+            let mut msg = format!("未找到匹配 {} 的文件", pattern);
+            if degraded {
+                msg.push_str(
+                    "\n（当前用 find 回退：`-name` 只匹配文件名单层，`**` 不生效。\
+                     装上 ripgrep 后 glob 支持完整 glob 语法）",
+                );
+            }
+            return msg;
+        }
+
+        all.sort();
+        let total = all.len();
+        let shown = total.min(GLOB_MAX_FILES);
+
+        let mut result = format!("找到 {} 个文件\n\n", total);
+        result.push_str(&all[..shown].join("\n"));
+        if total > shown {
+            result.push_str(&format!(
+                "\n\n[仅显示前 {} 个（按路径排序），共 {} 个 —— 请用更精确的 pattern 或 path 收窄]",
+                shown, total
+            ));
+        }
+        if degraded {
+            result.push_str(
+                "\n\n[注意：ripgrep 不可用，已用 find 回退，`**` 等 glob 语法不生效]",
+            );
+        }
+        result
+    }
 }
 
 // ─── ListDirExecutor ─────────────────────────────────────────────────────────
 
 pub struct ListDirExecutor;
+
+/// list_dir 最多回显多少个条目
+///
+/// 此前无上限：在仓库根上 `recursive=true` 会把 `target/` 整棵树列出来，
+/// 单次工具结果就能撑爆上下文窗口。
+const LIST_DIR_MAX_ENTRIES: usize = 500;
 
 #[async_trait::async_trait]
 impl ToolExecutor for ListDirExecutor {
@@ -1072,7 +1244,16 @@ impl ToolExecutor for ListDirExecutor {
         let max_depth = args["max_depth"].as_u64().unwrap_or(if recursive { 3 } else { 1 }) as usize;
 
         let mut entries = Vec::new();
-        self.list_dir_recursive(path, 0, max_depth, show_hidden, &mut entries).await?;
+        let mut skipped = 0usize;
+        self.list_dir_recursive(
+            path,
+            0,
+            max_depth,
+            show_hidden,
+            &mut entries,
+            &mut skipped,
+        )
+        .await?;
 
         // 排序：目录在前，文件在后
         entries.sort_by(|a, b| {
@@ -1086,16 +1267,34 @@ impl ToolExecutor for ListDirExecutor {
         });
 
         if entries.is_empty() {
-            Ok("(空目录)".into())
-        } else {
-            Ok(entries.join("\n"))
+            let mut msg = String::from("(空目录)");
+            if skipped > 0 {
+                msg.push_str(&format!("\n[{} 个条目被 .gitignore 过滤]", skipped));
+            }
+            return Ok(msg);
         }
+
+        let total = entries.len();
+        let shown = total.min(LIST_DIR_MAX_ENTRIES);
+        let mut out = entries[..shown].join("\n");
+        if total > shown {
+            out.push_str(&format!(
+                "\n\n[仅显示前 {} 个条目，共 {} 个 —— 用 path 指向更具体的子目录，\
+                 或用 glob 按模式检索]",
+                shown, total
+            ));
+        }
+        if skipped > 0 {
+            out.push_str(&format!("\n[另有 {} 个条目被 .gitignore 过滤]", skipped));
+        }
+        Ok(out)
     }
 
     fn name(&self) -> &str { "list_dir" }
 }
 
 impl ListDirExecutor {
+    #[allow(clippy::too_many_arguments)]
     async fn list_dir_recursive(
         &self,
         path: &str,
@@ -1103,20 +1302,33 @@ impl ListDirExecutor {
         max_depth: usize,
         show_hidden: bool,
         entries: &mut Vec<String>,
+        skipped: &mut usize,
     ) -> anyhow::Result<()> {
         if depth >= max_depth {
+            return Ok(());
+        }
+        // 已经攒够回显量还要继续递归，只会白读磁盘
+        if entries.len() >= LIST_DIR_MAX_ENTRIES * 4 {
             return Ok(());
         }
 
         let mut dir_entries = tokio::fs::read_dir(path).await
             .map_err(|e| anyhow::anyhow!("list_dir: 读取 {} 失败：{}", path, e))?;
 
+        let gitignore = get_gitignore();
         let mut items = Vec::new();
         while let Some(entry) = dir_entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
 
             // 隐藏文件过滤
             if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+
+            // gitignore 过滤：与 grep/glob 对齐。
+            // 缺这一条时 `target/`、`node_modules/` 会被整棵列进上下文。
+            if gitignore.should_skip(&entry.path()) {
+                *skipped += 1;
                 continue;
             }
 
@@ -1139,7 +1351,15 @@ impl ListDirExecutor {
             // 递归处理子目录
             if meta.is_dir() && depth + 1 < max_depth && !name.starts_with('.') {
                 let sub_path = format!("{}/{}", path, name);
-                Box::pin(self.list_dir_recursive(&sub_path, depth + 1, max_depth, show_hidden, entries)).await?;
+                Box::pin(self.list_dir_recursive(
+                    &sub_path,
+                    depth + 1,
+                    max_depth,
+                    show_hidden,
+                    entries,
+                    skipped,
+                ))
+                .await?;
             }
         }
 
@@ -1422,16 +1642,17 @@ mod tests {
 
     #[test]
     fn test_read_tracker_integration() {
+        use std::path::Path;
         // 使用全局追踪器
         read_tracker::global_read_tracker().clear();
 
         // 未读取的文件应返回错误
-        let result = read_tracker::require_file_read("/test/unread.rs");
+        let result = read_tracker::require_file_read_lenient(Path::new("/test/unread.rs"));
         assert!(result.is_err());
 
         // 读取后应成功
-        read_tracker::mark_file_read("/test/read.rs");
-        let result = read_tracker::require_file_read("/test/read.rs");
+        read_tracker::mark_file_read(Path::new("/test/read.rs"));
+        let result = read_tracker::require_file_read_lenient(Path::new("/test/read.rs"));
         assert!(result.is_ok());
 
         // 清理
@@ -1587,5 +1808,53 @@ mod tests {
     #[test]
     fn test_normalize_line_endings_no_newlines() {
         assert_eq!(normalize_line_endings("hello"), "hello");
+    }
+
+    // ── glob 结果格式化（P1-4 / P1-6）──
+
+    #[test]
+    fn glob_reports_true_total_not_the_truncated_count() {
+        // 回归 P1-6：此前先 take(200) 再报数，5000 个匹配会被报成「找到 200 个」，
+        // 模型据此认定已经看全
+        let paths: Vec<String> = (0..GLOB_MAX_FILES + 50)
+            .map(|i| format!("src/f{:04}.rs", i))
+            .collect();
+        let out = GlobExecutor::format_matches(paths.iter().map(|s| s.as_str()), "*.rs", false);
+
+        assert!(out.starts_with(&format!("找到 {} 个文件", GLOB_MAX_FILES + 50)));
+        assert!(out.contains(&format!("仅显示前 {} 个", GLOB_MAX_FILES)));
+        assert!(out.contains("收窄"));
+    }
+
+    #[test]
+    fn glob_sorts_before_truncating() {
+        // 回归 P1-6 的另一半：此前 take 在 sort 之前，拿到的是文件系统顺序的任意子集
+        let mut paths: Vec<String> = (0..GLOB_MAX_FILES + 10)
+            .map(|i| format!("f{:04}.rs", i))
+            .collect();
+        paths.reverse(); // 模拟文件系统给出的乱序
+        let out = GlobExecutor::format_matches(paths.iter().map(|s| s.as_str()), "*.rs", false);
+
+        // 排序后的前 200 个必须是 f0000..f0199，而不是倒序的尾巴
+        assert!(out.contains("f0000.rs"));
+        assert!(out.contains("f0199.rs"));
+        assert!(!out.contains("f0209.rs"));
+    }
+
+    #[test]
+    fn glob_no_match_flags_find_degradation() {
+        let empty: Vec<&str> = Vec::new();
+        let rg_msg = GlobExecutor::format_matches(empty.iter().copied(), "**/*.rs", false);
+        assert!(!rg_msg.contains("find 回退"));
+
+        let find_msg = GlobExecutor::format_matches(empty.iter().copied(), "**/*.rs", true);
+        assert!(find_msg.contains("`**` 不生效"), "回退时必须告知模型语义已降级");
+    }
+
+    #[test]
+    fn glob_skips_blank_lines() {
+        let lines = ["a.rs", "", "  ", "b.rs"];
+        let out = GlobExecutor::format_matches(lines.iter().copied(), "*.rs", false);
+        assert!(out.starts_with("找到 2 个文件"));
     }
 }

@@ -464,8 +464,49 @@ impl ToolNode {
             ..request
         };
 
+        // tool_search 特殊处理：按需返回工具的完整参数 schema，支持延迟加载
+        let result = if effective_request.tool_name == "tool_search" {
+            let tool_names: Vec<String> = effective_request.arguments["tool_names"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
+            let mut found = Vec::new();
+            let mut not_found = Vec::new();
+            for name in &tool_names {
+                if let Some(entry) = self.bridge.get_entry(name) {
+                    found.push(serde_json::json!({
+                        "name": entry.definition.name,
+                        "description": entry.definition.description,
+                        "parameters": entry.definition.parameters,
+                    }));
+                } else {
+                    not_found.push(name.clone());
+                }
+            }
+
+            let mut output = String::new();
+            if !found.is_empty() {
+                output.push_str("以下是请求工具的完整参数定义：\n\n");
+                output.push_str(&serde_json::to_string_pretty(&found).unwrap_or_default());
+            }
+            if !not_found.is_empty() {
+                output.push_str(&format!("\n\n未找到以下工具：{}", not_found.join(", ")));
+            }
+            if found.is_empty() && not_found.is_empty() {
+                output.push_str("请提供要查询的工具名称列表");
+            }
+
+            crate::tools::ToolCallResult {
+                tool_call_id: effective_request.tool_call_id.clone(),
+                output,
+                success: true,
+                duration_ms: 0,
+                is_partial: false,
+            }
+        }
         // task 工具特殊处理：通过消息总线请求 Kernel spawn 子 Agent
-        let result = if effective_request.tool_name == "task" {
+        else if effective_request.tool_name == "task" {
             let agent_type = effective_request.arguments["agent_type"].as_str().unwrap_or("general-purpose");
             let task_description = effective_request.arguments["description"].as_str().unwrap_or("");
             let model = effective_request.arguments["model"].as_str(); // 可选模型覆盖
@@ -504,6 +545,30 @@ impl ToolNode {
             }
         } else {
             self.bridge.execute(&effective_request).await
+        };
+
+        // 工具输出预算控制：防止超大输出灌入上下文消耗 token
+        // 借鉴 Claude Code applyToolResultBudget，超过预算时保留头尾
+        const TOOL_OUTPUT_BUDGET_CHARS: usize = 24_000;
+        let result = if result.output.len() > TOOL_OUTPUT_BUDGET_CHARS
+            && effective_request.tool_name != "task"
+            && effective_request.tool_name != "tool_search"
+        {
+            let original_len = result.output.len();
+            // 按字符边界安全截断，避免切断 UTF-8 多字节字符
+            let head_end = result.output.floor_char_boundary(10_000);
+            let tail_start = result.output.ceil_char_boundary(original_len.saturating_sub(10_000));
+            let head = &result.output[..head_end];
+            let tail = &result.output[tail_start..];
+            crate::tools::ToolCallResult {
+                output: format!(
+                    "{}\n\n[... 内容已截断，原始大小 {} 字符，使用 read_file 查看具体行 ...]\n\n{}",
+                    head, original_len, tail
+                ),
+                ..result
+            }
+        } else {
+            result
         };
 
         AgentMetrics::global()

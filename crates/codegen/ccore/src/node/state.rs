@@ -88,23 +88,55 @@ pub struct StateNode {
 }
 
 impl StateNode {
+    /// 新会话（随机 session id）
     pub fn new(id: NodeId) -> Self {
-        let storage_root = Self::dirs();
-        let session_id = uuid::Uuid::new_v4().to_string();
+        Self::with_session_id(id, uuid::Uuid::new_v4().to_string())
+    }
 
+    /// 指定 session id —— 恢复已有会话时由 launcher 传入
+    ///
+    /// 此前 `new` 无条件 `Uuid::new_v4()` 且没有任何注入通道，所以即使恢复函数
+    /// 接上了也没法告诉它恢复哪一个。
+    pub fn with_session_id(id: NodeId, session_id: String) -> Self {
         Self {
             id,
             short_term: ShortTermMemory::new(),
-            storage_root,
+            storage_root: Self::dirs(),
             session_id,
             jsonl_path: None,
         }
     }
 
+    /// 当前会话 ID
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// 获取默认存储目录
     fn dirs() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".ccode").join("sessions")
+        crate::node::session_index::sessions_root()
+    }
+
+    /// 用已复原的消息序列填充短期记忆
+    ///
+    /// 后续 `state/persist` 会继续往同一个 `conversation.jsonl` 追加，
+    /// 所以这里**只灌内存、不重写磁盘**。
+    pub fn restore(&mut self, messages: &[crate::node::session_index::RestoredMessage]) {
+        for m in messages {
+            self.short_term.store(
+                m.role.clone(),
+                m.content.clone(),
+                m.token_count,
+                m.is_tool_call,
+            );
+        }
+        self.init_jsonl();
+        tracing::info!(
+            target: "ccore::session",
+            session = %self.session_id,
+            messages = messages.len(),
+            "已恢复会话短期记忆"
+        );
     }
 
     /// 持久化当前对话到磁盘
@@ -180,45 +212,6 @@ impl StateNode {
                 tracing::warn!(target: "ccore::state", "failed to write jsonl entry: {e}");
             }
         }
-    }
-
-    /// 从 JSONL 文件加载会话（优先于 conversation.json）
-    pub async fn load_session_jsonl(&mut self, session_id: &str) -> anyhow::Result<()> {
-        let jsonl_path = self.storage_root.join(session_id).join("conversation.jsonl");
-        if !jsonl_path.exists() {
-            return self.load_session(session_id).await;
-        }
-
-        let content = std::fs::read_to_string(&jsonl_path)?;
-        let mut count = 0;
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<JsonlEntry>(line) {
-                match entry.entry_type.as_str() {
-                    "user" | "assistant" | "system" => {
-                        let role = entry.role.as_deref().unwrap_or(&entry.entry_type);
-                        let content = entry.content.as_deref().unwrap_or("");
-                        let tokens = entry.token_count.unwrap_or((content.len() / 4) as u32);
-                        self.short_term.store(role.to_string(), content.to_string(), tokens, false);
-                        count += 1;
-                    }
-                    "tool_call" | "tool_result" => {
-                        let content = entry.content.as_deref().unwrap_or("");
-                        let tokens = entry.token_count.unwrap_or((content.len() / 4) as u32);
-                        self.short_term.store("tool".to_string(), content.to_string(), tokens, true);
-                        count += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        self.session_id = session_id.to_string();
-        self.jsonl_path = Some(jsonl_path);
-        tracing::info!("JSONL 加载会话：{} ({}条事件)", session_id, count);
-        Ok(())
     }
 
     /// 查询当前对话状态
@@ -379,29 +372,6 @@ impl StateNode {
         }
     }
 
-    /// 从磁盘加载历史对话
-    pub async fn load_session(&mut self, session_id: &str) -> anyhow::Result<()> {
-        let path = self.storage_root.join(session_id).join("conversation.json");
-        if !path.exists() {
-            return Err(anyhow::anyhow!("会话不存在：{}", session_id));
-        }
-
-        let json = std::fs::read_to_string(&path)?;
-        let conversation: PersistedConversation = serde_json::from_str(&json)?;
-
-        for msg in conversation.messages {
-            self.short_term.store(
-                msg.role,
-                msg.content,
-                msg.token_count,
-                msg.is_tool_call,
-            );
-        }
-
-        self.session_id = session_id.to_string();
-        tracing::info!("加载历史会话：{} ({}条消息)", session_id, self.short_term.len());
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -453,7 +423,12 @@ impl Node for StateNode {
                 };
                 self.append_jsonl(entry);
 
-                self.persist().await?;
+                // 不在这里写 conversation.json。
+                //
+                // 此前每收到一条消息就 `to_string_pretty` 整个会话再全量 fs::write，
+                // 300 轮的会话要写 300 次、最后一次写的是完整 300 轮 —— O(n²) 写放大。
+                // jsonl 的追加写已经保证了崩溃安全，conversation.json 只是给人看的
+                // 快照，退出时（`Node::stop`）写一次就够。
             }
             "state/query" => {
                 let state = self.query_state();

@@ -26,8 +26,8 @@ use serde::Deserialize;
 use std::pin::Pin;
 
 use super::provider::{
-    Provider, SampleRequest, SampleResponse, StreamChannel, StreamChunk, TokenUsage, ToolCallChunk,
-    CancellationHandle,
+    ChatMessage, Provider, SampleRequest, SampleResponse, StreamChannel, StreamChunk, TokenUsage,
+    ToolCallChunk, CancellationHandle,
 };
 
 /// Claude 兼容 Provider 配置
@@ -68,38 +68,129 @@ impl ClaudeCompatProvider {
         format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'))
     }
 
+    /// 从消息列表中提取 system 角色条目
+    ///
+    /// `messages` 数组里 Anthropic 只接受 user/assistant，出现 `role: "system"`
+    /// 会被拒绝。但 ccore 的工作记忆会在对话中途注入 system 条目
+    /// （反射弧建议、doom loop 逃脱提示、元认知建议、压缩摘要、CCODE.md 项目上下文），
+    /// 且 `build_sample_request` 把 `system_prompt` 置为 None，全都落在 messages 里。
+    ///
+    /// 返回 (合并后的 system 文本, 剔除 system 后的消息列表)。
+    /// system 文本按出现顺序拼接，交由调用方放到顶层 `system` 字段。
+    pub(crate) fn extract_system_messages(
+        messages: &[ChatMessage],
+    ) -> (Option<String>, Vec<ChatMessage>) {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut rest: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+
+        for m in messages {
+            if m.role == "system" {
+                if !m.content.trim().is_empty() {
+                    system_parts.push(m.content.as_str());
+                }
+            } else {
+                rest.push(m.clone());
+            }
+        }
+
+        let system = if system_parts.is_empty() {
+            None
+        } else {
+            Some(system_parts.join("\n\n"))
+        };
+        (system, rest)
+    }
+
+    /// 合并连续同角色消息
+    ///
+    /// Anthropic Messages API 要求 user/assistant 严格交替，连续同角色会被拒绝。
+    /// 而 ccore 的工作记忆里，N 个并行工具的结果是 N 条独立 user 消息
+    /// （`WorkingEntry` 无 tool_call_id、`MessageRole` 无 Tool 变体，暂无法表达
+    /// 单条 user 消息内含多个 tool_result 块的标准形状），因此在序列化边界合并。
+    ///
+    /// 合并后保留首条的 `cache_control`——断点应落在稳定前缀的起始处。
+    /// OpenAI 兼容端点容忍连续同角色，故本处理只在 Anthropic provider 做。
+    pub(crate) fn merge_consecutive_roles(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        let mut merged: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+        for m in messages {
+            match merged.last_mut() {
+                Some(prev) if prev.role == m.role => {
+                    prev.content.push_str("\n\n");
+                    prev.content.push_str(&m.content);
+                    // 已有断点则保留，否则继承当前条的
+                    if prev.cache_control.is_none() {
+                        prev.cache_control = m.cache_control.clone();
+                    }
+                }
+                _ => merged.push(m.clone()),
+            }
+        }
+        merged
+    }
+
     /// 将 SampleRequest 转换为 Anthropic Messages API 请求体
     fn build_request_body(&self, request: &SampleRequest) -> serde_json::Value {
+        // 先剔除 system 条目（Anthropic 的 messages 只接受 user/assistant），
+        // 再合并连续同角色（要求严格交替）——顺序不能反：先剔除才能让原本被
+        // system 条目隔开的两条同角色消息正确合并。
+        let (inline_system, without_system) = Self::extract_system_messages(&request.messages);
+        let merged_messages = Self::merge_consecutive_roles(&without_system);
         let mut body = serde_json::json!({
             "model": request.model,
-            "messages": request.messages.iter().map(|m| {
-                // Anthropic 要求 content 为字符串或内容块数组
-                serde_json::json!({
+            "messages": merged_messages.iter().map(|m| {
+                let mut msg = serde_json::json!({
                     "role": m.role,
                     "content": m.content,
-                })
+                });
+                // 序列化 cache_control 断点，让 API 侧复用前缀 KV cache
+                if let Some(ref cc) = m.cache_control {
+                    msg.as_object_mut().unwrap().insert(
+                        "cache_control".to_string(),
+                        serde_json::json!({"type": cc.cache_type}),
+                    );
+                }
+                msg
             }).collect::<Vec<_>>(),
             "stream": request.stream,
             // Anthropic 要求必须设置 max_tokens
             "max_tokens": request.max_tokens.unwrap_or(8192),
         });
 
-        // 系统提示作为顶层 system 字段（而非放在 messages 中）
-        if let Some(ref system_prompt) = request.system_prompt {
+        // 系统提示作为顶层 system 字段（而非放在 messages 中）。
+        // request.system_prompt 与从 messages 里剔出的 inline system 条目都要带上：
+        // 前者是显式设置的，后者是工作记忆中途注入的（反射弧/doom loop 提示等），
+        // 两者都丢不得，按 显式 → 内联 的顺序拼接。
+        let system_text = match (request.system_prompt.as_deref(), inline_system.as_deref()) {
+            (Some(explicit), Some(inline)) => Some(format!("{explicit}\n\n{inline}")),
+            (Some(explicit), None) => Some(explicit.to_string()),
+            (None, Some(inline)) => Some(inline.to_string()),
+            (None, None) => None,
+        };
+        if let Some(ref system_prompt) = system_text {
             body["system"] = serde_json::json!(system_prompt);
         }
 
-        // 工具定义
+        // 工具定义（按名字排序确保跨轮次稳定，提升缓存命中率）
         if !request.tools.is_empty() {
-            body["tools"] = serde_json::json!(
-                request.tools.iter().map(|t| {
-                    serde_json::json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "input_schema": t.parameters,
-                    })
-                }).collect::<Vec<_>>()
-            );
+            let mut sorted_tools: Vec<_> = request.tools.iter().collect();
+            sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+            let mut tools_json: Vec<serde_json::Value> = sorted_tools.iter().map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                })
+            }).collect();
+
+            // 最后一个工具加 cache_control 断点，缓存整个工具定义前缀
+            if let Some(last) = tools_json.last_mut() {
+                last.as_object_mut().unwrap().insert(
+                    "cache_control".to_string(),
+                    serde_json::json!({"type": "ephemeral"}),
+                );
+            }
+            body["tools"] = serde_json::json!(tools_json);
 
             // 工具选择策略
             if let Some(ref tool_choice) = request.tool_choice {
@@ -598,6 +689,12 @@ impl Provider for ClaudeCompatProvider {
             )
             .flat_map(futures::stream::iter);
 
+        let stream = super::idle_timeout::with_idle_timeout(
+            stream,
+            request.idle_timeout_secs,
+            request_id,
+        );
+
         Ok(Box::pin(stream))
     }
 
@@ -690,6 +787,165 @@ struct SseParserState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::provider::CacheControl;
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            cache_control: None,
+        }
+    }
+
+    /// Anthropic 要求 user/assistant 严格交替。ccore 的工作记忆里 N 个并行工具
+    /// 的结果是 N 条独立 user 消息，必须在序列化边界合并否则请求被拒。
+    #[test]
+    fn merges_consecutive_user_messages() {
+        let input = vec![
+            msg("user", "帮我看下代码"),
+            msg("assistant", "[调用工具：read_file, grep]"),
+            msg("user", "文件内容 A"),
+            msg("user", "搜索结果 B"),
+            msg("user", "搜索结果 C"),
+        ];
+        let out = ClaudeCompatProvider::merge_consecutive_roles(&input);
+
+        assert_eq!(out.len(), 3, "3 条连续 user 应合并为 1 条");
+        assert_eq!(out[0].role, "user");
+        assert_eq!(out[1].role, "assistant");
+        assert_eq!(out[2].role, "user");
+        assert!(out[2].content.contains("文件内容 A"));
+        assert!(out[2].content.contains("搜索结果 B"));
+        assert!(out[2].content.contains("搜索结果 C"));
+    }
+
+    /// 合并后必须严格交替，这是 Anthropic 的硬性要求。
+    #[test]
+    fn merged_messages_strictly_alternate() {
+        let input = vec![
+            msg("user", "a"),
+            msg("user", "b"),
+            msg("assistant", "c"),
+            msg("assistant", "d"),
+            msg("user", "e"),
+        ];
+        let out = ClaudeCompatProvider::merge_consecutive_roles(&input);
+
+        for pair in out.windows(2) {
+            assert_ne!(
+                pair[0].role, pair[1].role,
+                "合并后不应存在连续同角色：{:?}",
+                out.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(out.len(), 3);
+    }
+
+    /// 合并时 cache_control 断点不能丢——断点落在稳定前缀起始处。
+    #[test]
+    fn merge_preserves_cache_control() {
+        let mut first = msg("user", "第一条");
+        first.cache_control = Some(CacheControl::ephemeral());
+        let input = vec![first, msg("user", "第二条")];
+
+        let out = ClaudeCompatProvider::merge_consecutive_roles(&input);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].cache_control.is_some(), "首条的断点应保留");
+    }
+
+    /// 首条无断点、后续条有断点时，应继承过来而非丢弃。
+    #[test]
+    fn merge_inherits_cache_control_from_later_message() {
+        let mut second = msg("user", "第二条");
+        second.cache_control = Some(CacheControl::ephemeral());
+        let input = vec![msg("user", "第一条"), second];
+
+        let out = ClaudeCompatProvider::merge_consecutive_roles(&input);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].cache_control.is_some(), "应继承后续条的断点");
+    }
+
+    #[test]
+    fn merge_leaves_already_alternating_untouched() {
+        let input = vec![msg("user", "a"), msg("assistant", "b"), msg("user", "c")];
+        let out = ClaudeCompatProvider::merge_consecutive_roles(&input);
+        assert_eq!(out.len(), 3, "已交替的序列不应被改动");
+        assert_eq!(out[0].content, "a");
+        assert_eq!(out[2].content, "c");
+    }
+
+    #[test]
+    fn merge_handles_empty_input() {
+        let out = ClaudeCompatProvider::merge_consecutive_roles(&[]);
+        assert!(out.is_empty());
+    }
+
+    /// Anthropic 的 messages 只接受 user/assistant。ccore 工作记忆会在对话中途
+    /// 注入 system 条目（反射弧建议/doom loop 提示/元认知建议/压缩摘要/CCODE.md），
+    /// 必须剔出来放顶层 system 字段，否则请求被拒。
+    #[test]
+    fn extracts_inline_system_messages() {
+        let input = vec![
+            msg("system", "你是编码助手"),
+            msg("user", "帮我看下代码"),
+            msg("assistant", "好的"),
+            msg("system", "[反射弧建议] 换个方法"),
+            msg("user", "继续"),
+        ];
+        let (system, rest) = ClaudeCompatProvider::extract_system_messages(&input);
+
+        let system = system.expect("应提取出 system 文本");
+        assert!(system.contains("你是编码助手"));
+        assert!(system.contains("[反射弧建议] 换个方法"), "中途注入的 system 也要提取");
+
+        assert_eq!(rest.len(), 3);
+        assert!(
+            rest.iter().all(|m| m.role != "system"),
+            "剔除后不应残留 system 角色：{:?}",
+            rest.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 剔除 system 必须在合并之前——否则原本被 system 条目隔开的两条同角色
+    /// 消息剔除后变成相邻，却已错过合并时机，仍是连续同角色。
+    #[test]
+    fn extract_before_merge_yields_alternating_messages() {
+        // user → system → user：剔掉 system 后两条 user 相邻，必须再合并
+        let input = vec![
+            msg("user", "第一个工具结果"),
+            msg("system", "[doom loop] 换个方法"),
+            msg("user", "第二个工具结果"),
+        ];
+
+        let (system, rest) = ClaudeCompatProvider::extract_system_messages(&input);
+        assert!(system.is_some());
+
+        let merged = ClaudeCompatProvider::merge_consecutive_roles(&rest);
+        assert_eq!(merged.len(), 1, "剔除 system 后两条 user 应合并为一条");
+        assert!(merged[0].content.contains("第一个工具结果"));
+        assert!(merged[0].content.contains("第二个工具结果"));
+
+        for pair in merged.windows(2) {
+            assert_ne!(pair[0].role, pair[1].role);
+        }
+    }
+
+    #[test]
+    fn extract_returns_none_when_no_system_messages() {
+        let input = vec![msg("user", "a"), msg("assistant", "b")];
+        let (system, rest) = ClaudeCompatProvider::extract_system_messages(&input);
+        assert!(system.is_none());
+        assert_eq!(rest.len(), 2);
+    }
+
+    /// 空白 system 条目不应产生一个只含空串的顶层 system 字段。
+    #[test]
+    fn extract_skips_blank_system_content() {
+        let input = vec![msg("system", "   "), msg("user", "a")];
+        let (system, rest) = ClaudeCompatProvider::extract_system_messages(&input);
+        assert!(system.is_none(), "纯空白的 system 条目应被忽略");
+        assert_eq!(rest.len(), 1);
+    }
 
     #[test]
     fn test_parse_text_delta() {
@@ -776,7 +1032,9 @@ mod tests {
             tool_choice: None,
             prompt_cache_key: None,
             goal_verify: false,
+            summarize: false,
             extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
         };
 
         let body = provider.build_request_body(&request);
@@ -786,6 +1044,76 @@ mod tests {
         assert_eq!(body["max_tokens"], 8192);
         // 无 system prompt 时不应该有 system 字段
         assert!(body.get("system").is_none());
+    }
+
+    /// 端到端：工作记忆中途注入的 system 条目不得残留在 messages 里，
+    /// 且必须出现在顶层 system 字段。这是 Anthropic 请求合法性的硬要求。
+    #[test]
+    fn request_body_hoists_inline_system_and_alternates() {
+        let config = ClaudeCompatConfig {
+            name: "claude".into(),
+            api_key: "sk-ant-test".into(),
+            base_url: "https://api.anthropic.com".into(),
+            models: vec!["claude-sonnet-4-20250514".into()],
+            api_version: "2023-06-01".into(),
+        };
+        let provider = ClaudeCompatProvider::new(config);
+
+        // 模拟真实工作记忆形状：CCODE.md 上下文 + 提问 + 工具调用 +
+        // 两个并行工具结果，中间被 doom loop 提示（system）隔开
+        let request = SampleRequest {
+            request_id: "req-1".into(),
+            agent_id: "agent-1".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            messages: vec![
+                msg("system", "项目上下文：这是 Rust 工程"),
+                msg("user", "帮我看下代码"),
+                msg("assistant", "[调用工具：read_file, grep]"),
+                msg("user", "文件内容"),
+                msg("system", "[doom loop] 换个方法"),
+                msg("user", "搜索结果"),
+            ],
+            tools: Vec::new(),
+            stream: true,
+            reasoning_effort: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            system_prompt: None,
+            tool_choice: None,
+            prompt_cache_key: None,
+            goal_verify: false,
+            summarize: false,
+            extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
+        };
+
+        let body = provider.build_request_body(&request);
+
+        // 两条 system 内容都应进入顶层 system 字段
+        let system = body["system"].as_str().expect("应有顶层 system 字段");
+        assert!(system.contains("项目上下文"));
+        assert!(system.contains("[doom loop]"), "中途注入的 system 也不能丢");
+
+        let msgs = body["messages"].as_array().expect("应有 messages 数组");
+
+        // messages 里不得残留 system 角色
+        for m in msgs {
+            let role = m["role"].as_str().unwrap();
+            assert_ne!(role, "system", "messages 中不应残留 system 角色");
+        }
+
+        // 必须严格交替
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        for pair in roles.windows(2) {
+            assert_ne!(pair[0], pair[1], "messages 必须严格交替，实际：{roles:?}");
+        }
+
+        // 剔除 system 后相邻的两条 user（文件内容 / 搜索结果）应已合并
+        let last = msgs.last().unwrap()["content"].as_str().unwrap();
+        assert!(last.contains("文件内容"));
+        assert!(last.contains("搜索结果"));
     }
 
     #[test]
@@ -823,7 +1151,9 @@ mod tests {
             tool_choice: Some(super::super::provider::ToolChoice::Auto),
             prompt_cache_key: None,
             goal_verify: false,
+            summarize: false,
             extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
         };
 
         let body = provider.build_request_body(&request);

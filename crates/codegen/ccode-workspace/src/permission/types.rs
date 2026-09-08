@@ -248,6 +248,10 @@ pub enum PermissionCommand {
         subagent_type: Option<String>,
         /// Subagent description if this request is from a child.
         subagent_description: Option<String>,
+        /// Model-declared side effects for fast-path permission evaluation.
+        /// When present, side_effect_eval is consulted before the full bash
+        /// analysis. None means "no declaration, use existing flow".
+        side_effects: Option<Vec<String>>,
     },
     /// Set the YOLO mode (auto-approve all permissions)
     SetYoloMode(bool),

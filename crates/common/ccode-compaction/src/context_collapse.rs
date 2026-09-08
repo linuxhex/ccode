@@ -131,12 +131,131 @@ pub fn is_degenerate(summary: &str) -> bool {
     trimmed.len() < 20 || trimmed.chars().all(|c| c == '.' || c == ' ')
 }
 
+/// 压缩质量评分（0.0~1.0）
+///
+/// 检查摘要是否保留了原始内容中的关键信息：
+/// - 文件路径（以 `/` 或 `.` 开头，含扩展名）
+/// - 错误信息（`error`、`failed`、`panic` 关键词）
+/// - 代码标识符（`fn `、`struct `、`impl `、`let `）
+/// - 用户意图（`TODO`、`FIXME`、任务描述）
+///
+/// 返回保留比例。低于 0.3 表示压缩丢失了过多关键信息。
+pub fn compaction_quality_score(original: &str, summary: &str) -> f64 {
+    let summary_lower = summary.to_lowercase();
+    let original_lower = original.to_lowercase();
+
+    let mut total_signals = 0u32;
+    let mut preserved_signals = 0u32;
+
+    // 检查文件路径模式
+    for word in original_lower.split_whitespace() {
+        if (word.starts_with("./") || word.starts_with("/"))
+            && word.contains('.')
+            && word.len() > 3
+            && word.len() < 200
+        {
+            total_signals += 1;
+            if summary_lower.contains(word) {
+                preserved_signals += 1;
+            }
+        }
+    }
+
+    // 检查错误关键词
+    let error_keywords = ["error", "failed", "panic", "unwrap", "exception"];
+    for kw in &error_keywords {
+        if original_lower.contains(kw) {
+            total_signals += 1;
+            if summary_lower.contains(kw) {
+                preserved_signals += 1;
+            }
+        }
+    }
+
+    // 检查代码标识符
+    let code_patterns = ["fn ", "struct ", "impl ", "let ", "pub ", "async "];
+    for pat in &code_patterns {
+        if original_lower.contains(pat) {
+            total_signals += 1;
+            if summary_lower.contains(pat) {
+                preserved_signals += 1;
+            }
+        }
+    }
+
+    // 检查任务标记
+    let task_markers = ["todo", "fixme", "hack", "xxx"];
+    for marker in &task_markers {
+        if original_lower.contains(marker) {
+            total_signals += 1;
+            if summary_lower.contains(marker) {
+                preserved_signals += 1;
+            }
+        }
+    }
+
+    if total_signals == 0 {
+        // 无可检测信号时，基于长度比给出中等分数
+        let len_ratio = summary.len() as f64 / original.len().max(1) as f64;
+        return if len_ratio > 0.05 && len_ratio < 0.5 { 0.7 } else { 0.5 };
+    }
+
+    preserved_signals as f64 / total_signals as f64
+}
+
 /// 摘要 prompt 模板：指示 LLM 保留决策/纠正/约束、丢弃闲聊/试错。
 pub const COLLAPSE_PROMPT: &str = "\
 Summarize the following earlier conversation turns for context continuity.
 PRESERVE: key decisions, error corrections, constraints, ruled-out approaches, project facts.
 DROP: chitchat, trial-and-error, repeated content, raw tool output.
 Be concise and factual. Output only the summary.";
+
+/// 增量摘要 prompt 模板 — 基于前次摘要 + 新增轮次生成更新摘要
+pub const INCREMENTAL_COLLAPSE_PROMPT: &str = "\
+You are given a previous conversation summary and new turns that occurred since.
+Produce an updated summary that incorporates the new information while preserving \
+all still-relevant information from the previous summary.
+
+RULES:
+- If the previous summary is marked with <conversation_summary> tags, treat it as \
+  authoritative for early history and carry its still-relevant information forward.
+- PRESERVE: key decisions, error corrections, constraints, ruled-out approaches, \
+  file paths, project facts, pending tasks.
+- DROP: information that is no longer relevant after the new turns.
+- Be concise and factual. Output only the updated summary.";
+
+/// 增量摘要 — 仅摘要新增轮次 + 前次摘要，而非重新摘要全部对话
+///
+/// 比全量摘要更 token 高效，且产生更稳定的结果（前次摘要中的信息不会丢失）。
+///
+/// # Arguments
+/// * `sampler` - LLM 摘要器
+/// * `previous_summary` - 前次压缩产生的摘要
+/// * `new_content` - 自上次压缩以来的新增内容（已格式化为文本）
+/// * `config` - 压缩配置
+///
+/// # Returns
+/// 更新后的摘要文本
+pub async fn incremental_summary<S: CollapseSampler>(
+    sampler: &S,
+    previous_summary: &str,
+    new_content: &str,
+    config: &ContextCollapseConfig,
+) -> Result<String, CollapseError> {
+    let input = format!(
+        "{}\n\n<previous_summary>\n{}\n</previous_summary>\n\n<new_turns>\n{}\n</new_turns>",
+        INCREMENTAL_COLLAPSE_PROMPT, previous_summary, new_content
+    );
+
+    let summary = sampler.summarize(&input, config.max_summary_tokens).await
+        .map_err(|e| CollapseError::Sampler(e))?;
+
+    if is_degenerate(&summary) {
+        return Err(CollapseError::Degenerate);
+    }
+
+    Ok(summary)
+}
 
 #[cfg(test)]
 mod tests {

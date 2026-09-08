@@ -31,6 +31,7 @@ pub mod sampler;
 pub mod tui;
 pub mod tool;
 pub mod state;
+pub mod session_index;
 pub mod transport;
 pub mod thinker;
 pub mod acp;

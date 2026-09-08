@@ -44,6 +44,15 @@ pub fn hook_spec_to_info(spec: &ccode_hooks::config::HookSpec) -> HookInfo {
         // Compaction
         HookEventName::PreCompact => HookEvent::PreCompact,
         HookEventName::PostCompact => HookEvent::PostCompact,
+        // Task lifecycle
+        HookEventName::TaskCreated => HookEvent::TaskCreated,
+        HookEventName::TaskCompleted => HookEvent::TaskCompleted,
+        // File/config/cwd changes
+        HookEventName::FileChanged => HookEvent::FileChanged,
+        HookEventName::ConfigChange => HookEvent::ConfigChange,
+        HookEventName::CwdChanged => HookEvent::CwdChanged,
+        // Permission
+        HookEventName::PermissionRequest => HookEvent::PermissionRequest,
     };
 
     let handler_type = if spec.url.is_some() {
@@ -303,6 +312,10 @@ mod tests {
             timeout_ms: 5000,
             source_dir: PathBuf::from("/tmp"),
             extra_env: HashMap::new(),
+            async_run: false,
+            async_rewake: false,
+            rewake_message: None,
+            condition: None,
         }
     }
 

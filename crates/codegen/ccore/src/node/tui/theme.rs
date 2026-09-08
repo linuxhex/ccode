@@ -66,6 +66,18 @@ impl Theme {
         Style::default().fg(self.primary).add_modifier(Modifier::BOLD)
     }
 
+    pub fn user_label_style(&self) -> Style {
+        Style::default()
+            .fg(self.secondary)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn assistant_label_style(&self) -> Style {
+        Style::default()
+            .fg(self.primary)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn user_text_style(&self) -> Style {
         Style::default().fg(self.secondary)
     }
@@ -132,6 +144,18 @@ impl Theme {
 
     pub fn help_style(&self) -> Style {
         Style::default().fg(self.text_muted)
+    }
+
+    pub fn primary_style_bold(&self) -> Style {
+        Style::default().fg(self.primary).add_modifier(Modifier::BOLD)
+    }
+
+    pub fn text_muted_style(&self) -> Style {
+        Style::default().fg(self.text_muted)
+    }
+
+    pub fn panel_bg(&self) -> Color {
+        Color::Rgb(0x1e, 0x1e, 0x2e)
     }
 
     pub fn markdown_style(&self) -> ccode_markdown::MarkdownStyle {

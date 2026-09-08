@@ -1,13 +1,9 @@
-//! ccode CLI 入口 - 参数解析 + 启动 kernel
+//! ccode CLI 入口 — 终端 AI 编程代理
 //!
-//! 启动模式：
-//! 1. FFI 模式：通过 libccore 动态库启动（生产发布）
-//! 2. Direct 模式：直接通过 Rust API 启动（开发调试）
-//!
-//! Direct 模式始终走分布式路径：kernel.run() → ZMQ 消息总线 → 5 Nodes
+//! 统一架构：单进程消息总线 + 多 Node（Thinker / Sampler / Tool / TUI / ...）
+//! 启动路径：kernel.run() → ZMQ 消息总线 → Node 协作
 
 use clap::Parser;
-use std::ffi::CString;
 
 /// ccode - 终端 AI 编程代理
 #[derive(Parser, Debug)]
@@ -45,10 +41,6 @@ struct Args {
     #[arg(long = "output-format", default_value = "plain")]
     output_format: String,
 
-    /// 使用 FFI 模式启动（通过动态库）
-    #[arg(long = "ffi")]
-    ffi_mode: bool,
-
     /// Router socket 地址（默认 PID 隔离，多实例互不冲突）
     #[arg(long = "router-addr")]
     router_addr: Option<String>,
@@ -60,10 +52,62 @@ struct Args {
     /// 工作目录
     #[arg(long = "work-dir")]
     work_dir: Option<String>,
+
+    /// 恢复会话：`--resume <ID>` 恢复指定会话；不带参数则列出可选会话
+    #[arg(long = "resume", num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+
+    /// 继续当前目录最近的一次会话
+    #[arg(short = 'c', long = "continue")]
+    continue_session: bool,
+
+    /// 列出已保存的会话后退出
+    #[arg(long = "list-sessions")]
+    list_sessions: bool,
+}
+
+/// 把三个会话相关 flag 归约成 `ResumeTarget`
+///
+/// 返回 `Ok(None)` = 开新会话；`Err` 里带的是给用户看的可操作错误信息
+/// （互斥组合直接报错而不是随便挑一个生效——静默挑一个会让用户以为另一个也起作用了）。
+fn resolve_resume_target(
+    resume: Option<&str>,
+    continue_session: bool,
+) -> anyhow::Result<Option<ccore::node::session_index::ResumeTarget>> {
+    use ccore::node::session_index::ResumeTarget;
+
+    match (resume, continue_session) {
+        (Some(_), true) => anyhow::bail!(
+            "`--resume` 与 `--continue` 不能同时使用。\n  \
+             继续当前目录最近一次会话用 `ccode --continue`\n  \
+             恢复指定会话用 `ccode --resume <SESSION_ID>`"
+        ),
+        // 裸 `--resume`（不带 ID）由调用方走列表分支，不该到这里
+        (Some(""), false) => Ok(None),
+        (Some(id), false) => {
+            ccore::node::session_index::validate_session_id(id)?;
+            Ok(Some(ResumeTarget::Id(id.to_string())))
+        }
+        (None, true) => Ok(Some(ResumeTarget::LastInCwd)),
+        (None, false) => Ok(None),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // 会话列表：`--list-sessions` 或裸 `--resume`（不带 ID）都只打印列表后退出，
+    // 不进日志初始化也不起 Kernel
+    let bare_resume = args.resume.as_deref() == Some("");
+    if args.list_sessions || bare_resume {
+        let root = ccore::node::session_index::sessions_root();
+        let sessions = ccore::node::session_index::list_sessions(&root);
+        print!("{}", ccore::node::session_index::render_session_list(&sessions));
+        return Ok(());
+    }
+
+    // flag 互斥校验放在日志初始化之前，错误直接打到 stderr 而不是被写进日志文件
+    let resume_target = resolve_resume_target(args.resume.as_deref(), args.continue_session)?;
 
     // 初始化日志
     let log_level = std::env::var("CCODE_LOG").unwrap_or_else(|_| "info".into());
@@ -116,63 +160,51 @@ fn main() -> anyhow::Result<()> {
     // 构建配置
     let config = load_config(&args)?;
 
-    if args.ffi_mode {
-        // FFI 模式：通过动态库启动
-        let config_json = serde_json::to_string(&config)?;
-        let c_config = CString::new(config_json)?;
-        let result = unsafe { ccore::ffi::ccore_start(c_config.as_ptr()) };
-        if result != 0 {
-            eprintln!("ccode 启动失败，错误码：{}", result);
-            std::process::exit(result);
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        // PID 隔离：多实例默认使用独立 socket，互不冲突
+        let pid = std::process::id();
+        let router_addr = args.router_addr
+            .unwrap_or_else(|| format!("ipc:///tmp/ccode-router-{pid}"));
+        let pub_addr = args.pub_addr
+            .unwrap_or_else(|| format!("ipc:///tmp/ccode-pub-{pid}"));
+
+        // Headless 模式：当使用 -p 参数时，设置环境变量让 TUI 跳过终端初始化
+        if args.prompt.is_some() {
+            std::env::set_var("CCODE_HEADLESS", "1");
         }
-    } else {
-        // Direct 模式：始终走分布式路径
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async move {
-            // PID 隔离：多实例默认使用独立 socket，互不冲突
-            let pid = std::process::id();
-            let router_addr = args.router_addr
-                .unwrap_or_else(|| format!("ipc:///tmp/ccode-router-{pid}"));
-            let pub_addr = args.pub_addr
-                .unwrap_or_else(|| format!("ipc:///tmp/ccode-pub-{pid}"));
 
-            // Headless 模式：当使用 -p 参数时，设置环境变量让 TUI 跳过终端初始化
-            if args.prompt.is_some() {
-                std::env::set_var("CCODE_HEADLESS", "1");
-            }
+        // 消息总线 + Node 架构：ZMQ 总线 → 各 Node 协作
+        let kernel_config = ccore::kernel::KernelConfig {
+            router_addr,
+            pub_addr,
+            working_dir: args.work_dir.clone().unwrap_or_else(|| ".".into()),
+            startup_prompt: args.prompt.clone(),
+            resume: resume_target,
+            ..Default::default()
+        };
+        let mut kernel = ccore::kernel::Kernel::new(kernel_config);
+        kernel.set_runtime_config(ccore::kernel::KernelRuntimeConfig::from(&config));
 
-            // 分布式模式：ZMQ → 心跳 → Node spawn → 事件循环
-            let kernel_config = ccore::kernel::KernelConfig {
-                router_addr,
-                pub_addr,
-                working_dir: args.work_dir.clone().unwrap_or_else(|| ".".into()),
-                startup_prompt: args.prompt.clone(),
-                ..Default::default()
-            };
-            let mut kernel = ccore::kernel::Kernel::new(kernel_config);
-            kernel.set_runtime_config(ccore::kernel::KernelRuntimeConfig::from(&config));
+        // 注入 HookDispatcher 桥接（让 ToolNode 的 pre/post_tool_use 生效）
+        let hook_adapter = ccore::tools::hook_adapter::HookDispatcherAdapter::new(
+            ccode_hooks::discovery::HookRegistry::default(),
+            None,
+            false,
+            uuid::Uuid::new_v4().to_string(),
+            args.work_dir.clone().unwrap_or_else(|| ".".into()),
+        );
+        kernel.set_hook_dispatcher(std::sync::Arc::new(hook_adapter));
 
-            // 注入 HookDispatcher 桥接（让 ToolNode 的 pre/post_tool_use 生效）
-            let hook_adapter = ccode_shell::agent::hook_adapter::HookDispatcherAdapter::new(
-                ccode_hooks::discovery::HookRegistry::default(),
-                None,
-                false,
-                uuid::Uuid::new_v4().to_string(),
-                args.work_dir.clone().unwrap_or_else(|| ".".into()),
-            );
-            kernel.set_hook_dispatcher(std::sync::Arc::new(hook_adapter));
+        // 扫描 Skills 目录并传递给 TUI 显示
+        let skills_count = count_skills(&args.work_dir.clone().unwrap_or_else(|| ".".into()));
+        kernel.set_skills_count(skills_count);
 
-            // 扫描 Skills 目录并传递给 TUI 显示
-            let skills_count = count_skills(&args.work_dir.clone().unwrap_or_else(|| ".".into()));
-            kernel.set_skills_count(skills_count);
+        kernel.run().await
+    })?;
 
-            kernel.run().await
-        })?;
-        // Kernel 已 shutdown，直接退出进程（避免残留 task 阻止 runtime drop）
-        std::process::exit(0);
-    }
-
-    Ok(())
+    // Kernel 已 shutdown，直接退出进程（避免残留 task 阻止 runtime drop）
+    std::process::exit(0);
 }
 
 /// 从 Claude Code 配置同步 LLM 设置
@@ -342,4 +374,71 @@ fn count_skills(work_dir: &str) -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ccore::node::session_index::ResumeTarget;
+
+    #[test]
+    fn no_flags_means_new_session() {
+        assert!(resolve_resume_target(None, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn continue_resolves_to_last_in_cwd() {
+        assert_eq!(
+            resolve_resume_target(None, true).unwrap(),
+            Some(ResumeTarget::LastInCwd)
+        );
+    }
+
+    #[test]
+    fn resume_with_id_resolves_to_that_id() {
+        assert_eq!(
+            resolve_resume_target(Some("9f2c4a11"), false).unwrap(),
+            Some(ResumeTarget::Id("9f2c4a11".into()))
+        );
+    }
+
+    #[test]
+    fn resume_and_continue_are_mutually_exclusive() {
+        let err = resolve_resume_target(Some("abc"), true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("不能同时使用"));
+        // 报错要顺手给出两条正确用法，而不是只说「错了」
+        assert!(msg.contains("--continue"));
+        assert!(msg.contains("--resume <SESSION_ID>"));
+    }
+
+    #[test]
+    fn resume_rejects_path_traversal_id() {
+        assert!(resolve_resume_target(Some("../../etc/passwd"), false).is_err());
+    }
+
+    #[test]
+    fn bare_resume_defers_to_list_branch() {
+        // 裸 `--resume` 由 main 走列表分支，这里只需保证它不被当成会话 ID
+        assert!(resolve_resume_target(Some(""), false).unwrap().is_none());
+    }
+
+    #[test]
+    fn args_parse_resume_variants() {
+        use clap::Parser;
+
+        let bare = Args::try_parse_from(["ccode", "--resume"]).unwrap();
+        assert_eq!(bare.resume.as_deref(), Some(""));
+
+        let with_id = Args::try_parse_from(["ccode", "--resume", "abc123"]).unwrap();
+        assert_eq!(with_id.resume.as_deref(), Some("abc123"));
+
+        let cont = Args::try_parse_from(["ccode", "-c"]).unwrap();
+        assert!(cont.continue_session);
+
+        let none = Args::try_parse_from(["ccode"]).unwrap();
+        assert!(none.resume.is_none());
+        assert!(!none.continue_session);
+        assert!(!none.list_sessions);
+    }
 }

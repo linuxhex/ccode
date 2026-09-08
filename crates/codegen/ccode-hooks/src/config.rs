@@ -73,6 +73,17 @@ pub struct RawHandler {
     /// (see its rustdoc for precedence and reserved-key stripping).
     #[serde(default, deserialize_with = "deserialize_optional_string_map")]
     pub env: HashMap<String, String>,
+    /// Run the hook in the background (non-blocking).
+    #[serde(default)]
+    pub async_run: bool,
+    /// When true and `async_run` is true, wake the model on exit code 2.
+    #[serde(default)]
+    pub async_rewake: bool,
+    /// Message shown to the model when an asyncRewake hook fires.
+    pub rewake_message: Option<String>,
+    /// Permission-rule-style condition filter (e.g. `"Bash(git *)"`)
+    /// that must match before the hook runs.
+    pub condition: Option<String>,
 }
 
 /// Accepts `null`, an absent field, or a string map. Serde otherwise rejects an
@@ -176,6 +187,14 @@ pub struct HookSpec {
     /// Besides being passed to the child, this map is consulted by the load-time
     /// expansion of `command` and `url` (see [`crate::env_expand`]).
     pub extra_env: std::collections::HashMap<String, String>,
+    /// Run the hook in the background (non-blocking).
+    pub async_run: bool,
+    /// When true and `async_run` is true, wake the model on exit code 2.
+    pub async_rewake: bool,
+    /// Message shown to the model when an asyncRewake hook fires.
+    pub rewake_message: Option<String>,
+    /// Permission-rule-style condition filter (e.g. `"Bash(git *)"`).
+    pub condition: Option<String>,
 }
 
 /// Parse hooks from a JSON value (e.g. from agent definition frontmatter).
@@ -362,6 +381,10 @@ pub fn parse_hook_file(content: &str, file_path: &Path) -> (Vec<HookSpec>, Vec<H
                     timeout_ms,
                     source_dir: source_dir.clone(),
                     extra_env,
+                    async_run: handler.async_run,
+                    async_rewake: handler.async_rewake,
+                    rewake_message: handler.rewake_message,
+                    condition: handler.condition,
                 });
             }
         }
@@ -750,11 +773,17 @@ mod tests {
         }"#;
         let (specs, errors) = parse_hook_file(json, Path::new("/tmp/settings.json"));
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-        assert_eq!(specs.len(), 2);
+        assert_eq!(specs.len(), 5);
         let has_pre = specs.iter().any(|s| s.event == HookEventName::PreToolUse);
         let has_post = specs.iter().any(|s| s.event == HookEventName::PostToolUse);
+        let has_perm = specs.iter().any(|s| s.event == HookEventName::PermissionRequest);
+        let has_task = specs.iter().any(|s| s.event == HookEventName::TaskCreated);
+        let has_file = specs.iter().any(|s| s.event == HookEventName::FileChanged);
         assert!(has_pre, "expected PreToolUse hook");
         assert!(has_post, "expected PostToolUse hook");
+        assert!(has_perm, "expected PermissionRequest hook");
+        assert!(has_task, "expected TaskCreated hook");
+        assert!(has_file, "expected FileChanged hook");
     }
 
     /// A `command` referencing a process-env var must be expanded at load time,

@@ -90,6 +90,11 @@ pub struct KernelConfig {
     pub mcp_transport: McpTransportKind,
     /// 启动时自动发送的 prompt（None = 交互模式，Some = headless 模式）
     pub startup_prompt: Option<String>,
+    /// 恢复哪一个会话（None = 开新会话）
+    ///
+    /// 由 `ccode --resume <ID>` / `--continue` 填入，在 `spawn_initial_set` 里
+    /// 解析成具体 session id 并同时回灌 State Node 与 Thinker Node。
+    pub resume: Option<crate::node::session_index::ResumeTarget>,
 }
 
 impl Default for KernelConfig {
@@ -107,6 +112,7 @@ impl Default for KernelConfig {
             mcp_server_enabled: false,
             mcp_transport: McpTransportKind::Stdio,
             startup_prompt: None,
+            resume: None,
         }
     }
 }
@@ -207,6 +213,30 @@ pub struct Kernel {
 }
 
 impl Kernel {
+    /// 解析反射规则 action 中的 `{agent_id}` 占位符
+    ///
+    /// 反射规则表是静态的，但 motor topic 是 per-agent 的
+    /// （ThinkerNode 订阅 `motor/{自身id}/adjust`）。规则里写
+    /// `motor/{agent_id}/adjust`，发布前用信号 payload 里的 agent_id 替换。
+    ///
+    /// broker 的匹配是单向的（订阅方 pattern 可含 `*`，发布的 topic 必须具体），
+    /// 所以不能直接把 `motor/*/adjust` 当发布 topic 用。
+    ///
+    /// 无占位符的 action（如 `kernel/log`）原样返回；有占位符但拿不到
+    /// agent_id 时返回 None，调用方应跳过发布而非发出一个匹配不到的 topic。
+    fn resolve_action_topic(action: &str, signal_payload: &str) -> Option<String> {
+        if !action.contains("{agent_id}") {
+            return Some(action.to_string());
+        }
+        let agent_id = serde_json::from_str::<serde_json::Value>(signal_payload)
+            .ok()
+            .and_then(|v| v["agent_id"].as_str().map(str::to_string))?;
+        if agent_id.is_empty() {
+            return None;
+        }
+        Some(action.replace("{agent_id}", &agent_id))
+    }
+
     pub fn new(config: KernelConfig) -> Self {
         // 安装全局 panic 钩子，捕获 panic 并记录日志而非直接崩溃
         panic_hook::install_panic_hook();
@@ -1394,8 +1424,18 @@ impl Kernel {
                                         action = %action,
                                         "反射弧 L0：感官信号 → 直接运动指令"
                                     );
+                                    let Some(motor_topic) =
+                                        Self::resolve_action_topic(&action, &payload_str)
+                                    else {
+                                        tracing::warn!(
+                                            target: "ccore::reflex",
+                                            action = %action,
+                                            "无法解析 action 中的 {{agent_id}}，跳过 motor 发布"
+                                        );
+                                        return Ok(());
+                                    };
                                     if let Ok(motor_msg) = FrameCodec::new_message(
-                                        Topic::new(&action),
+                                        Topic::new(&motor_topic),
                                         "kernel",
                                         &params,
                                     ) {
@@ -1419,8 +1459,11 @@ impl Kernel {
                                     action = %action,
                                     "反射弧 L1_formal：感官信号 → 本能运动指令 + 通知 ThinkerNode"
                                 );
+                                let motor_topic =
+                                    Self::resolve_action_topic(&action, &payload_str);
+                                if let Some(ref motor_topic) = motor_topic {
                                 if let Ok(motor_msg) = FrameCodec::new_message(
-                                    Topic::new(&action),
+                                    Topic::new(motor_topic),
                                     "kernel",
                                     &params,
                                 ) {
@@ -1434,6 +1477,13 @@ impl Kernel {
                                             transport.send_to(Bytes::from(identity), frames.clone()).await?;
                                         }
                                     }
+                                }
+                                } else {
+                                    tracing::warn!(
+                                        target: "ccore::reflex",
+                                        action = %action,
+                                        "L1_formal：无法解析 {{agent_id}}，跳过 motor 发布（仍通知 ThinkerNode）"
+                                    );
                                 }
                                 // 通知 ThinkerNode：发送 sensory/summary 到 cortex/{agent_id}/sensory
                                 let summary_msg = FrameCodec::new_message(
@@ -1455,8 +1505,11 @@ impl Kernel {
                                     action = %action,
                                     "反射弧 L1_trial：感官信号 → 试验运动指令（需 ThinkerNode 确认）"
                                 );
+                                if let Some(motor_topic) =
+                                    Self::resolve_action_topic(&action, &payload_str)
+                                {
                                 if let Ok(motor_msg) = FrameCodec::new_message(
-                                    Topic::new(&action),
+                                    Topic::new(&motor_topic),
                                     "kernel",
                                     &params,
                                 ) {
@@ -1470,6 +1523,13 @@ impl Kernel {
                                             transport.send_to(Bytes::from(identity), frames.clone()).await?;
                                         }
                                     }
+                                }
+                                } else {
+                                    tracing::warn!(
+                                        target: "ccore::reflex",
+                                        action = %action,
+                                        "L1_trial：无法解析 {{agent_id}}，跳过 motor 发布（仍通知 ThinkerNode）"
+                                    );
                                 }
                                 // 通知 ThinkerNode：发送 sensory/summary（标记需确认）
                                 let summary_msg = FrameCodec::new_message(
@@ -1604,6 +1664,50 @@ impl Kernel {
                     "ERL 注入 {} 条历史启发式到工作记忆",
                     heuristics.len()
                 );
+            }
+
+            // sys/goal_start — 外部指令：启动目标驱动循环
+            //
+            // 外部触发入口（IDE 插件 / CLI / 其他 Node）：Kernel 校验后转发为
+            // cortex/goal_start 广播给 ThinkerNode。ThinkerNode 侧消费逻辑早已就绪，
+            // 此前缺的正是本发布方，导致 cortex/goal_start 成为孤儿订阅。
+            "sys/goal_start" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&incoming.message)?;
+                let description = payload["description"].as_str().unwrap_or("").trim().to_string();
+                if description.is_empty() {
+                    tracing::warn!(
+                        target: "ccore::goal",
+                        "sys/goal_start 缺少非空 description，忽略"
+                    );
+                    return Ok(());
+                }
+
+                tracing::info!(
+                    target: "ccore::goal",
+                    description = %description.chars().take(80).collect::<String>(),
+                    "Kernel 转发外部目标启动指令"
+                );
+
+                let goal_msg = FrameCodec::new_message(
+                    Topic::cortex_goal_start(),
+                    "kernel",
+                    &serde_json::json!({ "description": description }),
+                )?;
+                let targets = self.broker.find_targets(&goal_msg);
+                if targets.is_empty() {
+                    tracing::warn!(
+                        target: "ccore::goal",
+                        "无 Node 订阅 cortex/goal_start，目标启动指令未投递"
+                    );
+                } else {
+                    let frames: Vec<Bytes> = FrameCodec::encode(&goal_msg)?
+                        .into_iter()
+                        .map(Bytes::from)
+                        .collect();
+                    for (identity, _node_id) in targets {
+                        transport.send_to(Bytes::from(identity), frames.clone()).await?;
+                    }
+                }
             }
 
             // cortex/goal_verify — GoalLoop 子任务验证请求（来自 ThinkerNode）
@@ -2067,5 +2171,73 @@ fn parse_node_type(s: &str) -> NodeType {
         "acp" => NodeType::Acp,
         "thinker" => NodeType::Thinker,
         _ => NodeType::Plugin,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// motor topic 的 `{agent_id}` 必须用信号 payload 里的真实 id 替换——
+    /// ThinkerNode 订阅 `motor/{自身id}/adjust`，而 broker 的匹配是单向的
+    /// （订阅方 pattern 可含 `*`，发布的 topic 必须具体），发出带占位符的
+    /// topic 会匹配不到任何订阅者。
+    #[test]
+    fn resolve_action_topic_substitutes_agent_id() {
+        let resolved = Kernel::resolve_action_topic(
+            "motor/{agent_id}/adjust",
+            r#"{"tool_name":"bash","success":false,"agent_id":"agent-42"}"#,
+        );
+        assert_eq!(resolved.as_deref(), Some("motor/agent-42/adjust"));
+    }
+
+    /// 无占位符的 action（如 kernel/log）原样返回。
+    #[test]
+    fn resolve_action_topic_passes_through_plain_action() {
+        let resolved = Kernel::resolve_action_topic("kernel/log", r#"{"agent_id":"a1"}"#);
+        assert_eq!(resolved.as_deref(), Some("kernel/log"));
+        // 即使 payload 无 agent_id 也不受影响
+        let resolved = Kernel::resolve_action_topic("kernel/log", "{}");
+        assert_eq!(resolved.as_deref(), Some("kernel/log"));
+    }
+
+    /// 有占位符但拿不到 agent_id 时返回 None——调用方须跳过发布，
+    /// 而不是发出一个匹配不到订阅者的 topic。
+    #[test]
+    fn resolve_action_topic_returns_none_without_agent_id() {
+        assert!(
+            Kernel::resolve_action_topic("motor/{agent_id}/adjust", r#"{"tool_name":"bash"}"#)
+                .is_none(),
+            "payload 缺 agent_id 应返回 None"
+        );
+        assert!(
+            Kernel::resolve_action_topic("motor/{agent_id}/adjust", r#"{"agent_id":""}"#).is_none(),
+            "agent_id 为空串应返回 None"
+        );
+        assert!(
+            Kernel::resolve_action_topic("motor/{agent_id}/adjust", "not-json").is_none(),
+            "payload 非法 JSON 应返回 None"
+        );
+    }
+
+    /// 替换后的 topic 必须能被 ThinkerNode 的通配订阅命中，回路才算通。
+    #[test]
+    fn resolved_motor_topic_matches_thinker_subscription() {
+        let resolved = Kernel::resolve_action_topic(
+            "motor/{agent_id}/adjust",
+            r#"{"agent_id":"agent-42"}"#,
+        )
+        .expect("应解析成功");
+
+        // ThinkerNode 的订阅声明形如 motor/{自身id}/adjust，
+        // broker 侧以 topic_matches(pattern, topic) 判定
+        assert!(
+            crate::message::topic::topic_matches("motor/*/adjust", &resolved),
+            "解析后的 topic {resolved} 应被 motor/*/adjust 命中"
+        );
+        assert!(
+            crate::message::topic::topic_matches("motor/agent-42/adjust", &resolved),
+            "解析后的 topic 应与具体 agent 的订阅完全匹配"
+        );
     }
 }

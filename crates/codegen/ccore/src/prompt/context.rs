@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use crate::memory::working::WorkingMemory;
-use crate::prompt::agents_md::AgentConfigFile;
 use crate::prompt::skills::SkillInfo;
 use crate::prompt::personas::PersonaInfo;
 use crate::tools::prompts;
@@ -30,10 +29,13 @@ pub struct TemplateRenderer {
 
 impl TemplateRenderer {
     pub fn new() -> Self {
+        // kind（语义类别）→ 实际工具名（以 bridge.rs 声明为准）。
+        // 模板里 ${{ tools.by_kind.read }} 的意义就是解耦「语义类别」与「实际名」，
+        // 映射到旧名会让渲染结果指向不存在的工具，LLM 被指引用错名字。
         let mut tool_names = HashMap::new();
-        tool_names.insert("read".into(), "read".into());
-        tool_names.insert("write".into(), "write".into());
-        tool_names.insert("edit".into(), "edit".into());
+        tool_names.insert("read".into(), "read_file".into());
+        tool_names.insert("write".into(), "write_file".into());
+        tool_names.insert("edit".into(), "search_replace".into());
         tool_names.insert("bash".into(), "bash".into());
         tool_names.insert("grep".into(), "grep".into());
         tool_names.insert("glob".into(), "glob".into());
@@ -367,8 +369,12 @@ pub struct PromptContext {
     pub tools_section: Option<String>,
     /// Memory system enabled flag
     pub memory_enabled: bool,
-    /// Discovered AGENTS.md files
-    pub agents_md_files: Vec<AgentConfigFile>,
+    /// 已格式化的项目规范段（CCODE.md / CLAUDE.md / AGENTS.md）
+    ///
+    /// 由 [`crate::tools::project_context`] 统一发现与格式化 —— 那是主线
+    /// (`ThinkerNode::load_project_context`) 用的同一份实现。此处此前有一份
+    /// 独立的 `prompt::agents_md` 副本，两套发现规则不一致，已删除。
+    pub project_docs_section: Option<String>,
     /// Discovered skills from .skill/ directory
     pub skills: Vec<SkillInfo>,
     /// Active personas for system prompt injection
@@ -395,7 +401,7 @@ impl Clone for PromptContext {
             custom_instructions: self.custom_instructions.clone(),
             tools_section: self.tools_section.clone(),
             memory_enabled: self.memory_enabled,
-            agents_md_files: self.agents_md_files.clone(),
+            project_docs_section: self.project_docs_section.clone(),
             skills: self.skills.clone(),
             active_personas: self.active_personas.clone(),
             renderer: None, // Renderer 不参与 Clone，设为 None
@@ -418,7 +424,7 @@ impl Default for PromptContext {
             custom_instructions: None,
             tools_section: None,
             memory_enabled: false,
-            agents_md_files: Vec::new(),
+            project_docs_section: None,
             skills: Vec::new(),
             active_personas: Vec::new(),
             renderer: None,
@@ -463,12 +469,12 @@ impl PromptContext {
         prompt.push_str(&self.render_user_info());
 
         // 3. AGENTS.md section (after user_info)
-        if let Some(agents_md) = crate::prompt::agents_md::format_agents_md_section(&self.agents_md_files) {
+        if let Some(project_docs) = self.project_docs_section.as_deref() {
             prompt.push_str("\n\n");
-            prompt.push_str(&agents_md);
+            prompt.push_str(project_docs);
         }
 
-        // 4. Skills section (after agents_md)
+        // 4. Skills section (after project docs)
         if let Some(skills_section) = crate::prompt::skills::format_skills_section(&self.skills) {
             prompt.push_str("\n\n");
             prompt.push_str(&skills_section);

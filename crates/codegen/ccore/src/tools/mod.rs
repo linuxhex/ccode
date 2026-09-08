@@ -23,6 +23,7 @@ pub mod path_validator;
 pub mod permission;
 pub mod project_context;
 pub mod prompts;
+pub mod file_history;
 pub mod read_tracker;
 pub mod rustfmt_hook;
 pub mod sandbox;

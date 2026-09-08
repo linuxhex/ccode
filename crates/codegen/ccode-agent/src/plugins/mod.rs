@@ -16,6 +16,7 @@ pub mod git_install;
 pub mod hooks_adapter;
 pub mod install_registry;
 pub mod local_refresh;
+pub mod local_settings;
 pub mod manifest;
 pub mod marketplace;
 pub mod registry;

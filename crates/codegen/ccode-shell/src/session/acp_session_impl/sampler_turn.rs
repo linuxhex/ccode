@@ -134,6 +134,65 @@ where
         result
     }
 }
+
+/// 判断工具错误是否为瞬态错误（可重试）
+fn is_transient_tool_error(err: &ccode_tool_runtime::ToolError) -> bool {
+    let msg = format!("{:?}", err).to_lowercase();
+    msg.contains("timeout")
+        || msg.contains("timed out")
+        || msg.contains("429")
+        || msg.contains("too many requests")
+        || msg.contains("502")
+        || msg.contains("503")
+        || msg.contains("504")
+        || msg.contains("connection reset")
+        || msg.contains("econnrefused")
+        || msg.contains("econnreset")
+}
+
+/// 工具调用瞬态错误重试（指数退避，借鉴 ccore ToolRetryConfig）
+///
+/// 最多重试 `max_retries` 次（默认 2），退避时间从 `base_delay` 开始倍增。
+/// 仅对瞬态错误（timeout, 429, 502, 503, 504, connection reset）重试。
+pub(super) async fn call_with_transient_retry<F, Fut>(
+    tool_name: &str,
+    max_retries: u32,
+    mut call: F,
+) -> Result<ccode_tools::types::output::ToolRunResult, ccode_tool_runtime::ToolError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                ccode_tools::types::output::ToolRunResult,
+                ccode_tool_runtime::ToolError,
+            >,
+        >,
+{
+    let base_delay = std::time::Duration::from_secs(1);
+    for attempt in 0..=max_retries {
+        let result = call().await;
+        if result.is_ok() || attempt == max_retries {
+            return result;
+        }
+        if let Err(ref err) = result {
+            if !is_transient_tool_error(err) {
+                return result;
+            }
+            let delay = base_delay * 2u32.pow(attempt);
+            tracing::info!(
+                tool = tool_name,
+                attempt = attempt + 1,
+                max_retries,
+                delay_secs = delay.as_secs(),
+                error = ?err,
+                "transient tool error, retrying with backoff"
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
+    unreachable!()
+}
+
 impl SessionActor {
     pub(super) async fn prepare_tool_definitions_timed(&self) -> (Vec<ToolDefinition>, u64) {
         let mcp_wait_start = std::time::Instant::now();

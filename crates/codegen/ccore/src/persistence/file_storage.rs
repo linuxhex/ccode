@@ -44,7 +44,14 @@ impl FileStorage {
 impl StorageBackend for FileStorage {
     async fn save(&self, key: &str, data: &[u8]) -> Result<()> {
         let path = self.key_to_path(key);
-        let temp_path = path.with_extension("tmp");
+        // 生成唯一临时文件路径：`<base>.{pid}.tmp`
+        // 不用 with_extension("tmp")——它会替换扩展名
+        let mut tmp_name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        tmp_name.push(format!(".{}.tmp", std::process::id()));
+        let temp_path = path.with_file_name(tmp_name);
 
         // 确保父目录存在（key 可能含子目录路径）
         if let Some(parent) = temp_path.parent() {

@@ -30,9 +30,39 @@ const AUTOCOMPACT_THRESHOLD: f64 = 0.8;
 /// 系统缓冲区百分比（Claude Code: 0.1）
 const SYSTEM_BUFFER: f64 = 0.1;
 
-/// Token 估算比率（英文约4字符/token，中文约1.5字符/token）
+/// Token 估算比率
+///
+/// 英文约 4 字符/token。
+///
+/// CJK 取 1.0 而非更宽松的 1.5：实测 "检测到工具重复调用，请换一种方法。"
+/// （15 汉字 + 2 全角标点）真实约 15~17 token，CJK÷1.5 只估出 11，低估约 30%。
+/// 低估是危险方向——会让压缩触发偏晚、上下文有溢出风险，故取接近真实上界的 1.0。
 const CHARS_PER_TOKEN_EN: f64 = 4.0;
-const CHARS_PER_TOKEN_CJK: f64 = 1.5;
+const CHARS_PER_TOKEN_CJK: f64 = 1.0;
+
+/// 判定字符是否按 CJK 口径计费。
+///
+/// 覆盖范围必须齐全，否则漏掉的字符会落进 `CHARS_PER_TOKEN_EN`（÷4）分支被严重低估：
+/// 12 个片假名真实约 12~18 token，÷4 只估出 3。低估会让压缩触发偏晚、上下文溢出。
+///
+/// 上面 CJK=1.0 的校准串含 `，`(U+FF0C 全角) 与 `。`(U+3002 CJK 标点)——这两个此前不在
+/// 覆盖内、走了 ÷4 分支恰好凑出 16 落进「15~17」区间，即**覆盖漏洞被速率偶然补偿**。
+/// 补齐覆盖后该串为 17×1.0 = 17，仍在区间内，校准不受影响。
+#[inline]
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3000..=0x303F         // CJK 标点（。、〈〉《》等）
+        | 0x3040..=0x309F       // 平假名
+        | 0x30A0..=0x30FF       // 片假名
+        | 0x3400..=0x4DBF       // CJK 扩展 A
+        | 0x4E00..=0x9FFF       // CJK 统一表意文字
+        | 0xAC00..=0xD7AF       // 韩文音节
+        | 0xF900..=0xFAFF       // CJK 兼容表意文字
+        | 0xFF00..=0xFFEF       // 全角字符（，！？：等）
+        | 0x20000..=0x2A6DF     // CJK 扩展 B
+    )
+}
 
 /// Token 预算管理器
 pub struct TokenBudgetManager {
@@ -169,13 +199,10 @@ impl TokenBudgetManager {
 
     /// 粗略token估算（Claude Code: roughTokenCountEstimation）
     ///
-    /// 当精确token计数不可用时，基于字符数估算
+    /// 当精确token计数不可用时，基于字符数估算。
+    /// CJK 判定见 [`is_cjk`]——覆盖不全会让漏掉的字符按 ÷4 计费而严重低估。
     pub fn estimate_tokens(text: &str) -> usize {
-        let cjk_count = text.chars().filter(|c| {
-            ('\u{4E00}'..='\u{9FFF}').contains(c) ||  // CJK Unified
-            ('\u{3400}'..='\u{4DBF}').contains(c) ||  // CJK Extension A
-            ('\u{F900}'..='\u{FAFF}').contains(c)      // CJK Compat
-        }).count();
+        let cjk_count = text.chars().filter(|c| is_cjk(*c)).count();
 
         let total_chars = text.chars().count();
         let ascii_count = total_chars.saturating_sub(cjk_count);
@@ -274,8 +301,47 @@ mod tests {
     #[test]
     fn test_estimate_tokens_cjk() {
         let tokens = TokenBudgetManager::estimate_tokens("你好世界测试");
-        // 5 CJK chars / 1.5 = ~4 tokens
-        assert!((3..=5).contains(&tokens));
+        // 6 CJK chars / 1.0 = 6 tokens（CJK 取 1.0 以避免低估，见常量注释）
+        assert_eq!(tokens, 6);
+    }
+
+    /// CJK 覆盖范围必须齐全——漏掉的字符会落进 ÷4 分支被严重低估。
+    ///
+    /// 此前 `is_cjk` 只覆盖 CJK 统一表意/扩展A/兼容三段，导致片假名、平假名、
+    /// 韩文、全角标点、CJK 标点全部按 ÷4 计费。12 个片假名只估出 3 token
+    /// （真实约 12~18），低估 4 倍以上。低估会让压缩触发偏晚、上下文溢出。
+    #[test]
+    fn estimate_tokens_covers_all_cjk_ranges() {
+        // 每组都是「N 个该类字符」，齐全覆盖下应为 N token，走 ÷4 则约 N/4
+        let cases: [(&str, usize); 5] = [
+            ("コンピュータープログラム", 12), // 片假名
+            ("ひらがなのてすと", 8),          // 平假名
+            ("안녕하세요세계입니다", 10),      // 韩文音节
+            ("，！？：；（）", 7),             // 全角标点
+            ("。、〈〉《》", 6),               // CJK 标点
+        ];
+        for (text, char_count) in cases {
+            assert_eq!(
+                TokenBudgetManager::estimate_tokens(text),
+                char_count,
+                "「{text}」{char_count} 个字符应全部按 CJK 口径计 {char_count} token，\
+                 若得到约 {} 则说明该 Unicode 段漏出了 is_cjk 覆盖",
+                char_count.div_ceil(4)
+            );
+        }
+    }
+
+    /// CJK=1.0 的原始校准串在补齐覆盖后仍须落在「真实约 15~17 token」区间内。
+    ///
+    /// 该串含 `，`(U+FF0C) 与 `。`(U+3002)。补齐覆盖前这两个走 ÷4 得 1，
+    /// 凑出 15+1=16；补齐后为 17×1.0=17。两者都在区间内，故校准不受影响。
+    #[test]
+    fn estimate_tokens_calibration_string_still_in_range() {
+        let tokens = TokenBudgetManager::estimate_tokens("检测到工具重复调用，请换一种方法。");
+        assert!(
+            (15..=17).contains(&tokens),
+            "校准串估算 {tokens} 应落在 15~17，超出说明 CJK 速率或覆盖被改动"
+        );
     }
 
     #[test]

@@ -162,6 +162,7 @@ async fn request(handle: &PermissionHandle, access: AccessKind, id: &str) -> Dec
         session_id: None,
         subagent_type: None,
         subagent_description: None,
+        side_effects: None,
     };
     let PermissionHandle::Actor { cmd_tx, .. } = handle else {
         panic!("expected actor handle");

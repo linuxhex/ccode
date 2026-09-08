@@ -91,16 +91,15 @@ impl Scrubber {
     }
 
     fn scrub(&self, s: &str) -> String {
-        let out = ccode_secrets::redact_secrets(s);
-        let out = match self.home_dir.as_deref() {
-            Some(home) => Cow::Owned(replace_home_prefix(out.as_ref(), home)),
-            None => out,
+        let out: Cow<'_, str> = match self.home_dir.as_deref() {
+            Some(home) => Cow::Owned(replace_home_prefix(s, home)),
+            None => Cow::Borrowed(s),
         };
         redact_username_segments(out.as_ref(), &self.usernames)
     }
 
     fn scrub_value(&self, val: &mut Value) {
-        ccode_secrets::walk_json_strings(val, &mut |s| *s = self.scrub(s));
+        walk_json_strings(val, &mut |s| *s = self.scrub(s));
     }
 }
 
@@ -188,6 +187,23 @@ fn is_segment_boundary_char(c: char) -> bool {
             c,
             '"' | '\'' | '(' | '[' | '{' | ',' | ':' | ';' | '=' | '<'
         )
+}
+
+fn walk_json_strings(val: &mut Value, f: &mut dyn FnMut(&mut String)) {
+    match val {
+        Value::String(s) => f(s),
+        Value::Array(arr) => {
+            for v in arr {
+                walk_json_strings(v, f);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                walk_json_strings(v, f);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn before_send(mut event: Event<'static>, scrubber: &Scrubber) -> Option<Event<'static>> {

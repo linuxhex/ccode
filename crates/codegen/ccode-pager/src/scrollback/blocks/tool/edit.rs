@@ -175,16 +175,14 @@ pub fn render_diff_hunks_highlighted(
     render_diff_hunks_core(hunks, path, None, theme, width, config)
 }
 
-/// The single hunk walker behind both public fronts, so gutters, backgrounds,
-/// separators, and wrap behavior are identical across highlight phases by
-/// construction. Every line renders its per-hunk syntect spans (keeping the
-/// highlighter state exactly as in the hunk-only phase); when `by_new_line`
-/// is given, matching Equal/Insert lines swap in the full-file styles.
 /// Compute word-level changed ranges between old and new text.
 ///
 /// Returns `(old_changed_ranges, new_changed_ranges)` as byte offset ranges
 /// within the respective strings. Used to highlight intra-line changes in
 /// diff views (e.g., which specific words changed within a modified line).
+///
+/// The offsets are only meaningful against the exact strings passed in; callers
+/// must render their spans from those same strings (see `apply_word_highlights`).
 fn compute_word_diff_ranges(
     old: &str,
     new: &str,
@@ -233,54 +231,80 @@ fn apply_word_highlights(
         return spans;
     }
 
-    let mut result = Vec::new();
+    // Sort and merge first. Emitting per raw range duplicated any span that
+    // straddled two of them (prefix + middle + suffix pushed once per range);
+    // after merging, each span is cut at most once per disjoint region.
+    let mut merged: Vec<Range<usize>> = changed_ranges.to_vec();
+    merged.sort_by_key(|r| r.start);
+    merged.dedup_by(|next, prev| {
+        if next.start <= prev.end {
+            prev.end = prev.end.max(next.end);
+            true
+        } else {
+            false
+        }
+    });
+
+    let mut result = Vec::with_capacity(spans.len());
     let mut byte_offset = 0usize;
 
     for span in spans {
         let span_len = span.content.len();
         let span_start = byte_offset;
-        let span_end = byte_offset + span_len;
+        let span_end = span_start + span_len;
+        byte_offset = span_end;
 
-        for range in changed_ranges {
+        // Local cut points, ascending and disjoint because `merged` is.
+        let mut cuts: Vec<(usize, usize)> = Vec::new();
+        for range in &merged {
             if range.end <= span_start || range.start >= span_end {
                 continue;
             }
-            let overlap_start = range.start.max(span_start) - span_start;
-            let overlap_end = range.end.min(span_end) - span_start;
+            let local_start = range.start.max(span_start) - span_start;
+            let local_end = range.end.min(span_end) - span_start;
+            // Ranges are char-aligned in the text they were computed from, but the
+            // span stream can still drift from it. Slicing mid-char panics, so a
+            // misaligned range drops its highlight rather than killing the render.
+            if !span.content.is_char_boundary(local_start)
+                || !span.content.is_char_boundary(local_end)
+            {
+                cuts.clear();
+                break;
+            }
+            cuts.push((local_start, local_end));
+        }
 
-            if overlap_start > 0 {
+        if cuts.is_empty() {
+            result.push(span);
+            continue;
+        }
+
+        let mut cursor = 0usize;
+        for (local_start, local_end) in cuts {
+            if local_start > cursor {
                 result.push(Span {
-                    content: span.content[..overlap_start].to_string().into(),
+                    content: span.content[cursor..local_start].to_string().into(),
                     style: span.style,
                     ..Default::default()
                 });
             }
             result.push(Span {
-                content: span.content[overlap_start..overlap_end].to_string().into(),
+                content: span.content[local_start..local_end].to_string().into(),
                 style: span.style.bg(highlight_bg),
                 ..Default::default()
             });
-            if overlap_end < span_len {
-                result.push(Span {
-                    content: span.content[overlap_end..].to_string().into(),
-                    style: span.style,
-                    ..Default::default()
-                });
-            }
+            cursor = local_end;
         }
-
-        if !changed_ranges.iter().any(|r| r.start < span_end && r.end > span_start) {
-            result.push(span);
+        if cursor < span_len {
+            result.push(Span {
+                content: span.content[cursor..].to_string().into(),
+                style: span.style,
+                ..Default::default()
+            });
         }
-
-        byte_offset = span_end;
     }
 
-    if result.is_empty() {
-        spans
-    } else {
-        result
-    }
+    result
 }
 
 /// Pre-compute word-level highlights for Delete/Insert pairs in a hunk.
@@ -302,28 +326,31 @@ fn compute_hunk_word_highlights(
             let mut deletes = Vec::new();
             let mut inserts = Vec::new();
 
-            // Collect consecutive Delete lines
+            // Collect consecutive Delete lines. Tabs are expanded here because the
+            // ranges are applied to spans rendered from `expand_tabs(trimmed)`; on the
+            // raw text every tab would shift later offsets by `tab_width - 1` bytes,
+            // mislabeling words and — landing mid-char — panicking the slice.
             while i < lines.len() && lines[i].tag == ChangeTag::Delete {
-                deletes.push((i, lines[i].text.trim_end_matches(['\r', '\n'])));
+                deletes.push((i, expand_tabs(lines[i].text.trim_end_matches(['\r', '\n']))));
                 i += 1;
             }
             // Collect consecutive Insert lines
             while i < lines.len() && lines[i].tag == ChangeTag::Insert {
-                inserts.push((i, lines[i].text.trim_end_matches(['\r', '\n'])));
+                inserts.push((i, expand_tabs(lines[i].text.trim_end_matches(['\r', '\n']))));
                 i += 1;
             }
 
             // Pair up lines and compute word-level diffs
             let pair_count = deletes.len().min(inserts.len());
             for j in 0..pair_count {
-                let (del_idx, del_text) = deletes[j];
-                let (ins_idx, ins_text) = inserts[j];
+                let (del_idx, del_text) = &deletes[j];
+                let (ins_idx, ins_text) = &inserts[j];
                 let (old_ranges, new_ranges) = compute_word_diff_ranges(del_text, ins_text);
                 if !old_ranges.is_empty() {
-                    result.insert((ChangeTag::Delete, del_idx), old_ranges);
+                    result.insert((ChangeTag::Delete, *del_idx), old_ranges);
                 }
                 if !new_ranges.is_empty() {
-                    result.insert((ChangeTag::Insert, ins_idx), new_ranges);
+                    result.insert((ChangeTag::Insert, *ins_idx), new_ranges);
                 }
             }
         } else {
@@ -334,6 +361,11 @@ fn compute_hunk_word_highlights(
     result
 }
 
+/// The single hunk walker behind both public fronts, so gutters, backgrounds,
+/// separators, and wrap behavior are identical across highlight phases by
+/// construction. Every line renders its per-hunk syntect spans (keeping the
+/// highlighter state exactly as in the hunk-only phase); when `by_new_line`
+/// is given, matching Equal/Insert lines swap in the full-file styles.
 fn render_diff_hunks_core(
     hunks: &[DiffHunk],
     path: &Path,
@@ -3451,5 +3483,109 @@ class ProcessQueueItem(BaseModel):
             "expected cold-start mismatch (hunk-only string spill vs full-file); \
              if equal, the bug may already be fixed or the fixture no longer triggers"
         );
+    }
+
+    /// The word-highlight path shipped without ever being compiled, so its
+    /// invariants are pinned here rather than trusted.
+    fn words(spans: &[Span<'static>]) -> Vec<(String, bool)> {
+        spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.bg == Some(Color::Red)))
+            .collect()
+    }
+
+    #[test]
+    fn apply_word_highlights_splits_a_single_range() {
+        let spans = vec![Span::raw("let x = 1;")];
+        let out = apply_word_highlights(spans, &[4..5], Color::Red);
+        assert_eq!(
+            words(&out),
+            vec![
+                ("let ".to_string(), false),
+                ("x".to_string(), true),
+                (" = 1;".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_word_highlights_does_not_duplicate_across_ranges() {
+        // One span overlapping two ranges: the pre-merge version emitted
+        // prefix+middle+suffix once per range, so "let x = 1;" came out twice as
+        // long. Concatenation must still reproduce the input exactly.
+        let spans = vec![Span::raw("let x = 1;")];
+        let out = apply_word_highlights(spans, &[4..5, 8..9], Color::Red);
+        let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "let x = 1;", "content must be preserved, not duplicated");
+        assert_eq!(
+            words(&out),
+            vec![
+                ("let ".to_string(), false),
+                ("x".to_string(), true),
+                (" = ".to_string(), false),
+                ("1".to_string(), true),
+                (";".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_word_highlights_merges_touching_ranges() {
+        let spans = vec![Span::raw("abcdef")];
+        let out = apply_word_highlights(spans, &[1..3, 3..5], Color::Red);
+        assert_eq!(
+            words(&out),
+            vec![
+                ("a".to_string(), false),
+                ("bcde".to_string(), true),
+                ("f".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_word_highlights_survives_misaligned_range() {
+        // A range landing mid-UTF-8 (offset 1 splits '中') must drop the
+        // highlight, not panic — this crate has a history of CJK slice panics.
+        let spans = vec![Span::raw("中文")];
+        let out = apply_word_highlights(spans, &[1..4], Color::Red);
+        let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "中文");
+        assert!(
+            out.iter().all(|s| s.style.bg != Some(Color::Red)),
+            "misaligned range must not highlight anything"
+        );
+    }
+
+    #[test]
+    fn apply_word_highlights_spans_range_crossing_span_boundary() {
+        let spans = vec![Span::raw("foo"), Span::raw("bar")];
+        let out = apply_word_highlights(spans, &[2..4], Color::Red);
+        assert_eq!(
+            words(&out),
+            vec![
+                ("fo".to_string(), false),
+                ("o".to_string(), true),
+                ("b".to_string(), true),
+                ("ar".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn word_diff_ranges_are_char_aligned_on_cjk() {
+        let (old, new) = compute_word_diff_ranges("你好 世界", "你好 苍穹");
+        for r in old.iter() {
+            assert!(
+                "你好 世界".is_char_boundary(r.start) && "你好 世界".is_char_boundary(r.end),
+                "old range {r:?} must not split a char"
+            );
+        }
+        for r in new.iter() {
+            assert!(
+                "你好 苍穹".is_char_boundary(r.start) && "你好 苍穹".is_char_boundary(r.end),
+                "new range {r:?} must not split a char"
+            );
+        }
     }
 }

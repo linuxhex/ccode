@@ -10,7 +10,28 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{Local, SecondsFormat};
 use serde_json::json;
-use ccode_analytics::Mixpanel;
+
+struct Mixpanel {
+    _token: String,
+    _client: reqwest::Client,
+}
+
+impl Mixpanel {
+    fn new(token: &str) -> Self {
+        Self {
+            _token: token.to_owned(),
+            _client: reqwest::Client::new(),
+        }
+    }
+
+    async fn track(&self, _event: &str, _properties: Option<std::collections::HashMap<String, serde_json::Value>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn engage(&self, _user_id: &str, _properties: std::collections::HashMap<String, serde_json::Value>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+}
 
 use crate::config::{TelemetryConfig, TelemetryMode, deployment_id_from_key};
 use crate::http::OriginClientInfo;

@@ -203,6 +203,8 @@ async fn create_test_actor_with_memory(
         pending_skill_reminders: Mutex::new(Vec::new()),
         pending_compile_feedback: Mutex::new(None),
         current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
+        current_turn_edited_files: Mutex::new(Vec::new()),
+        speculative_tool_results: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
         idle_flush_timeout: memory_config
             .as_ref()
             .and_then(|mc| mc.flush.idle_timeout_secs)

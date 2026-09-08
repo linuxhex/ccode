@@ -255,7 +255,7 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "read",
+            "name": "read_file",
             "description": READ_PROMPT,
             "parameters": {
                 "type": "object",
@@ -269,7 +269,7 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "write",
+            "name": "write_file",
             "description": WRITE_PROMPT,
             "parameters": {
                 "type": "object",
@@ -281,14 +281,14 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "edit",
+            "name": "search_replace",
             "description": EDIT_PROMPT,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "文件的绝对路径" },
-                    "old_text": { "type": "string", "description": "要搜索的文本" },
-                    "new_text": { "type": "string", "description": "替换文本" },
+                    "search": { "type": "string", "description": "要搜索的文本" },
+                    "replace": { "type": "string", "description": "替换文本" },
                     "replace_all": { "type": "boolean", "description": "是否替换所有匹配" },
                     "mode": { "type": "string", "enum": ["replace", "insert", "write"], "description": "编辑模式" }
                 },
@@ -433,9 +433,9 @@ mod tests {
             .filter_map(|d| d["name"].as_str())
             .collect();
         assert!(names.contains(&"bash"));
-        assert!(names.contains(&"read"));
-        assert!(names.contains(&"write"));
-        assert!(names.contains(&"edit"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"search_replace"));
         assert!(names.contains(&"grep"));
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"web_search"));

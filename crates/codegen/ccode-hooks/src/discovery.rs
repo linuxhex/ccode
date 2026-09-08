@@ -86,6 +86,12 @@ impl HookRegistry {
         HookEventName::PreCompact,
         HookEventName::PostCompact,
         HookEventName::SessionEnd,
+        HookEventName::TaskCreated,
+        HookEventName::TaskCompleted,
+        HookEventName::FileChanged,
+        HookEventName::ConfigChange,
+        HookEventName::PermissionRequest,
+        HookEventName::CwdChanged,
     ];
 
     pub fn all_hooks(&self) -> Vec<&HookSpec> {
@@ -385,6 +391,12 @@ mod tests {
             HookEventName::PreCompact,
             HookEventName::PostCompact,
             HookEventName::SessionEnd,
+            HookEventName::TaskCreated,
+            HookEventName::TaskCompleted,
+            HookEventName::FileChanged,
+            HookEventName::ConfigChange,
+            HookEventName::PermissionRequest,
+            HookEventName::CwdChanged,
         ];
         for event in every_variant {
             match event {
@@ -402,7 +414,13 @@ mod tests {
                 | HookEventName::SubagentEnd
                 | HookEventName::PreCompact
                 | HookEventName::PostCompact
-                | HookEventName::SessionEnd => {}
+                | HookEventName::SessionEnd
+                | HookEventName::TaskCreated
+                | HookEventName::TaskCompleted
+                | HookEventName::FileChanged
+                | HookEventName::ConfigChange
+                | HookEventName::PermissionRequest
+                | HookEventName::CwdChanged => {}
             }
             assert!(
                 HookRegistry::ALL_EVENTS.contains(&event),
@@ -923,6 +941,10 @@ mod tests {
             timeout_ms: 5_000,
             source_dir: PathBuf::from("/tmp"),
             extra_env: Default::default(),
+            async_run: false,
+            async_rewake: false,
+            rewake_message: None,
+            condition: None,
         }
     }
 

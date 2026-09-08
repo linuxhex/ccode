@@ -527,6 +527,8 @@ impl SessionActor {
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
         let ccore_state = self.ccore_state.clone();
         let speculative_cache = self.speculative_tool_results.clone();
+        // 全局并发上限：防止大量并发 bash 命令耗尽系统资源（借鉴 ccore ToolNode Semaphore(20)）
+        let tool_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(20));
         let dispatch_futures: Vec<_> = approved
             .iter()
             .enumerate()
@@ -540,11 +542,13 @@ impl SessionActor {
                 let pending_interjections = pending_interjections.clone();
                 let blocking_wait_depth = self.tool_context.blocking_wait_depth.clone();
                 let speculative_cache = speculative_cache.clone();
+                let tool_semaphore = tool_semaphore.clone();
                 let interruptible =
                     is_interruptible_wait_tool(&prepared.tool_name, &prepared.parsed_args);
                 let lock = lock_path_for_args(&prepared.parsed_args)
                     .and_then(|fp| file_locks.get(fp).cloned());
                 async move {
+                    let _permit = tool_semaphore.acquire().await.expect("semaphore closed");
                     let exec_start = std::time::Instant::now();
                     let cached = if prepared.is_read_only {
                         speculative_cache.lock().remove(prepared.tool_call_id.0.as_ref())
@@ -1398,6 +1402,10 @@ impl SessionActor {
                         .map(|cwd| std::path::PathBuf::from(cwd.as_str())),
                 }
             });
+            let side_effects = match &tool_input {
+                ccode_tools::types::ToolInput::Bash(bash) => bash.side_effects.clone(),
+                _ => None,
+            };
             let decision = {
                 let _pending_guard =
                     crate::session::pending_interaction::PendingInteractionGuard::new(
@@ -1412,6 +1420,7 @@ impl SessionActor {
                         access_kind.clone(),
                         tool_call_update,
                         edit_path_context,
+                        side_effects,
                         Some(self.session_info.id.0.to_string()),
                         None,
                         None,
