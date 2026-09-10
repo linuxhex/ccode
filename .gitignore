@@ -7,3 +7,13 @@
 
 # 本地计划文件：开发者个人草稿，不入库
 /.claude/plans/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+*.so

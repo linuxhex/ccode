@@ -12,7 +12,8 @@
 | `ccore/src/sampler/claude_compat.rs` | cache_control 序列化 + 工具排序 + tools 缓存断点 |
 | `ccore/src/sampler/openai_compat.rs` | cache_control 序列化 + 工具排序 |
 | `ccore-advanced/src/agent/meta_cognitive.rs` | DifficultyLevel 新增 to_reasoning_effort() 映射方法 |
-| `ccore/src/prompt/agents_md.rs` | AGENTS.md 大小限制（8KB 预算，超出截断） |
+| `ccore/src/tools/project_context.rs` | 项目规范（CCODE.md / CLAUDE.md / AGENTS.md）发现与注入，总量 32KB 预算 + 超出截断并附提示 |
+| `ccore/src/prompt/agents_md.rs` | 删除：零调用者的重复实现，发现规则与 `tools::project_context` 不一致 |
 | `ccode-cli/src/main.rs` | API 启动预热（异步 HEAD 请求预热 TCP/TLS 连接） |
 | `ccode-shell/src/session/acp_session.rs` | 新增 current_turn_edited_files 字段跟踪编辑文件 |
 | `ccode-shell/src/session/acp_session_impl/turn.rs` | 多语言编译反馈：跟踪编辑文件路径，按项目类型调度检查器 |
@@ -35,7 +36,7 @@
 ### P0 改进（竞品差距补全）
 
 5. **推理力度分级**（对标 DeepSeek Harness off/high/max）：将 MetaCognitiveController 的难度评估映射到 reasoning_effort（Trivial→off, Moderate→0.5, Complex→0.8, Extreme→1.0），简单任务省 50%+ 推理 token
-6. **AGENTS.md 大小限制**（对标 Codex 渐进加载）：总内容超 8KB 时截断，提示模型用 read_file 查看完整内容，防止大型 AGENTS.md 撑爆系统提示
+6. **项目规范大小限制**（对标 Codex 渐进加载）：`tools::project_context` 统一发现 CCODE.md / CLAUDE.md / AGENTS.md，总内容超 32KB（对齐 codex `project_doc_max_bytes` 默认值）时截断，附「可用 read_file 读取完整文件」提示，防止大型规范文件撑爆系统提示。同时删除 `prompt::agents_md` 这份零调用者的重复实现——它与 `tools::project_context` 的发现规则不一致，主线（`ThinkerNode::load_project_context`）走的是后者
 
 ### 功能性改进（快、好用、准确）
 

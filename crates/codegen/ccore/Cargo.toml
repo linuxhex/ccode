@@ -10,8 +10,12 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 dashboard = []
+python = ["pyo3"]
 
 [dependencies]
+# Python FFI
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+
 dunce = { workspace = true }
 
 # 异步运行时

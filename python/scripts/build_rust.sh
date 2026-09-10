@@ -1,0 +1,19 @@
+#!/bin/bash
+# Build the Rust Python extension using maturin
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+CRATE_DIR="$PROJECT_ROOT/crates/codegen/ccore-python"
+
+echo "Building ccore_engine Python extension..."
+echo "Crate directory: $CRATE_DIR"
+
+cd "$CRATE_DIR"
+
+# Build with maturin
+maturin develop --release
+
+echo "Build complete!"
+echo "You can now import ccore_engine in Python"

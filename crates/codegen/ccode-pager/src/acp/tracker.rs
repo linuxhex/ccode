@@ -4808,14 +4808,11 @@ mod tests {
             &meta(),
             &mut sb,
         );
-        assert_eq!(
+        assert!(matches!(
             tracker.activity(),
-            Some(TurnActivity::ToolRunning {
-                title: "cargo test".into(),
-                description: None,
-                ..
-            })
-        );
+            Some(TurnActivity::ToolRunning { ref title, description: None, .. })
+            if title == "cargo test"
+        ));
     }
     /// Foreground execute tools often carry a human `description` in raw_input
     /// (e.g. sleep with "Wait 5 seconds…"). Surface it for the spinner.
@@ -4841,14 +4838,11 @@ mod tests {
             &meta(),
             &mut sb,
         );
-        assert_eq!(
+        assert!(matches!(
             tracker.activity(),
-            Some(TurnActivity::ToolRunning {
-                title: "sleep 5 && echo done".into(),
-                description: Some("Wait 5 seconds then print done".into()),
-                ..
-            })
-        );
+            Some(TurnActivity::ToolRunning { ref title, description: Some(ref d), .. })
+            if title == "sleep 5 && echo done" && d == "Wait 5 seconds then print done"
+        ));
     }
     /// The initial ToolCall registers with kind=Other and title=tool_id
     /// (e.g. "Shell"). When raw_input carries a `command` field, activity()
@@ -4868,14 +4862,11 @@ mod tests {
                 .locations(vec![]),
         );
         tracker.handle_update(tc, &meta(), &mut sb);
-        assert_eq!(
+        assert!(matches!(
             tracker.activity(),
-            Some(TurnActivity::ToolRunning {
-                title: "gt stack submit --no-edit".into(),
-                description: None,
-                ..
-            }),
-        );
+            Some(TurnActivity::ToolRunning { ref title, description: None, .. })
+            if title == "gt stack submit --no-edit"
+        ));
     }
     #[test]
     fn activity_strips_redundant_session_cd_prefix() {
@@ -4896,14 +4887,11 @@ mod tests {
             .locations(vec![]),
         );
         tracker.handle_update(tc, &meta(), &mut sb);
-        assert_eq!(
+        assert!(matches!(
             tracker.activity(),
-            Some(TurnActivity::ToolRunning {
-                title: "echo hi".into(),
-                description: None,
-                ..
-            }),
-        );
+            Some(TurnActivity::ToolRunning { ref title, description: None, .. })
+            if title == "echo hi"
+        ));
     }
     #[test]
     fn activity_strips_windows_shaped_session_cd_on_unix_host() {
@@ -4924,14 +4912,11 @@ mod tests {
             .locations(vec![]),
         );
         tracker.handle_update(tc, &meta(), &mut sb);
-        assert_eq!(
+        assert!(matches!(
             tracker.activity(),
-            Some(TurnActivity::ToolRunning {
-                title: "cargo test".into(),
-                description: None,
-                ..
-            }),
-        );
+            Some(TurnActivity::ToolRunning { ref title, description: None, .. })
+            if title == "cargo test"
+        ));
     }
     #[test]
     fn execute_block_keeps_full_command_sets_header_display_when_peeled() {
