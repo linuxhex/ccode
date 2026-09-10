@@ -14,6 +14,7 @@ resolver = "2"
 members = [
     "crates/codegen/ccore",
     "crates/codegen/ccore-advanced",
+    "crates/codegen/ccore-python",
     "crates/codegen/ccode-cli",
     "crates/codegen/ccode-auth",
     "crates/codegen/ccode-config",
