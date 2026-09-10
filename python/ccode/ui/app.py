@@ -16,9 +16,14 @@ from ccode.mode import ModeManager, RuntimeMode
 class OutputPanel(Static):
     """Panel for displaying assistant output."""
 
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._buffer: str = ""
+
     def append_text(self, text: str) -> None:
         """Append text to the output."""
-        self.update(self.renderable + text)
+        self._buffer += text
+        self.update(self._buffer)
 
 
 class ToolProgress(Static):
@@ -139,4 +144,5 @@ class CCODEApp(App):
     def action_clear(self) -> None:
         """Clear the output panel."""
         output = self.query_one("#output-panel", OutputPanel)
+        output._buffer = ""
         output.update("")
