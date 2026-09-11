@@ -1,5 +1,7 @@
 """CLI entry point for CCODE Agent."""
 
+from typing import Optional
+
 import click
 
 from ccode.ui.app import CCODEApp
@@ -9,23 +11,16 @@ from ccode.mode import RuntimeMode, ModeManager
 @click.command()
 @click.option("--project", "-p", default=".", help="Project directory")
 @click.option("--model", "-m", default="claude-sonnet-4-20250514", help="Model to use")
-@click.option("--mode", type=click.Choice(["python", "rust"]), default="python",
-              help="Runtime mode: python (new) or rust (legacy)")
+@click.option("--kernel", "-k", default=None,
+              help="Rust kernel ZMQ address (e.g. tcp://127.0.0.1:5555)")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
-def main(project: str, model: str, mode: str, verbose: bool) -> None:
+def main(project: str, model: str, kernel: Optional[str], verbose: bool) -> None:
     """CCODE Agent - AI coding assistant."""
-    mode_manager = ModeManager(ModeManager.from_string(mode))
-
-    if mode_manager.is_rust_mode():
-        click.echo("Rust mode: launching legacy ccore binary...")
-        click.echo("(Not yet implemented - use Python mode)")
-        return
-
     app = CCODEApp(
         project_dir=project,
         model=model,
         verbose=verbose,
-        mode_manager=mode_manager,
+        kernel_addr=kernel,
     )
     app.run()
 

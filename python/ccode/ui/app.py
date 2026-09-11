@@ -11,6 +11,7 @@ from textual.reactive import reactive
 from ccode.reasoning import ReasoningEngine
 from ccode.tools import ToolExecutor
 from ccode.mode import ModeManager, RuntimeMode
+from ccode.kernel import KernelClient
 
 
 class OutputPanel(Static):
@@ -86,14 +87,17 @@ class CCODEApp(App):
         model: str = "claude-sonnet-4-20250514",
         verbose: bool = False,
         mode_manager: Optional[ModeManager] = None,
+        kernel_addr: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.project_dir = Path(project_dir).resolve()
         self.model = model
         self.verbose = verbose
         self.mode_manager = mode_manager or ModeManager()
+        self.kernel_addr = kernel_addr
         self.reasoning: ReasoningEngine | None = None
         self.tools: ToolExecutor | None = None
+        self.kernel: KernelClient | None = None
 
     def compose(self) -> ComposeResult:
         """Compose the UI layout."""
@@ -108,10 +112,22 @@ class CCODEApp(App):
     async def on_mount(self) -> None:
         """Initialize the app after mount."""
         self.reasoning = ReasoningEngine(model=self.model)
-        self.tools = ToolExecutor()
+
+        kernel_client = None
+        if self.kernel_addr:
+            try:
+                kernel_client = KernelClient(kernel_addr=self.kernel_addr)
+                await kernel_client.connect()
+                self.kernel = kernel_client
+            except Exception:
+                kernel_client = None
+
+        self.tools = ToolExecutor(use_ffi=True, kernel_client=kernel_client)
 
         output = self.query_one("#output-panel", OutputPanel)
-        output.update(f"[dim]CCODE Agent ready. Project: {self.project_dir}[/dim]")
+        backend = self.tools.backend
+        status = f"[dim]CCODE Agent ready. Project: {self.project_dir} | Backend: {backend}[/dim]"
+        output.update(status)
 
         input_widget = self.query_one("#user-input", Input)
         input_widget.focus()
@@ -146,3 +162,8 @@ class CCODEApp(App):
         output = self.query_one("#output-panel", OutputPanel)
         output._buffer = ""
         output.update("")
+
+    async def on_shutdown(self) -> None:
+        """Clean up on app shutdown."""
+        if self.kernel:
+            await self.kernel.disconnect()

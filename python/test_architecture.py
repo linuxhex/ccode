@@ -13,6 +13,7 @@ async def test_tool_executor() -> None:
     print("Testing ToolExecutor...")
 
     executor = ToolExecutor(use_ffi=False)  # Use Python fallback
+    test_dir = Path(__file__).resolve().parent
 
     # Test shell command
     print("\n1. Testing shell command:")
@@ -21,7 +22,7 @@ async def test_tool_executor() -> None:
 
     # Test read file
     print("\n2. Testing read_file:")
-    result = await executor.execute("read_file", {"path": "pyproject.toml"})
+    result = await executor.execute("read_file", {"path": str(test_dir / "pyproject.toml")})
     if "error" not in result:
         print(f"   Read {result.get('size', 0)} bytes")
     else:
@@ -29,7 +30,7 @@ async def test_tool_executor() -> None:
 
     # Test list directory
     print("\n3. Testing list_dir:")
-    result = await executor.execute("list_dir", {"path": "."})
+    result = await executor.execute("list_dir", {"path": str(test_dir)})
     if "entries" in result:
         print(f"   Found {len(result['entries'])} entries")
         for entry in result["entries"][:5]:

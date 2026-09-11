@@ -1,4 +1,4 @@
-"""Tool execution client - Calls Rust FFI or kernel."""
+"""Tool execution client - Calls Rust kernel, FFI, or Python fallback."""
 
 import subprocess
 from pathlib import Path
@@ -6,10 +6,18 @@ from typing import Any, Callable
 
 
 class ToolExecutor:
-    """Executes tools via Rust FFI or fallback to Python."""
+    """Executes tools via Rust kernel, FFI, or Python fallback.
 
-    def __init__(self, use_ffi: bool = False) -> None:
+    Priority: Kernel (ZMQ) → FFI (PyO3) → Python subprocess.
+    """
+
+    def __init__(
+        self,
+        use_ffi: bool = False,
+        kernel_client: Any = None,
+    ) -> None:
         self.use_ffi = use_ffi
+        self.kernel_client = kernel_client
         self._ffi_module: Any = None
 
         if use_ffi:
@@ -17,8 +25,16 @@ class ToolExecutor:
                 import ccore_engine
                 self._ffi_module = ccore_engine
             except ImportError:
-                print("Warning: ccore_engine not available, using fallback")
                 self.use_ffi = False
+
+    @property
+    def backend(self) -> str:
+        """Return the active execution backend name."""
+        if self.kernel_client is not None:
+            return "kernel"
+        if self.use_ffi and self._ffi_module:
+            return "ffi"
+        return "python"
 
     async def execute(
         self,
@@ -29,18 +45,21 @@ class ToolExecutor:
         """
         Execute a tool and return the result.
 
-        Args:
-            tool_id: Tool identifier (shell, read_file, write_file, etc.)
-            params: Tool parameters
-            progress_callback: Optional callback for progress updates
-
-        Returns:
-            Tool execution result
+        Priority: Kernel → FFI → Python fallback.
         """
+        if self.kernel_client is not None:
+            try:
+                result = await self.kernel_client.execute_tool(tool_id, params)
+                if result.is_success:
+                    return {"result": result.result}
+                return {"error": result.error}
+            except Exception:
+                pass
+
         if self.use_ffi and self._ffi_module:
             return await self._execute_ffi(tool_id, params)
-        else:
-            return await self._execute_fallback(tool_id, params)
+
+        return await self._execute_fallback(tool_id, params)
 
     async def _execute_ffi(self, tool_id: str, params: dict[str, Any]) -> Any:
         """Execute via Rust FFI."""
