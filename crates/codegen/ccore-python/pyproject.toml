@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7.0,<2.0.0"]
+build-backend = "maturin"
+
+[project]
+name = "ccore-engine"
+version = "0.1.0"
+description = "Rust tool execution engine for CCODE Agent via PyO3"
+requires-python = ">=3.12"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+strip = true

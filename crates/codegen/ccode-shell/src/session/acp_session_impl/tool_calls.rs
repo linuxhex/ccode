@@ -308,9 +308,14 @@ impl SessionActor {
         const DEFAULT_TOOL_CALL_BUDGET: u32 = 50;
         let mut tool_call_budget: u32 = DEFAULT_TOOL_CALL_BUDGET;
 
-        // === fileCache: 已读文件内容缓存 ===
+        // === fileCache: 已读文件内容缓存（含 mtime 去重检测） ===
+        /// 缓存条目：文件内容 + 缓存时的 mtime
+        struct CachedFile {
+            content: String,
+            mtime: std::time::SystemTime,
+        }
         const FILE_CACHE_MAX_ENTRIES: usize = 50;
-        let mut file_cache: std::collections::HashMap<std::path::PathBuf, String> =
+        let mut file_cache: std::collections::HashMap<std::path::PathBuf, CachedFile> =
             std::collections::HashMap::with_capacity(FILE_CACHE_MAX_ENTRIES);
         for call in tool_calls.into_iter() {
             if final_result.is_some() {
@@ -343,28 +348,46 @@ impl SessionActor {
             }
 
             // === fileCache 命中检查：对 Read 工具，如果文件已缓存则跳过实际调用 ===
-            if call.function.name == "Read" || call.function.name == "read_file" {
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) {
-                    if let Some(path_str) = args.get("file_path")
+            let read_cache_path: Option<std::path::PathBuf> =
+                if (call.function.name == "Read" || call.function.name == "read_file")
+                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                    && let Some(path_str) = args.get("file_path")
                         .or_else(|| args.get("path"))
                         .and_then(|v| v.as_str())
-                    {
-                        let path = std::path::PathBuf::from(path_str);
-                        if let Some(cached_content) = file_cache.get(&path) {
-                            tracing::debug!(
-                                file_path = %path_str,
-                                "fileCache hit: returning cached content for Read tool"
-                            );
-                            self.chat_state_handle.push_tool_result(ConversationItem::tool_result(
-                                call.id.clone(),
-                                format!("[fileCache] Content served from cache ({} bytes):\n{}",
-                                    cached_content.len(), cached_content),
-                            ));
-                            continue;
-                        }
+                {
+                    Some(std::path::PathBuf::from(path_str))
+                } else {
+                    None
+                };
+            if let Some(ref path) = read_cache_path
+                && let Some(cached) = file_cache.get(path) {
+                    let is_unchanged = tokio::fs::metadata(path).await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|t| t == cached.mtime)
+                        .unwrap_or(false);
+                    if is_unchanged {
+                        tracing::debug!(
+                            file_path = %path.display(),
+                            "fileCache hit: file unchanged, returning stub"
+                        );
+                        self.chat_state_handle.push_tool_result(ConversationItem::tool_result(
+                            call.id.clone(),
+                            format!(
+                                "[File unchanged: {}] Content was previously read ({} bytes) and hasn't changed. \
+                                Use the previously read content from context.",
+                                path.display(), cached.content.len(),
+                            ),
+                        ));
+                        continue;
+                    } else {
+                        tracing::debug!(
+                            file_path = %path.display(),
+                            "fileCache: file modified since cache, invalidating"
+                        );
+                        file_cache.remove(path);
                     }
                 }
-            }
 
             // === toolCallBudget 检查 ===
             if tool_call_budget == 0 {
@@ -502,6 +525,9 @@ impl SessionActor {
         let pending_interjections = self.pending_interjections.clone();
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
         let ccore_state = self.ccore_state.clone();
+        let speculative_cache = self.speculative_tool_results.clone();
+        // 全局并发上限：防止大量并发 bash 命令耗尽系统资源（借鉴 ccore ToolNode Semaphore(20)）
+        let tool_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(20));
         let dispatch_futures: Vec<_> = approved
             .iter()
             .enumerate()
@@ -514,53 +540,92 @@ impl SessionActor {
                 let ccore_state = ccore_state.clone();
                 let pending_interjections = pending_interjections.clone();
                 let blocking_wait_depth = self.tool_context.blocking_wait_depth.clone();
+                let speculative_cache = speculative_cache.clone();
+                let tool_semaphore = tool_semaphore.clone();
                 let interruptible =
                     is_interruptible_wait_tool(&prepared.tool_name, &prepared.parsed_args);
                 let lock = lock_path_for_args(&prepared.parsed_args)
                     .and_then(|fp| file_locks.get(fp).cloned());
                 async move {
+                    let _permit = tool_semaphore.acquire().await.expect("semaphore closed");
                     let exec_start = std::time::Instant::now();
-                    let run_tool = || {
-                        let prepared = Arc::clone(&prepared);
-                        let workspace_ops = workspace_ops.clone();
-                        let session_id = session_id.clone();
-                        let ccore_state = ccore_state.clone();
-                        let lock = lock.clone();
-                        async move {
-                            let _guard = if let Some(ref l) = lock {
-                                Some(l.lock().await)
-                            } else {
-                                None
-                            };
-                            dispatch_tool(&workspace_ops, &prepared, &session_id, &ccore_state).await
-                        }
+                    let cached = if prepared.is_read_only {
+                        speculative_cache.lock().remove(prepared.tool_call_id.0.as_ref())
+                    } else {
+                        None
                     };
-                    let result = if interruptible {
-                        let _wait_guard = BlockingWaitGuard::enter(blocking_wait_depth.clone());
-                        tokio::select! {
-                            biased;
-                            result = call_with_auth_retry(
+                    let result = if let Some(entry) = cached
+                        && entry.args == prepared.parsed_args
+                    {
+                        ccode_telemetry::unified_log::info(
+                            "shell.tool.speculative_dispatch_hit",
+                            Some(session_id.as_ref()),
+                            Some(serde_json::json!({
+                                "tool_name": prepared.tool_name.as_str(),
+                            })),
+                        );
+                        tracing::debug!(
+                            tool = %prepared.tool_name,
+                            "speculative: using pre-executed result from cache"
+                        );
+                        // ccore side effects: record_read for file-reading tools
+                        // 投机执行跳过了 dispatch_tool，需补 record_read 维持读后写检查
+                        if matches!(prepared.tool_name.as_str(), "read_file" | "read" | "search" | "grep" | "glob" | "list_dir")
+                            && let Some(path) = prepared.parsed_args.get("file_path")
+                                .or_else(|| prepared.parsed_args.get("path"))
+                                .or_else(|| prepared.parsed_args.get("target_file"))
+                                .and_then(|v| v.as_str())
+                            {
+                                ccore_state.record_read(path);
+                            }
+                        // ccore side effects: route_reflex for sensory signals
+                        if let Some(reflex_msg) = ccore_state.route_reflex(&prepared.tool_name, &entry.result.prompt_text, true) {
+                            tracing::debug!(tool = %prepared.tool_name, "{}", reflex_msg);
+                        }
+                        Ok(entry.result)
+                    } else {
+                        let run_tool = || {
+                            let prepared = Arc::clone(&prepared);
+                            let workspace_ops = workspace_ops.clone();
+                            let session_id = session_id.clone();
+                            let ccore_state = ccore_state.clone();
+                            let lock = lock.clone();
+                            async move {
+                                let _guard = if let Some(ref l) = lock {
+                                    Some(l.lock().await)
+                                } else {
+                                    None
+                                };
+                                dispatch_tool(&workspace_ops, &prepared, &session_id, &ccore_state).await
+                            }
+                        };
+                        if interruptible {
+                            let _wait_guard = BlockingWaitGuard::enter(blocking_wait_depth.clone());
+                            tokio::select! {
+                                biased;
+                                result = call_with_auth_retry(
+                                    am.as_ref(),
+                                    Some(&shared_recovery),
+                                    &prepared.tool_name,
+                                    run_tool,
+                                ) => result,
+                                _ = wait_for_pending_interjection(&pending_interjections) => {
+                                    tracing::info!(
+                                        tool = %prepared.tool_name,
+                                        "abort wait tool: interjection pending"
+                                    );
+                                    Ok(interrupted_wait_tool_result(&prepared.parsed_args))
+                                }
+                            }
+                        } else {
+                            call_with_auth_retry(
                                 am.as_ref(),
                                 Some(&shared_recovery),
                                 &prepared.tool_name,
                                 run_tool,
-                            ) => result,
-                            _ = wait_for_pending_interjection(&pending_interjections) => {
-                                tracing::info!(
-                                    tool = %prepared.tool_name,
-                                    "abort wait tool: interjection pending"
-                                );
-                                Ok(interrupted_wait_tool_result(&prepared.parsed_args))
-                            }
+                            )
+                            .await
                         }
-                    } else {
-                        call_with_auth_retry(
-                            am.as_ref(),
-                            Some(&shared_recovery),
-                            &prepared.tool_name,
-                            run_tool,
-                        )
-                        .await
                     };
                     let success = match &result {
                         Ok(tool_result) => !tool_result.output.is_error(),
@@ -638,9 +703,9 @@ impl SessionActor {
                         .or_else(|| prepared.dispatch_target_name.clone())
                         .unwrap_or_else(|| prepared.tool_name.clone());
 
-                    // === fileCache: 缓存 Read 工具的文件内容 ===
-                    if effective_tool_name == "Read" || effective_tool_name == "read_file" {
-                        if let Some(path_str) = prepared.parsed_args.get("file_path")
+                    // === fileCache: 缓存 Read 工具的文件内容（含 mtime） ===
+                    if (effective_tool_name == "Read" || effective_tool_name == "read_file")
+                        && let Some(path_str) = prepared.parsed_args.get("file_path")
                             .or_else(|| prepared.parsed_args.get("path"))
                             .and_then(|v| v.as_str())
                         {
@@ -652,17 +717,44 @@ impl SessionActor {
                                         file_cache.remove(&oldest);
                                     }
                                 }
-                                file_cache.insert(path, tool_result.prompt_text.clone());
+                                let mtime = tokio::fs::metadata(&path).await
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                file_cache.insert(path, CachedFile {
+                                    content: tool_result.prompt_text.clone(),
+                                    mtime,
+                                });
                             }
                         }
-                    }
 
-                    post_tool_use_result = self
+                    // === fileCache: Write 工具执行后使缓存失效 ===
+                    if !prepared.is_read_only
+                        && let Some(path_str) = prepared.parsed_args.get("file_path")
+                            .or_else(|| prepared.parsed_args.get("path"))
+                            .and_then(|v| v.as_str())
+                        {
+                            let path = std::path::PathBuf::from(path_str);
+                            if file_cache.remove(&path).is_some() {
+                                tracing::debug!(
+                                    file_path = %path_str,
+                                    "fileCache invalidated after write tool"
+                                );
+                            }
+                        }
+
+                    post_tool_use_result = if self
                         .hook_event_active(ccode_hooks::event::HookEventName::PostToolUse)
-                        .then(|| {
-                            serde_json::to_value(&tool_result.output)
-                                .unwrap_or(serde_json::Value::Null)
-                        });
+                    {
+                        let output = tool_result.output.clone();
+                        tokio::task::spawn_blocking(move || {
+                            serde_json::to_value(&output).unwrap_or(serde_json::Value::Null)
+                        })
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    };
                     let followups = self
                         .handle_bridge_tool_success(
                             &prepared.tool_call_id,
@@ -1144,8 +1236,8 @@ impl SessionActor {
                 }
 
                 // Inject additional context from hooks into the conversation.
-                if let Some(ref additional_ctx) = pre_result.rewrite.additional_context {
-                    if !additional_ctx.is_empty() {
+                if let Some(ref additional_ctx) = pre_result.rewrite.additional_context
+                    && !additional_ctx.is_empty() {
                         tracing::info!(
                             tool_name = %resolved_tool_name,
                             context_len = additional_ctx.len(),
@@ -1157,7 +1249,6 @@ impl SessionActor {
                             ConversationItem::user(context_msg),
                         );
                     }
-                }
 
                 if let ccode_hooks::result::HookDecision::Deny { reason, hook_name } =
                     pre_result.decision
@@ -1174,8 +1265,8 @@ impl SessionActor {
                 }
 
                 // Honor permission chain deny from rule engine / pre-filter.
-                if let Some(chain_result) = pre_result.chain_result {
-                    if let ccode_hooks::permission_rules::PermissionDecision::Deny { reason } =
+                if let Some(chain_result) = pre_result.chain_result
+                    && let ccode_hooks::permission_rules::PermissionDecision::Deny { reason } =
                         chain_result.decision
                     {
                         tracing::info!(
@@ -1194,7 +1285,6 @@ impl SessionActor {
                             )
                             .await?));
                     }
-                }
             }
             if let Some(denied) = self
                 .run_pre_tool_use_client_hook(&call, &tool_call_id, &envelope)
@@ -1310,6 +1400,10 @@ impl SessionActor {
                         .map(|cwd| std::path::PathBuf::from(cwd.as_str())),
                 }
             });
+            let side_effects = match &tool_input {
+                ccode_tools::types::ToolInput::Bash(bash) => bash.side_effects.clone(),
+                _ => None,
+            };
             let decision = {
                 let _pending_guard =
                     crate::session::pending_interaction::PendingInteractionGuard::new(
@@ -1324,6 +1418,7 @@ impl SessionActor {
                         access_kind.clone(),
                         tool_call_update,
                         edit_path_context,
+                        side_effects,
                         Some(self.session_info.id.0.to_string()),
                         None,
                         None,
@@ -2741,6 +2836,98 @@ impl SessionActor {
                 })
                 .await;
             }
+            SamplingEvent::ToolCallReady {
+                tool_index,
+                ref id,
+                ref name,
+                ref arguments,
+                ..
+            } => {
+                tracing::debug!(
+                    tool_index,
+                    tool_call_id = %id,
+                    tool_name = %name,
+                    args_len = arguments.len(),
+                    "speculative: tool call fully streamed, available for early dispatch"
+                );
+                let raw_input = serde_json::from_str::<serde_json::Value>(arguments).ok();
+                let tool_call_id = acp::ToolCallId::new(std::sync::Arc::from(id.as_str()));
+
+                let is_read_only = self
+                    .agent
+                    .borrow()
+                    .tool_bridge()
+                    .tool_kind(name)
+                    .map(|k| k.is_read_only())
+                    .unwrap_or(false);
+
+                if is_read_only
+                    && let Some(ref args) = raw_input {
+                        let wops = self.workspace_ops.clone();
+                        let cache = self.speculative_tool_results.clone();
+                        let call_id = id.clone();
+                        let tool_name = name.clone();
+                        let sid = self.session_info.id.0.to_string();
+                        let args_snapshot = args.clone();
+                        let args = args.clone();
+                        tokio::spawn(async move {
+                            let t0 = std::time::Instant::now();
+                            match wops.call_tool(&tool_name, args, &call_id, Some(&sid)).await {
+                                Ok(result) => {
+                                    let elapsed_ms = t0.elapsed().as_millis() as u64;
+                                    cache.lock().insert(
+                                        call_id.clone(),
+                                        SpeculativeCacheEntry {
+                                            result,
+                                            args: args_snapshot,
+                                        },
+                                    );
+                                    ccode_telemetry::unified_log::info(
+                                        "shell.tool.speculative_hit",
+                                        Some(&sid),
+                                        Some(serde_json::json!({
+                                            "tool_name": tool_name.as_str(),
+                                            "elapsed_ms": elapsed_ms,
+                                        })),
+                                    );
+                                    tracing::debug!(
+                                        tool = %tool_name,
+                                        elapsed_ms,
+                                        "speculative: read-only tool pre-executed and cached"
+                                    );
+                                }
+                                Err(e) => {
+                                    ccode_telemetry::unified_log::info(
+                                        "shell.tool.speculative_miss",
+                                        Some(&sid),
+                                        Some(serde_json::json!({
+                                            "tool_name": tool_name.as_str(),
+                                            "error": e.to_string(),
+                                        })),
+                                    );
+                                    tracing::debug!(
+                                        tool = %tool_name,
+                                        error = %e,
+                                        "speculative: pre-execution failed, will re-execute normally"
+                                    );
+                                }
+                            }
+                        });
+                    }
+
+                let meta = self.stamp_tool_meta(None, name, None);
+                self.send_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id, name.clone())
+                            .kind(acp::ToolKind::Other)
+                            .status(acp::ToolCallStatus::Pending)
+                            .raw_input(raw_input)
+                            .meta(meta),
+                    ),
+                    None,
+                )
+                .await;
+            }
             SamplingEvent::Completed {
                 response, metrics, ..
             } => {
@@ -3156,6 +3343,7 @@ mod plan_mode_edit_gate_tests {
                     timeout: None,
                     description: "write via bash".into(),
                     is_background: false,
+                    side_effects: None,
                 })
             ),
             PlanEditGate::Allow,

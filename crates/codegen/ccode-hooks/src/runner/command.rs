@@ -851,6 +851,10 @@ mod tests {
                 timeout_ms: 5000,
                 source_dir: std::path::PathBuf::from(source),
                 extra_env: std::collections::HashMap::new(),
+                async_run: false,
+                async_rewake: false,
+                rewake_message: None,
+                condition: None,
             };
         use crate::config::HandlerType;
         assert_eq!(
@@ -893,6 +897,10 @@ mod tests {
             timeout_ms: 5000,
             source_dir: std::env::temp_dir(),
             extra_env: std::collections::HashMap::new(),
+                async_run: false,
+                async_rewake: false,
+                rewake_message: None,
+                condition: None,
         }
     }
 
@@ -1055,6 +1063,10 @@ mod tests {
             timeout_ms: 5000,
             source_dir: tmp.path().to_path_buf(),
             extra_env,
+            async_run: false,
+            async_rewake: false,
+            rewake_message: None,
+            condition: None,
         };
 
         let envelope = make_envelope();
@@ -1113,6 +1125,10 @@ mod tests {
             timeout_ms: 5000,
             source_dir: tmp.path().to_path_buf(),
             extra_env: std::collections::HashMap::new(),
+                async_run: false,
+                async_rewake: false,
+                rewake_message: None,
+                condition: None,
         };
 
         let envelope = make_envelope();
@@ -1242,6 +1258,10 @@ mod tests {
             timeout_ms: 5000,
             source_dir: std::env::temp_dir(),
             extra_env,
+            async_run: false,
+            async_rewake: false,
+            rewake_message: None,
+            condition: None,
         };
 
         let envelope = make_envelope();
@@ -1315,6 +1335,10 @@ mod tests {
             timeout_ms: 5000,
             source_dir: std::env::temp_dir(),
             extra_env,
+            async_run: false,
+            async_rewake: false,
+            rewake_message: None,
+            condition: None,
         };
 
         let envelope = make_envelope();
@@ -1380,6 +1404,10 @@ mod tests {
             timeout_ms: 5000,
             source_dir: tmp.path().to_path_buf(),
             extra_env: std::collections::HashMap::new(),
+                async_run: false,
+                async_rewake: false,
+                rewake_message: None,
+                condition: None,
         };
 
         let envelope = make_envelope();

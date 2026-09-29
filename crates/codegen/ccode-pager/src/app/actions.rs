@@ -2027,6 +2027,9 @@ pub enum Effect {
         /// Optional client-chosen ID for the forked session (`--session-id`
         /// with `--fork-session`).
         new_session_id: Option<String>,
+        /// Optional turn index to fork at. `None` forks from the current tip;
+        /// `Some(n)` forks the conversation up to and including prompt `n`.
+        target_prompt_index: Option<usize>,
     },
     /// Read the display title (and its `/rename` manual-ness) from local
     /// `summary.json` (post-resume UI label + prompt-border title).

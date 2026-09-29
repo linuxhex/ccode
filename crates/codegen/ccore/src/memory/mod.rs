@@ -39,3 +39,4 @@ pub mod episodic;
 pub mod repo_map;
 pub mod function_embed;
 pub mod intent_retriever;
+pub mod world_state;

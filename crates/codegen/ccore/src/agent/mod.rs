@@ -28,6 +28,8 @@ pub mod skills;
 pub mod goal_loop;
 pub mod schedule_loop;
 pub mod proactive_loop;
+pub mod graph_store;
+pub mod mailbox;
 
 // 进阶模块（main 分支使用 stub 实现，master 分支使用 ccore-advanced 完整实现）
 pub use crate::stubs::{experiential, meta_cognitive, decentralized, goal_verifier};

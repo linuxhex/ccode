@@ -10,15 +10,21 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 dashboard = []
+python = ["pyo3"]
 
 [dependencies]
+# Python FFI
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+
+dunce = { workspace = true }
+
 # 异步运行时
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
 futures = { workspace = true }
 
 # TUI 渲染
 ratatui = { workspace = true }
-crossterm = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
 syntect = { workspace = true }
 
 # 消息总线 - 纯 Rust ZMTP 实现
@@ -85,6 +91,21 @@ ccode-compaction = { path = "../../common/ccode-compaction" }
 
 # Hook 系统（权限链 + 输入改写）
 ccode-hooks = { path = "../ccode-hooks" }
+
+# TUI 输入组件（多行编辑、光标移动、选择、撤销）
+ccode-textarea = { path = "../ccode-textarea" }
+
+# Markdown 渲染（流式 + 语法高亮）
+ccode-markdown = { workspace = true }
+anstyle = { workspace = true }
+
+# 工具集（主工具库，ccore 内置工具逐步迁移至此）
+ccode-tools = { path = "../ccode-tools" }
+ccode-tools-api = { path = "../ccode-tools-api" }
+
+# 进阶模块（编译为 cdylib，运行时加载）
+ccore-advanced = { path = "../ccore-advanced" }
+
 
 # Dashboard HTTP 服务器 + MCP SSE 传输
 axum = { workspace = true }

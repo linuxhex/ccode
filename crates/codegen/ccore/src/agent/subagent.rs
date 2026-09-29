@@ -182,12 +182,15 @@ impl SubAgentNode {
 
     /// 构建采样请求
     fn build_sample_request(&mut self) -> SampleRequest {
-        let messages: Vec<ChatMessage> = self
+        let mut messages: Vec<ChatMessage> = self
             .working_memory
             .to_chat_messages()
             .into_iter()
             .map(|(role, content)| ChatMessage { role, content, cache_control: None })
             .collect();
+
+        // Prompt cache 断点：4-breakpoint 策略（与 ThinkerNode 对齐）
+        crate::sampler::cache_placement::place_breakpoints(&mut messages);
 
         let request_id = uuid::Uuid::new_v4().to_string();
         self.current_sample_request_id = Some(request_id.clone());
@@ -226,9 +229,11 @@ impl SubAgentNode {
             thinking: None,
             system_prompt: None,
             tool_choice: None,
-            prompt_cache_key: None,
+            prompt_cache_key: Some(self.id.to_string()),
             goal_verify: false,
+            summarize: false,
             extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
         }
     }
 
@@ -760,18 +765,14 @@ pub struct ResultAggregator {
     completed: Vec<SubAgentResult>,
     /// 超时设置（秒）
     timeout_secs: u64,
-    /// 最大重试次数（用于失败重试功能，当前未使用）
-    #[allow(dead_code)]
-    max_retries: u32,
 }
 
 impl ResultAggregator {
-    pub fn new(timeout_secs: u64, max_retries: u32) -> Self {
+    pub fn new(timeout_secs: u64, _max_retries: u32) -> Self {
         Self {
             pending: HashMap::new(),
             completed: Vec::new(),
             timeout_secs,
-            max_retries,
         }
     }
 
@@ -1179,7 +1180,6 @@ mod tests {
         let manager = SubAgentManager::new(5, 600);
         let aggregator = manager.create_aggregator(300);
         assert_eq!(aggregator.timeout_secs, 300);
-        assert_eq!(aggregator.max_retries, 5);
 
         let default_aggregator = manager.create_default_aggregator();
         assert_eq!(default_aggregator.timeout_secs, 600);
@@ -1189,7 +1189,7 @@ mod tests {
     fn test_subagent_task() {
         let task = SubAgentTask {
             description: "Test task".to_string(),
-            allowed_tools: vec!["read".to_string(), "write".to_string()],
+            allowed_tools: vec!["read_file".to_string(), "write_file".to_string()],
             max_turns: 10,
             timeout_secs: 300,
         };

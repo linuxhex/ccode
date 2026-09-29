@@ -49,7 +49,10 @@ pub struct OpenAICompatProvider {
 impl OpenAICompatProvider {
     pub fn new(config: OpenAICompatConfig) -> Self {
         let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(300))
+            .pool_idle_timeout(std::time::Duration::from_secs(600))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { config, client }
@@ -71,10 +74,18 @@ impl OpenAICompatProvider {
             }));
         }
         for m in &request.messages {
-            messages.push(serde_json::json!({
+            let mut msg = serde_json::json!({
                 "role": m.role,
                 "content": m.content,
-            }));
+            });
+            // 序列化 cache_control 断点（OpenAI 支持 message 级别缓存）
+            if let Some(ref cc) = m.cache_control {
+                msg.as_object_mut().unwrap().insert(
+                    "cache_control".to_string(),
+                    serde_json::json!({"type": cc.cache_type}),
+                );
+            }
+            messages.push(msg);
         }
 
         let mut body = serde_json::json!({
@@ -83,9 +94,13 @@ impl OpenAICompatProvider {
             "stream": request.stream,
         });
 
+        // 工具定义按名字排序，确保跨轮次稳定提升缓存命中率
         if !request.tools.is_empty() {
+            let mut sorted_tools: Vec<_> = request.tools.iter().collect();
+            sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+
             body["tools"] = serde_json::json!(
-                request.tools.iter().map(|t| {
+                sorted_tools.iter().map(|t| {
                     serde_json::json!({
                         "type": "function",
                         "function": {
@@ -464,6 +479,12 @@ impl Provider for OpenAICompatProvider {
             })
             .flat_map(futures::stream::iter);
 
+        let stream = super::idle_timeout::with_idle_timeout(
+            stream,
+            request.idle_timeout_secs,
+            request_id,
+        );
+
         Ok(Box::pin(stream))
     }
 
@@ -527,6 +548,20 @@ impl Provider for OpenAICompatProvider {
 
     fn name(&self) -> &str {
         &self.config.name
+    }
+
+    async fn warm_up(&self) -> Result<()> {
+        let url = self.chat_url();
+        tracing::info!("预热 Provider {} 连接：{}", self.config.name, url);
+        match self.client.head(&url).send().await {
+            Ok(resp) => {
+                tracing::info!("Provider {} 连接预热完成，status={}", self.config.name, resp.status());
+            }
+            Err(e) => {
+                tracing::warn!("Provider {} 连接预热失败（非致命）：{}", self.config.name, e);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -603,7 +638,9 @@ mod tests {
             tool_choice: None,
             prompt_cache_key: None,
             goal_verify: false,
+            summarize: false,
             extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
         };
 
         let body = provider.build_request_body(&request);
@@ -664,7 +701,9 @@ mod tests {
             tool_choice: Some(super::super::provider::ToolChoice::Auto),
             prompt_cache_key: None,
             goal_verify: false,
+            summarize: false,
             extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
         };
 
         let body = provider.build_request_body(&request);

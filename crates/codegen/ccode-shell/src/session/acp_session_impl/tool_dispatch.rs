@@ -48,15 +48,14 @@ pub(super) async fn dispatch_tool(
         )
         .await;
     // ccore 融合：记录文件读取（持久化 ccore_state）
-    if result.is_ok() && matches!(prepared.tool_name.as_str(), "read_file" | "read" | "search" | "grep" | "glob" | "list_dir") {
-        if let Some(path) = prepared.parsed_args.get("file_path")
+    if result.is_ok() && matches!(prepared.tool_name.as_str(), "read_file" | "read" | "search" | "grep" | "glob" | "list_dir")
+        && let Some(path) = prepared.parsed_args.get("file_path")
             .or_else(|| prepared.parsed_args.get("path"))
             .or_else(|| prepared.parsed_args.get("target_file"))
             .and_then(|v| v.as_str())
         {
             ccore_state.record_read(path);
         }
-    }
     // ccore 融合：反射弧——工具结果路由到 ReflexRouter
     // 匹配感官信号，触发 L0 直接反射（日志通知）或 L1 本能反射
     if let Ok(ref tool_result) = result {
@@ -242,6 +241,7 @@ impl SessionActor {
             timeout: None,
             description: title_command.clone().into_owned(),
             is_background: false,
+            side_effects: None,
         });
         // Bash mode has no model-issued wire name; resolve the toolset's
         // execute tool by kind so the ccode.dev/tool identity still stamps.
@@ -344,12 +344,20 @@ impl SessionActor {
                 output_delta: None,
                 was_bare_echo: false,
             };
+            let raw_output = {
+                let bo = bash_output.clone();
+                tokio::task::spawn_blocking(move || {
+                    serde_json::to_value(ToolsToolOutput::Bash(bo)).ok()
+                })
+                .await
+                .unwrap_or(None)
+            };
             self.send_update(
                 acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
                     tool_call_id,
                     acp::ToolCallUpdateFields::new()
                         .status(Some(final_status))
-                        .raw_output(serde_json::to_value(ToolsToolOutput::Bash(bash_output)).ok()),
+                        .raw_output(raw_output),
                 )),
                 None,
             )

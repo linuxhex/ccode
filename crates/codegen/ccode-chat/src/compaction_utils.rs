@@ -721,10 +721,73 @@ pub fn format_compact_summary_content(raw_summary: &str) -> String {
 /// chars; smallest healthy prod summary observed at 3,242 chars).
 const MIN_SUMMARY_SEED_CHARS: usize = 500;
 /// True when the cleaned summary seed is too small to plausibly carry the
-/// task state of the conversation it would replace. Callers should
-/// retry like a transient failure.
+/// task state of the conversation it would replace, OR when it lacks
+/// the required 9-category structure (fewer than 7/9 sections present).
+/// Callers should retry like a transient failure.
 pub fn is_degenerate_summary(raw_summary: &str) -> bool {
-    format_compact_summary(raw_summary).chars().count() < MIN_SUMMARY_SEED_CHARS
+    let cleaned = format_compact_summary(raw_summary);
+    if cleaned.chars().count() < MIN_SUMMARY_SEED_CHARS {
+        return true;
+    }
+    // 结构完整性检查：至少 7/9 个 section 必须存在
+    !is_structurally_complete(&cleaned)
+}
+
+/// 9 类结构化摘要的必要 section 标题（编号 + 关键词匹配）
+///
+/// 压缩后的摘要必须包含这 9 个 section，缺失过多视为结构不完整。
+const REQUIRED_SECTIONS: &[(&str, &[&str])] = &[
+    ("1", &["Primary Request", "Intent"]),
+    ("2", &["Key Technical", "Concepts"]),
+    ("3", &["Files", "Code Sections"]),
+    ("4", &["Errors", "Fixes"]),
+    ("5", &["Problem Solving"]),
+    ("6", &["All User Messages", "User Messages"]),
+    ("7", &["Pending Tasks"]),
+    ("8", &["Current Work"]),
+    ("9", &["Next Step", "Optional Next"]),
+];
+
+/// 检查摘要中 9 类结构化 section 的覆盖情况
+///
+/// 返回 `(found_count, total_count, missing_sections)` — 找到的 section 数、总数、缺失的 section 编号列表。
+/// 匹配规则：行首以 "数字." 开头，且行内包含对应的关键词。
+pub fn validate_structured_summary(summary: &str) -> (usize, usize, Vec<String>) {
+    let mut found = 0;
+    let mut missing = Vec::new();
+
+    for (num, keywords) in REQUIRED_SECTIONS {
+        let has_section = summary.lines().any(|line| {
+            let trimmed = line.trim();
+            // 匹配 "1." / "1." 等编号开头
+            let starts_with_num = trimmed.starts_with(&format!("{}.", num))
+                || trimmed.starts_with(&format!("{} ", num))
+                || trimmed.starts_with(&format!("{}.", num));
+            if !starts_with_num {
+                return false;
+            }
+            // 行内包含至少一个关键词（大小写不敏感）
+            let line_lower = trimmed.to_lowercase();
+            keywords.iter().any(|kw| line_lower.contains(&kw.to_lowercase()))
+        });
+
+        if has_section {
+            found += 1;
+        } else {
+            missing.push(format!("Section {}", num));
+        }
+    }
+
+    (found, REQUIRED_SECTIONS.len(), missing)
+}
+
+/// 结构化摘要是否完整（至少包含 7/9 个 section）
+///
+/// 允许 2 个 section 缺失（某些对话可能确实没有相关内容），
+/// 但缺失过多说明模型没有遵循指令，应视为退化。
+pub fn is_structurally_complete(summary: &str) -> bool {
+    let (found, total, _) = validate_structured_summary(summary);
+    found >= total.saturating_sub(2)
 }
 /// Cap (in `char`s) for the rejected-summary text captured on
 /// [`CompactionAttempt::summary`].
@@ -1820,16 +1883,25 @@ actual user question";
     }
     #[test]
     fn healthy_summary_accepted() {
-        let raw = format!(
-            "<summary>\n{}\n</summary>",
-            "1. Primary Request: fix the bug. ".repeat(40)
-        );
-        assert!(!is_degenerate_summary(&raw));
+        let raw = "<summary>\n\
+            1. Primary Request and Intent: The user explicitly asked to fix a critical bug in the authentication module that was causing login failures for all new users.\n\
+            2. Key Technical Concepts: Rust async/await, tokio runtime, parking_lot Mutex, session management, compaction pipeline.\n\
+            3. Files and Code Sections: src/main.rs was modified to add proper error handling for the login flow. The key change was adding a null check before accessing user info.\n\
+            4. Errors and Fixes: Type mismatch error in the auth module was resolved by adding explicit type conversion. The root cause was a missing null check.\n\
+            5. Problem Solving: Root cause identified as missing null check in the authentication flow. The fix was applied and verified with unit tests.\n\
+            6. All User Messages: The user asked to fix the authentication bug and provided error logs from the production system.\n\
+            7. Pending Tasks: Deploy the fix to staging environment and verify with integration tests.\n\
+            8. Current Work: The fix has been applied to src/main.rs and all unit tests pass. Currently waiting for code review.\n\
+            9. Optional Next Step: Deploy to staging for verification. The user said: 'please fix the auth bug and deploy when ready'.\n\
+        </summary>";
+        assert!(!is_degenerate_summary(raw));
     }
     #[test]
     fn floor_boundary_at_500_chars() {
         assert!(is_degenerate_summary(&"y".repeat(499)));
-        assert!(!is_degenerate_summary(&"y".repeat(500)));
+        assert!(is_degenerate_summary(&"y".repeat(500)));
+        let structured = "1. Primary Request: fix the bug in the main module.\n2. Key Technical Concepts: Rust async, tokio, parking_lot Mutex.\n3. Files and Code Sections: src/main.rs was modified to add error handling.\n4. Errors and Fixes: type mismatch resolved by adding explicit conversion.\n5. Problem Solving: root cause identified as missing null check.\n6. All User Messages: user asked to fix the bug in main.\n7. Pending Tasks: verify the fix works in production.\n8. Current Work: applied the fix and running tests.\n9. Optional Next Step: deploy to staging for verification.";
+        assert!(!is_degenerate_summary(structured));
     }
     #[test]
     fn analysis_wrapping_empty_summary_rejected() {
@@ -2713,8 +2785,7 @@ actual user question";
                     },
                 ],
                 model_id: Some("ccode-3".to_string()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             // [4] Tool result for call_1
             ConversationItem::tool_result(
@@ -2752,8 +2823,7 @@ actual user question";
                     },
                 ],
                 model_id: Some("ccode-3".to_string()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             // [9] Tool result for call_3
             ConversationItem::tool_result("call_3", "File edited successfully."),
@@ -3088,8 +3158,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 content: "response".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ]);
         assert_eq!(result.len(), 3);
@@ -3112,8 +3181,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 content: "response".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ]);
         assert_eq!(result.len(), 1, "reasoning sibling must be dropped");
@@ -3162,8 +3230,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "match found"),
         ]);
@@ -3205,8 +3272,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 content: "plain text response".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ]);
         assert_eq!(result.len(), 1);
@@ -3241,8 +3307,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "match"),
             ConversationItem::user("second turn"),
@@ -3251,8 +3316,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 content: "thinking only".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc2", "stray"),
             ConversationItem::user("third turn"),
@@ -3260,8 +3324,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 content: "plain reply".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ]);
         assert_eq!(result.len(), 6);
@@ -3329,8 +3392,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "files"),
         ];
@@ -3741,5 +3803,74 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             out.iter().any(|i| i.text_content() == "recent answer"),
             "recent turn must survive"
         );
+    }
+
+    #[test]
+    fn test_validate_structured_summary_all_present() {
+        let summary = r#"
+1. Primary Request and Intent: User wants to fix bugs
+2. Key Technical Concepts: Rust, Python
+3. Files and Code Sections: src/main.rs
+4. Errors and Fixes: Fixed null pointer
+5. Problem Solving: Identified root cause
+6. All User Messages: fix the bug
+7. Pending Tasks: Write tests
+8. Current Work: Running tests
+9. Optional Next Step: Commit changes
+"#;
+        let (found, total, missing) = validate_structured_summary(summary);
+        assert_eq!(found, 9);
+        assert_eq!(total, 9);
+        assert!(missing.is_empty());
+        assert!(is_structurally_complete(summary));
+    }
+
+    #[test]
+    fn test_validate_structured_summary_some_missing() {
+        let summary = r#"
+1. Primary Request and Intent: User wants to fix bugs
+2. Key Technical Concepts: Rust
+5. Problem Solving: Identified root cause
+8. Current Work: Running tests
+"#;
+        let (found, total, missing) = validate_structured_summary(summary);
+        assert_eq!(found, 4);
+        assert_eq!(total, 9);
+        assert_eq!(missing.len(), 5);
+        // 4/9 < 7/9, not complete
+        assert!(!is_structurally_complete(summary));
+    }
+
+    #[test]
+    fn test_validate_structured_summary_partial_ok() {
+        // 7/9 sections present — should be considered complete
+        let summary = r#"
+1. Primary Request and Intent: User wants to fix bugs
+2. Key Technical Concepts: Rust, Python
+3. Files and Code Sections: src/main.rs
+4. Errors and Fixes: Fixed null pointer
+5. Problem Solving: Identified root cause
+8. Current Work: Running tests
+9. Optional Next Step: Commit changes
+"#;
+        let (found, total, missing) = validate_structured_summary(summary);
+        assert_eq!(found, 7);
+        assert_eq!(total, 9);
+        assert_eq!(missing.len(), 2);
+        assert!(is_structurally_complete(summary));
+    }
+
+    #[test]
+    fn test_is_degenerate_summary_structural_check() {
+        // Long enough but missing structure → degenerate
+        let long_but_unstructured = "a".repeat(600);
+        assert!(is_degenerate_summary(&long_but_unstructured));
+
+        // Long enough with structure → not degenerate
+        let structured = format!(
+            "1. Primary Request and Intent: {}\n2. Key Technical Concepts: Rust\n3. Files and Code Sections: src/main.rs\n4. Errors and Fixes: None\n5. Problem Solving: Done\n6. All User Messages: hello\n7. Pending Tasks: None\n8. Current Work: Testing\n9. Optional Next Step: None",
+            "x".repeat(500)
+        );
+        assert!(!is_degenerate_summary(&structured));
     }
 }

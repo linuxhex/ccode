@@ -54,6 +54,14 @@ pub struct HookSpecWire {
     pub timeout_ms: u64,
     pub source_dir: PathBuf,
     pub extra_env: HashMap<String, String>,
+    /// Run the hook in the background (non-blocking).
+    pub async_run: bool,
+    /// When true and `async_run` is true, wake the model on exit code 2.
+    pub async_rewake: bool,
+    /// Message shown to the model when an asyncRewake hook fires.
+    pub rewake_message: Option<String>,
+    /// Permission-rule-style condition filter (e.g. `"Bash(git *)"`).
+    pub condition: Option<String>,
 }
 
 /// Wire mirror of `ccode_hooks::event::HookEventName`.
@@ -86,6 +94,12 @@ pub enum HookEventNameWire {
     SubagentEnd,
     PreCompact,
     PostCompact,
+    TaskCreated,
+    TaskCompleted,
+    FileChanged,
+    ConfigChange,
+    PermissionRequest,
+    CwdChanged,
     /// An event string this client does not know, preserved verbatim.
     Unknown(String),
 }
@@ -109,6 +123,12 @@ impl HookEventNameWire {
             Self::SubagentEnd => "subagent_end",
             Self::PreCompact => "pre_compact",
             Self::PostCompact => "post_compact",
+            Self::TaskCreated => "task_created",
+            Self::TaskCompleted => "task_completed",
+            Self::FileChanged => "file_changed",
+            Self::ConfigChange => "config_change",
+            Self::PermissionRequest => "permission_request",
+            Self::CwdChanged => "cwd_changed",
             Self::Unknown(s) => s,
         }
     }
@@ -142,6 +162,12 @@ impl<'de> Deserialize<'de> for HookEventNameWire {
             "subagent_end" => Self::SubagentEnd,
             "pre_compact" => Self::PreCompact,
             "post_compact" => Self::PostCompact,
+            "task_created" => Self::TaskCreated,
+            "task_completed" => Self::TaskCompleted,
+            "file_changed" => Self::FileChanged,
+            "config_change" => Self::ConfigChange,
+            "permission_request" => Self::PermissionRequest,
+            "cwd_changed" => Self::CwdChanged,
             // Forward-tolerant: preserve an unknown event verbatim.
             _ => Self::Unknown(s),
         })
@@ -159,7 +185,7 @@ mod tests {
 
     #[test]
     fn hook_event_name_wire_snake_case_round_trip() {
-        // All 15 variants (mirrors upstream `event_name_deser_all_variants`).
+        // All 21 variants (mirrors upstream `event_name_deser_all_variants`).
         for (variant, wire) in [
             (HookEventNameWire::SessionStart, "session_start"),
             (HookEventNameWire::SessionEnd, "session_end"),
@@ -179,6 +205,12 @@ mod tests {
             (HookEventNameWire::SubagentEnd, "subagent_end"),
             (HookEventNameWire::PreCompact, "pre_compact"),
             (HookEventNameWire::PostCompact, "post_compact"),
+            (HookEventNameWire::TaskCreated, "task_created"),
+            (HookEventNameWire::TaskCompleted, "task_completed"),
+            (HookEventNameWire::FileChanged, "file_changed"),
+            (HookEventNameWire::ConfigChange, "config_change"),
+            (HookEventNameWire::PermissionRequest, "permission_request"),
+            (HookEventNameWire::CwdChanged, "cwd_changed"),
         ] {
             assert_eq!(
                 serde_json::to_value(&variant).unwrap(),
@@ -220,7 +252,11 @@ mod tests {
                     "url_raw": null,
                     "timeout_ms": 5000,
                     "source_dir": "/home/u/.ccode/hooks",
-                    "extra_env": { "FOO": "bar" }
+                    "extra_env": { "FOO": "bar" },
+                    "async_run": false,
+                    "async_rewake": false,
+                    "rewake_message": null,
+                    "condition": null
                 }]
             }
         });

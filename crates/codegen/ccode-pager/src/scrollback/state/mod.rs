@@ -924,8 +924,16 @@ impl ScrollbackState {
         if let Some(entry) = self.entries.get_mut(&id)
             && let RenderBlock::AgentMessage(ref mut msg) = entry.block
         {
-            msg.push_chunk(chunk);
-            entry.invalidate_cache();
+            // Use deferred push during streaming: appends text without triggering
+            // expensive markdown rendering (syntect highlighting + word-wrap).
+            // The full render happens when streaming completes via finish().
+            msg.push_chunk_deferred(chunk);
+            // For running entries, skip cached_output invalidation: the fast
+            // height estimate (estimate_line_count) will be used instead of
+            // full rendering. This avoids O(tokens * render_cost) during streaming.
+            if !entry.is_running {
+                entry.invalidate_cache();
+            }
             self.dirty_heights.insert(id);
             self.bump_content_generation();
             return true;
@@ -1443,6 +1451,10 @@ impl ScrollbackState {
                 }
             }
             entry.invalidate_cache();
+            // Freeze the render cache: this entry's content is now immutable.
+            // Subsequent invalidate_cache() calls become no-ops, avoiding
+            // redundant re-renders during streaming of later entries.
+            entry.is_finalized = true;
         }
         // Mark height dirty since collapsed mode has different height.
         // display_mode may have changed, so gaps need recomputation.

@@ -79,7 +79,7 @@ pub fn validate_path(path: &str, workspace_root: &Path) -> PathValidation {
     };
 
     // 尝试 canonicalize（文件可能不存在）
-    let canonical = canonical.canonicalize().unwrap_or_else(|_| {
+    let canonical = dunce::canonicalize(&canonical).unwrap_or_else(|_| {
         // 文件不存在时，手动规范化
         normalize_path(&canonical)
     });
@@ -275,6 +275,6 @@ mod tests {
         // but we can test the logic
         let result = ensure_in_workspace("/etc/passwd", workspace);
         // Should be rejected (path outside workspace)
-        assert!(result.is_err() || true); // Depends on actual filesystem
+        assert!(result.is_err(), "expected outside-path to be rejected");
     }
 }

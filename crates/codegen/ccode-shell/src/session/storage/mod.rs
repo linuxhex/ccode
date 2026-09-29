@@ -403,9 +403,7 @@ pub(crate) mod chat_rebuild {
             let item = ConversationItem::Assistant(AssistantItem {
                 content: std::sync::Arc::<str>::from(std::mem::take(&mut self.agent_text)),
                 tool_calls: std::mem::take(&mut self.agent_tool_calls),
-                model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             });
             self.has_agent_content = false;
             self.item_count += 1;

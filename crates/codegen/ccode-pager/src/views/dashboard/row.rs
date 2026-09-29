@@ -823,6 +823,7 @@ fn subagent_activity(info: &SubagentInfo, state: RowState) -> Option<String> {
                 &TurnActivity::ToolRunning {
                     title: last_tool.to_string(),
                     description: None,
+                    started_at: std::time::Instant::now(),
                 },
             )))
         }

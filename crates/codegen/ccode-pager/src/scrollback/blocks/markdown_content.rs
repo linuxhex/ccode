@@ -194,6 +194,35 @@ impl MarkdownContent {
         self.state.borrow().renderer.source().is_empty()
     }
 
+    /// Fast line count estimate from source text length.
+    ///
+    /// Uses source byte length divided by width as a rough approximation.
+    /// This avoids full markdown rendering (syntect highlighting + word-wrap)
+    /// and is suitable for streaming entries where exact height isn't critical.
+    ///
+    /// The estimate is intentionally conservative (slightly over-estimates)
+    /// to avoid layout jumps when streaming completes.
+    pub fn estimate_line_count(&self, width: usize) -> usize {
+        if width == 0 {
+            return 0;
+        }
+        let state = self.state.borrow();
+        let source = state.renderer.source();
+        if source.is_empty() {
+            return 1;
+        }
+        // Count newlines for baseline, then estimate wrapped lines
+        let newline_count = source.chars().filter(|&c| c == '\n').count();
+        // Average characters per line after markdown rendering
+        // Use width * 0.7 as effective line width (accounts for indentation, etc)
+        let effective_width = (width as f64 * 0.7).max(1.0) as usize;
+        let char_count = source.len();
+        // Estimate: newlines + (remaining chars / effective width)
+        // Add 1 for the first line, and a small buffer for markdown overhead
+        let estimated = newline_count + (char_count.saturating_sub(newline_count) / effective_width) + 2;
+        estimated.max(1)
+    }
+
     /// Get the rendered text as plain text (styles stripped).
     ///
     /// Returns the styled markdown output with all ratatui styles removed,

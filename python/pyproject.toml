@@ -1,0 +1,49 @@
+[project]
+name = "ccode-agent"
+version = "0.1.0"
+description = "CCODE Agent - Python UI + Reasoning layer with Rust tool execution"
+readme = "README.md"
+authors = [
+    { name = "this_way", email = "this_way@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=1.0.0",
+    "pyzmq>=26.0.0",
+    "msgpack>=1.0.0",
+    "pydantic>=2.0.0",
+    "openai>=1.0.0",
+    "anthropic>=0.40.0",
+    "httpx>=0.27.0",
+    "rich>=13.0.0",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+ccode-agent = "ccode.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.11,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "mypy>=1.0.0",
+    "ruff>=0.8.0",
+    "maturin>=1.7.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

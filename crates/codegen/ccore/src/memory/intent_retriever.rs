@@ -14,7 +14,6 @@ use std::collections::HashMap;
 
 use super::embedding::EmbeddingIndex;
 use super::function_embed::CodeBlock;
-use super::repo_map::RepoMap;
 use std::path::PathBuf;
 
 /// 检索意图
@@ -53,8 +52,6 @@ pub struct IntentRetriever {
     embedding_index: EmbeddingIndex,
     /// 代码块表（block_id → CodeBlock）
     code_blocks: HashMap<String, CodeBlock>,
-    /// Repo Map（用于依赖链扩展）
-    repo_map: Option<RepoMap>,
 }
 
 impl IntentRetriever {
@@ -63,36 +60,37 @@ impl IntentRetriever {
         Self {
             embedding_index,
             code_blocks: HashMap::new(),
-            repo_map: None,
-        }
-    }
-
-    /// 设置 Repo Map
-    pub fn set_repo_map(&mut self, repo_map: RepoMap) {
-        self.repo_map = Some(repo_map);
-    }
-
-    /// 注册代码块
-    pub fn register_block(&mut self, block: CodeBlock) {
-        self.code_blocks.insert(block.id.clone(), block);
-    }
-
-    /// 批量注册代码块
-    pub fn register_blocks(&mut self, blocks: Vec<CodeBlock>) {
-        for block in blocks {
-            self.register_block(block);
         }
     }
 
     /// 基于意图列表检索
     ///
-    /// 对每个意图独立检索 top-k，合并后用 MMR 去重排序
+    /// 对每个意图独立检索 top-k，合并后用 MMR 去重排序。
+    ///
+    /// 低于 `MIN_RELEVANCE_SCORE` 的结果会被丢弃：检索结果会以「[代码上下文]」
+    /// 注入工作记忆并消耗 token 预算，无阈值时一旦查询向量退化
+    /// （如全零向量导致 cosine 恒为 0）就会静默注入无关内容——
+    /// 那比返回空结果更糟，因为它不可见。
     pub fn search_by_intents(
         &self,
         intents: &[RetrievalIntent],
         query_embedding: &[f32],
         top_k: usize,
     ) -> Vec<RetrievalResult> {
+        /// 相关度下限：低于此值视为无效匹配
+        const MIN_RELEVANCE_SCORE: f64 = 0.3;
+
+        // 查询向量退化时直接返回空——余弦相似度分母为零会让所有候选得分为 0，
+        // 排序结果无意义。返回空比返回"看似有序实则随机"的结果诚实。
+        let query_norm: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if query_norm == 0.0 {
+            tracing::warn!(
+                target: "ccore::memory",
+                "意图检索收到零向量查询，跳过检索（调用方需提供真实 embedding）"
+            );
+            return Vec::new();
+        }
+
         let mut all_results: Vec<RetrievalResult> = Vec::new();
 
         for intent in intents {
@@ -102,11 +100,15 @@ impl IntentRetriever {
             for (idx, score) in raw {
                 let vector = &self.embedding_index.vectors()[idx];
                 if let Some(block) = self.code_blocks.get(&vector.entry_id) {
+                    let relevance = (score as f64) * intent.weight;
+                    if relevance < MIN_RELEVANCE_SCORE {
+                        continue;
+                    }
                     all_results.push(RetrievalResult {
                         block_id: block.id.clone(),
                         file_path: block.file_path.clone(),
                         name: block.name.clone(),
-                        relevance_score: (score as f64) * intent.weight,
+                        relevance_score: relevance,
                         source_intent: intent.description.clone(),
                         preview: block.source.chars().take(200).collect(),
                     });
@@ -173,59 +175,6 @@ impl IntentRetriever {
         intents.extend(type_intents);
 
         intents
-    }
-
-    /// 基于依赖链扩展检索结果
-    ///
-    /// 对命中的代码块，额外检索其依赖的文件中的代码块
-    pub fn expand_with_dependencies(
-        &self,
-        results: &[RetrievalResult],
-        max_additional: usize,
-    ) -> Vec<RetrievalResult> {
-        let repo_map = match &self.repo_map {
-            Some(m) => m,
-            None => return Vec::new(),
-        };
-
-        let mut additional = Vec::new();
-        let mut seen_files = std::collections::HashSet::new();
-
-        for result in results {
-            seen_files.insert(result.file_path.clone());
-        }
-
-        for result in results {
-            // 查找该文件的所有依赖
-            let deps = repo_map.all_dependencies(&result.file_path);
-            for dep_path in deps {
-                if seen_files.contains(&dep_path) {
-                    continue;
-                }
-                seen_files.insert(dep_path.clone());
-
-                // 将依赖文件中的代码块加入结果
-                for block in self.code_blocks.values() {
-                    if block.file_path == dep_path && additional.len() < max_additional {
-                        additional.push(RetrievalResult {
-                            block_id: block.id.clone(),
-                            file_path: block.file_path.clone(),
-                            name: block.name.clone(),
-                            relevance_score: result.relevance_score * 0.5,
-                            source_intent: format!("依赖链扩展: {}", result.name),
-                            preview: block.source.chars().take(200).collect(),
-                        });
-                    }
-                }
-            }
-        }
-
-        additional
-    }
-
-    /// 获取所有代码块数量
-    pub fn block_count(&self) -> usize {
-        self.code_blocks.len()
     }
 
     // ---- 内部方法 ----
@@ -337,5 +286,37 @@ mod tests {
         assert!(components.contains(&"model".to_string()));
         assert!(components.contains(&"login".to_string()));
         assert!(components.contains(&"handler".to_string()));
+    }
+
+    /// 零向量查询必须返回空，而不是一堆相关度为 0 的无关结果。
+    ///
+    /// 检索结果会以「[代码上下文]」注入工作记忆并消耗 token 预算。
+    /// 余弦相似度在查询向量模长为 0 时恒返回 0，此时排序无意义——
+    /// 静默注入无关内容比返回空结果更糟，因为它不可见。
+    #[test]
+    fn zero_query_vector_returns_empty_not_garbage() {
+        let retriever = IntentRetriever::new(EmbeddingIndex::new());
+        let intents = IntentRetriever::expand_intents("查找登录函数");
+        assert!(!intents.is_empty(), "前提：意图展开应产出结果");
+
+        let results = retriever.search_by_intents(&intents, &vec![0.0f32; 1536], 5);
+        assert!(
+            results.is_empty(),
+            "零向量查询应返回空并告警，实得 {} 条结果",
+            results.len()
+        );
+    }
+
+    /// 非零向量但索引为空时也应返回空——不应 panic 或产出伪结果。
+    #[test]
+    fn nonzero_query_on_empty_index_returns_empty() {
+        let retriever = IntentRetriever::new(EmbeddingIndex::new());
+        let intents = IntentRetriever::expand_intents("查找登录函数");
+
+        let mut query = vec![0.0f32; 1536];
+        query[0] = 1.0; // 非零，模长为 1
+
+        let results = retriever.search_by_intents(&intents, &query, 5);
+        assert!(results.is_empty(), "空索引应返回空结果");
     }
 }

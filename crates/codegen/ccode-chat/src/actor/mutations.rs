@@ -238,8 +238,10 @@ impl ChatStateActor {
         if !self.pruning_config.enabled {
             return 0;
         }
-        // Fast exit: not enough turns have elapsed for any hard-clear to apply.
-        if self.state.prompt_index < self.pruning_config.hard_clear_age_turns {
+        // Fast exit: not enough turns have elapsed for any clearing to apply.
+        let min_threshold = self.pruning_config.soft_clear_age_turns
+            .min(self.pruning_config.hard_clear_age_turns);
+        if self.state.prompt_index < min_threshold {
             return 0;
         }
 
@@ -248,12 +250,12 @@ impl ChatStateActor {
         // shell mid-turn and do not increment `prompt_index`.  The naive backward
         // scan counts every User item as a turn boundary, so synthetic items make
         // old tool results appear older than they really are and can cause
-        // premature hard-clears.
+        // premature clears.
         //
         // Fix: raise the effective clearing threshold by the number of synthetic
         // User items.  This guarantees a tool result is never cleared before
-        // `hard_clear_age_turns` REAL turns have elapsed, regardless of how many
-        // synthetic messages the session contains.
+        // `soft_clear_age_turns` / `hard_clear_age_turns` REAL turns have elapsed,
+        // regardless of how many synthetic messages the session contains.
         let total_user_items = self
             .state
             .conversation
@@ -261,15 +263,24 @@ impl ChatStateActor {
             .filter(|i| matches!(i, ConversationItem::User(_)))
             .count();
         let synthetic_count = total_user_items.saturating_sub(self.state.prompt_index);
-        let effective_threshold = self
+        let effective_soft_threshold = self
+            .pruning_config
+            .soft_clear_age_turns
+            .saturating_add(synthetic_count);
+        let effective_hard_threshold = self
             .pruning_config
             .hard_clear_age_turns
             .saturating_add(synthetic_count);
 
+        let soft_clear_summary_chars = self.pruning_config.soft_clear_summary_chars;
         let before_bytes = self.conversation_content_bytes();
-        let mut cleared = 0usize;
+        let mut soft_cleared = 0usize;
+        let mut hard_cleared = 0usize;
         let mut turn_from_end: usize = 0;
         let mut seen_first_user = false;
+
+        /// Marker for soft-cleared tool results: summary + cleared notice.
+        const SOFT_CLEAR_MARKER: &str = "\n\n[Old tool result content cleared]";
 
         for i in (0..self.state.conversation.len()).rev() {
             if matches!(&self.state.conversation[i], ConversationItem::User(_)) {
@@ -284,28 +295,45 @@ impl ChatStateActor {
                 continue;
             };
 
-            if turn_from_end < effective_threshold {
+            // Hard clear: very old tool results → full placeholder
+            if turn_from_end >= effective_hard_threshold {
+                if tr.content.as_ref() != HARD_CLEAR_PLACEHOLDER {
+                    tr.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
+                    hard_cleared += 1;
+                }
                 continue;
             }
 
-            if tr.content.as_ref() != HARD_CLEAR_PLACEHOLDER {
-                tr.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
-                cleared += 1;
+            // Soft clear: moderately old tool results → summary + marker
+            if turn_from_end >= effective_soft_threshold {
+                // Skip if already hard-cleared or already soft-cleared
+                if tr.content.as_ref() == HARD_CLEAR_PLACEHOLDER {
+                    continue;
+                }
+                if tr.content.as_ref().ends_with(SOFT_CLEAR_MARKER) {
+                    continue;
+                }
+                let summary: String = tr.content.chars().take(soft_clear_summary_chars).collect();
+                let new_content = format!("{summary}{SOFT_CLEAR_MARKER}");
+                tr.content = std::sync::Arc::<str>::from(new_content);
+                soft_cleared += 1;
             }
         }
 
-        if cleared > 0 {
+        let total_cleared = soft_cleared + hard_cleared;
+        if total_cleared > 0 {
             let after_bytes = self.conversation_content_bytes();
             tracing::debug!(
-                hard_cleared = cleared,
+                soft_cleared,
+                hard_cleared,
                 bytes_freed = before_bytes.saturating_sub(after_bytes),
                 conversation_len = self.state.conversation.len(),
-                "ChatState: in-memory tool-result prune"
+                "ChatState: in-memory tool-result prune (soft+hard)"
             );
             self.persistence.replace_history(&self.state.conversation);
         }
 
-        cleared
+        total_cleared
     }
 
     /// Approximate byte footprint of all string content in the conversation.

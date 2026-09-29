@@ -2,6 +2,9 @@
 //!
 //! CLI 通过 FFI 调用 libccore 动态库
 
+#[cfg(feature = "python")]
+mod python;
+
 use crate::config::CcodeConfig;
 use crate::kernel::{Kernel, KernelConfig, KernelRuntimeConfig};
 use std::ffi::{CStr, CString};

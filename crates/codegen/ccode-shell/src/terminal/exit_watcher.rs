@@ -189,7 +189,7 @@ async fn complete_and_release(
     out: SnapshotOutput,
 ) {
     let snapshot = {
-        let mut guard = tasks.lock().unwrap();
+        let mut guard = tasks.lock().expect("exit_watcher tasks lock poisoned");
         guard.get_mut(task_id).map(|task| {
             task.mark_completed(out.clone());
             task.to_snapshot(task_id, out)

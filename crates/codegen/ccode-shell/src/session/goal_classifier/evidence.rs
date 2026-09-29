@@ -1134,8 +1134,7 @@ mod tests {
             content: text.into(),
             tool_calls: Vec::new(),
             model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })
     }
 
@@ -1148,8 +1147,7 @@ mod tests {
                 arguments: "{\"target_file\":\"x\"}".into(),
             }],
             model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })
     }
 

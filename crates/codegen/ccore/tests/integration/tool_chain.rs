@@ -30,7 +30,7 @@ async fn test_read_then_edit_workflow() {
     }
 
     // 3. 验证 read_tracker 已记录
-    assert!(read_tracker::has_file_been_read(file_path.to_str().unwrap()));
+    assert!(read_tracker::has_file_been_read(&file_path));
 
     // 4. 编辑文件（应该成功，因为已读取）
     let edit_args = json!({
@@ -76,8 +76,8 @@ async fn test_edit_without_read_should_fail() {
     // EditExecutor 会因为先读后写约束而失败，
     // 或者因为路径在工作区外而失败
     // 两者都是预期行为
-    if result.is_err() {
-        let err = result.unwrap_err().to_string();
+    if let Err(ref err) = result {
+        let err = err.to_string();
         assert!(
             err.contains("必须先读取") || err.contains("工作目录外"),
             "错误信息应包含'必须先读取'或'工作目录外'，实际: {}",

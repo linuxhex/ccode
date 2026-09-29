@@ -151,6 +151,8 @@ async fn create_test_actor(
         pending_skill_reminders: Mutex::new(Vec::new()),
         pending_compile_feedback: Mutex::new(None),
         current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
+        current_turn_edited_files: Mutex::new(Vec::new()),
+        speculative_tool_results: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
         idle_flush_timeout: None,
         dream_check_timeout: None,
         last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -245,6 +247,7 @@ async fn create_test_actor(
         workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
         trace_config_template: std::cell::RefCell::new(None),
         ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
+        config_cache: std::cell::RefCell::new(None),
     }
 }
 /// Test that should_auto_compact returns correct trigger info.
@@ -596,6 +599,8 @@ async fn create_test_actor_with_memory(
         pending_skill_reminders: Mutex::new(Vec::new()),
         pending_compile_feedback: Mutex::new(None),
         current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
+        current_turn_edited_files: Mutex::new(Vec::new()),
+        speculative_tool_results: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
         idle_flush_timeout: memory_config
             .as_ref()
             .and_then(|mc| mc.flush.idle_timeout_secs)
@@ -701,6 +706,7 @@ async fn create_test_actor_with_memory(
         workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
         trace_config_template: std::cell::RefCell::new(None),
         ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
+        config_cache: std::cell::RefCell::new(None),
     }
 }
 #[tokio::test(flavor = "current_thread")]
@@ -1379,6 +1385,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 pending_compile_feedback: Mutex::new(None),
                 current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
+                current_turn_edited_files: Mutex::new(Vec::new()),
+                speculative_tool_results: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
                 last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -1482,6 +1490,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),
                 ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
+                config_cache: std::cell::RefCell::new(None),
             };
             let eleven_minutes_ago_ms = chrono::Utc::now().timestamp_millis() - (11 * 60 * 1000);
             actor

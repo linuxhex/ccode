@@ -347,6 +347,14 @@ pub fn stream_messages<'a>(
                                 }
                             }
                             BlockType::ToolUse => {
+                                let tool_index = block_to_tool_index.get(&index).copied().unwrap_or(0);
+                                yield SamplingEvent::ToolCallReady {
+                                    request_id: request_id.clone(),
+                                    tool_index,
+                                    id: state.tool_id.clone(),
+                                    name: state.tool_name.clone(),
+                                    arguments: state.args_acc.clone(),
+                                };
                                 assistant_tool_calls.push(ToolCall {
                                     id: std::sync::Arc::<str>::from(state.tool_id),
                                     name: state.tool_name,
@@ -494,6 +502,7 @@ pub fn stream_messages<'a>(
             model_fingerprint: None,
             // The Messages API does not echo the applied reasoning effort.
             reasoning_effort: None,
+            ..Default::default()
         });
 
         let mut items: Vec<ConversationItem> = Vec::new();

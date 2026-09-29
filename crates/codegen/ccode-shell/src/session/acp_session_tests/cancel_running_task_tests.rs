@@ -110,7 +110,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 chat_event_tx,
                 tokio_util::sync::CancellationToken::new(),
             );
-            let actor = Arc::new(SessionActor {
+            let actor = Arc::new(Box::new(SessionActor {
                 session_info,
                 auth_method_id: test_auth_method_id("test-auth"),
                 model_auth_memo: std::cell::RefCell::new(None),
@@ -199,6 +199,8 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 pending_compile_feedback: Mutex::new(None),
                 current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
+                current_turn_edited_files: Mutex::new(Vec::new()),
+                speculative_tool_results: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
                 last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -299,7 +301,8 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),
                 ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
-            });
+                config_cache: std::cell::RefCell::new(None),
+            }));
             let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
                 "hello persist".to_string(),
             ))];
@@ -578,7 +581,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 embedding_credentials: crate::session::memory::EndpointScopedCredentials::none(),
             };
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
-            let actor = Arc::new(SessionActor {
+            let actor = Arc::new(Box::new(SessionActor {
                 session_info: session_info.clone(),
                 auth_method_id: test_auth_method_id("test-auth"),
                 model_auth_memo: std::cell::RefCell::new(None),
@@ -670,6 +673,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 pending_compile_feedback: Mutex::new(None),
                 current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
+                current_turn_edited_files: Mutex::new(Vec::new()),
+                speculative_tool_results: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
                 last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -770,7 +775,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),
                 ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
-            });
+                config_cache: std::cell::RefCell::new(None),
+            }));
             let _ = actor
                 .process_conversation_turn_with_recovery("disabled-memory", None, None, None)
                 .await;
@@ -860,7 +866,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     ),
                 )
                 .await;
-            let actor = SessionActor {
+            let actor = Box::new(SessionActor {
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel"),
                     cwd: cwd.as_str().to_string(),
@@ -956,6 +962,8 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 pending_compile_feedback: Mutex::new(None),
                 current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
+                current_turn_edited_files: Mutex::new(Vec::new()),
+                speculative_tool_results: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
                 last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -1073,7 +1081,8 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),
                 ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
-            };
+                config_cache: std::cell::RefCell::new(None),
+            });
             let (tx, rx) = tokio::sync::oneshot::channel();
             let bridge = actor.agent.borrow().tool_bridge().clone();
             {
@@ -2118,7 +2127,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     ),
                 )
                 .await;
-            let actor = SessionActor {
+            let actor = Box::new(SessionActor {
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel-sampler"),
                     cwd: cwd.as_str().to_string(),
@@ -2214,6 +2223,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 pending_skill_reminders: Mutex::new(Vec::new()),
                 pending_compile_feedback: Mutex::new(None),
                 current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
+                current_turn_edited_files: Mutex::new(Vec::new()),
+                speculative_tool_results: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
                 idle_flush_timeout: None,
                 dream_check_timeout: None,
                 last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -2331,7 +2342,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),
                 ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
-            };
+                config_cache: std::cell::RefCell::new(None),
+            });
             let request_id = ccode_sampler::RequestId::random();
             let request_id_for_task = request_id.clone();
             let sampler_for_task = sampler_handle.clone();

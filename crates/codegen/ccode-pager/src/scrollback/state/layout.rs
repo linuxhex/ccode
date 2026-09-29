@@ -981,23 +981,47 @@ impl ScrollbackState {
                 continue;
             };
 
-            let renderer = EntryRenderer::new(entry, &theme)
-                .with_appearance(self.appearance.clone())
-                .with_cwd(cwd);
             let new_height = match inline_edit_height {
                 Some((edit_id, h)) if edit_id == id => h,
-                _ => renderer.desired_height(entry_area_width),
+                // Fast path for running entries: use block's line count estimate
+                // to avoid expensive full markdown rendering during streaming.
+                // The estimate is O(1) vs O(render_cost) for full output().
+                _ if entry.is_running => {
+                    if let Some(estimated_lines) = entry.block.estimate_line_count(entry_area_width as usize) {
+                        // Add vpad overhead (same logic as assemble_height)
+                        let vpad: u16 = if entry.block.has_vpad_fast() { 2 } else { 0 };
+                        (estimated_lines as u16).saturating_add(vpad)
+                    } else {
+                        // Block doesn't support fast estimation, fall back to full render
+                        let renderer = EntryRenderer::new(entry, &theme)
+                            .with_appearance(self.appearance.clone())
+                            .with_cwd(cwd);
+                        renderer.desired_height(entry_area_width)
+                    }
+                }
+                // Full rendering path for completed entries
+                _ => {
+                    let renderer = EntryRenderer::new(entry, &theme)
+                        .with_appearance(self.appearance.clone())
+                        .with_cwd(cwd);
+                    renderer.desired_height(entry_area_width)
+                }
             };
             let old_height = cache.entries[idx].height;
-            // This entry now has an exact (re)measured height, so it no longer
-            // needs the lazy viewport measurement pass.
-            cache.measured[idx] = true;
+            // Running entries use estimates, not exact measurements.
+            // Only mark as measured for completed entries.
+            if !entry.is_running {
+                cache.measured[idx] = true;
+            }
 
             // A measured prompt's exact truncated height feeds sticky min_height;
             // refresh it unconditionally (the height can be unchanged while the
             // seed is still the conservative MAX) — matching the sibling measure
             // paths. Cheap: prompts are rarely re-dirtied.
             if entry.block.is_user_prompt() {
+                let renderer = EntryRenderer::new(entry, &theme)
+                    .with_appearance(self.appearance.clone())
+                    .with_cwd(cwd);
                 cache.entry_truncated_heights[idx] =
                     renderer.compute_truncated_height(entry_area_width);
             }

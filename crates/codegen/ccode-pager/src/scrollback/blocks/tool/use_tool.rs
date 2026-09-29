@@ -99,7 +99,7 @@ impl UseToolCallBlock {
         }
     }
 
-    /// Render the header line: **Server** `Action`
+    /// Render the header line: **Server** `Action` [elapsed]
     fn header_line(&self, theme: &Theme, muted: bool, max_width: Option<usize>) -> Line<'static> {
         let text_style = if muted {
             theme.muted()
@@ -115,29 +115,74 @@ impl UseToolCallBlock {
 
         let (server, action) = self.split_name();
 
+        // Format elapsed time if available
+        let elapsed_str = self.elapsed_ms.map(|ms| {
+            if ms < 1000 {
+                format!("{}ms", ms)
+            } else if ms < 10_000 {
+                format!("{:.1}s", ms as f64 / 1000.0)
+            } else {
+                format!("{}s", ms / 1000)
+            }
+        });
+
         if server.is_empty() {
             let display = match max_width {
-                Some(w) => truncate_str(&action, w),
+                Some(w) => {
+                    let budget = if elapsed_str.is_some() {
+                        w.saturating_sub(8) // Reserve space for " (1.2s)"
+                    } else {
+                        w
+                    };
+                    truncate_str(&action, budget).to_string()
+                }
                 None => action,
             };
-            return Line::from(vec![Span::styled(display, bold_style)]);
+            
+            let mut spans = vec![Span::styled(display, bold_style)];
+            
+            if let Some(elapsed) = elapsed_str {
+                spans.push(Span::styled(
+                    format!(" ({})", elapsed),
+                    if muted { theme.muted() } else { theme.dim() },
+                ));
+            }
+            
+            return Line::from(spans);
         }
 
         let prefix = format!("{server} ");
 
         match max_width {
             Some(w) => {
-                let budget = w.saturating_sub(prefix.len());
+                let elapsed_len = elapsed_str.as_ref().map_or(0, |e| e.len() + 3); // " (Xs)"
+                let budget = w.saturating_sub(prefix.len() + elapsed_len);
                 let display_action = truncate_str(&action, budget);
-                Line::from(vec![
+                let mut spans = vec![
                     Span::styled(prefix, bold_style),
-                    Span::styled(display_action, action_style),
-                ])
+                    Span::styled(display_action.to_string(), action_style),
+                ];
+                if let Some(elapsed) = elapsed_str {
+                    spans.push(Span::styled(
+                        format!(" ({})", elapsed),
+                        if muted { theme.muted() } else { theme.dim() },
+                    ));
+                }
+                Line::from(spans)
             }
-            None => Line::from(vec![
-                Span::styled(prefix, bold_style),
-                Span::styled(action, action_style),
-            ]),
+            None => {
+                let mut spans = vec![
+                    Span::styled(prefix, bold_style),
+                    Span::styled(action, action_style),
+                ];
+                if let Some(elapsed) = elapsed_str {
+                    spans.push(Span::styled(
+                        format!(" ({})", elapsed),
+                        if muted { theme.muted() } else { theme.dim() },
+                    ));
+                }
+                Line::from(spans)
+            }
         }
     }
 }

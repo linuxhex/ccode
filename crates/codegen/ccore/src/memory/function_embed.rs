@@ -238,7 +238,7 @@ impl CodeBlockParser {
                 brace_depth = brace_depth.saturating_sub(trimmed.chars().filter(|c| *c == '}').count());
 
                 if brace_depth == 0 {
-                    blocks.push(current_fn.take().unwrap());
+                    blocks.push(current_fn.take().expect("expected function block to be present"));
                 }
             }
 
@@ -334,7 +334,7 @@ impl CodeBlockParser {
                 brace_depth = brace_depth.saturating_sub(trimmed.chars().filter(|c| *c == '}').count());
 
                 if brace_depth == 0 {
-                    blocks.push(current_block.take().unwrap());
+                    blocks.push(current_block.take().expect("expected function block to be present"));
                 }
             }
         }
@@ -392,7 +392,7 @@ impl CodeBlockParser {
             if let Some(ref mut block) = current_block {
                 // Python: 块结束 = 缩进回到同级或更低
                 if !trimmed.is_empty() && indent <= current_indent && !trimmed.starts_with('#') {
-                    blocks.push(current_block.take().unwrap());
+                    blocks.push(current_block.take().expect("expected function block to be present"));
                     continue;
                 }
                 block.source.push_str(line);

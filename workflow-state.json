@@ -1,0 +1,15 @@
+{
+  "requirement_id": "CCODE-003",
+  "phase": "implemented",
+  "main_service": "ccode",
+  "multi_service_mode": false,
+  "description": "TUI 整体性能与交互优化，对标 opencode/grok-build",
+  "changes": [
+    "streaming performance: O(1) height estimation for running entries, deferred push, skip cache invalidation",
+    "contextual tool action labels: Reading/Writing/Searching instead of generic Run",
+    "context usage warning icon at 80% threshold",
+    "activity label: Responding -> Generating for clarity",
+    "terminal title bar: contextual tool labels matching status line",
+    "fixed pre-existing ccore compilation errors (set_skills_count, take_task_handles, BufferGuard API)"
+  ]
+}

@@ -1027,7 +1027,6 @@ fn hook_write_deny_refuses_marker_spoof() {
     // kernel enforcement — marker spoof only needs the verify API.
     #[cfg(not(target_os = "linux"))]
     {
-        return;
     }
     #[cfg(target_os = "linux")]
     {

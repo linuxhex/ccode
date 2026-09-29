@@ -143,11 +143,10 @@ impl PermissionRuleSet {
     pub fn evaluate(&self, tool_name: &str, tool_input: &serde_json::Value) -> PermissionDecision {
         // 第一遍：deny 优先扫描，确保安全基线不被后续规则覆盖
         for rule in &self.rules {
-            if let PermissionRule::Deny { .. } = rule {
-                if rule.matches(tool_name, tool_input) {
+            if let PermissionRule::Deny { .. } = rule
+                && rule.matches(tool_name, tool_input) {
                     return rule.to_decision();
                 }
-            }
         }
 
         // 第二遍：按顺序匹配 allow / ask 规则
@@ -214,8 +213,8 @@ impl PermissionRuleSet {
 
         // 加载项目级规则：.ccode/rules/*.json
         let project_rules_dir = project_root.join(".ccode").join("rules");
-        if project_rules_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&project_rules_dir) {
+        if project_rules_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&project_rules_dir) {
                 let mut json_files: Vec<_> = entries
                     .filter_map(|entry| entry.ok())
                     .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
@@ -237,7 +236,6 @@ impl PermissionRuleSet {
                     }
                 }
             }
-        }
 
         Self { rules }
     }
@@ -371,13 +369,13 @@ fn extract_arg_text(tool_input: &serde_json::Value) -> String {
                 return path.to_string();
             }
             // 兜底：将 JSON 值转为紧凑字符串
-            let compact = serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".to_string());
-            compact
+            
+            serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".to_string())
         }
         serde_json::Value::String(s) => s.clone(),
         other => {
-            let compact = serde_json::to_string(other).unwrap_or_else(|_| "".to_string());
-            compact
+            
+            serde_json::to_string(other).unwrap_or_else(|_| "".to_string())
         }
     }
 }
@@ -425,11 +423,10 @@ fn glob_match_impl(pattern: &str, text: &str) -> bool {
             }
             // **/ 可匹配零个路径段：跳过 **/ 直接从下一个路径段开始
             // （如 **/credentials* 匹配 credentials.json）
-            if next_pi < plen && pchars[next_pi] == '/' {
-                if dp(pchars, tchars, next_pi + 1, ti) {
+            if next_pi < plen && pchars[next_pi] == '/'
+                && dp(pchars, tchars, next_pi + 1, ti) {
                     return true;
                 }
-            }
             // ** 匹配零到多个字符
             for end in ti..=tlen {
                 if dp(pchars, tchars, next_pi, end) {

@@ -299,6 +299,154 @@ impl PromptContext {
         };
         Some(prompt)
     }
+
+    /// Decompose this context into typed fragments (借鉴 Codex Context Fragment).
+    ///
+    /// Each fragment carries its own compaction behavior and cache stability
+    /// metadata, enabling the compaction engine to make per-fragment decisions
+    /// instead of treating the system prompt as an opaque monolith.
+    pub fn fragments(&self) -> Vec<PromptFragment> {
+        let mut frags = Vec::with_capacity(8);
+
+        // 1. Base template — always kept, most stable prefix
+        frags.push(PromptFragment {
+            category: FragmentCategory::BaseInstructions,
+            cache_priority: CachePriority::Immutable,
+            compaction: CompactionBehavior::Keep,
+            content: String::new(),
+        });
+
+        // 2. Environment info (OS, shell, cwd, date) — stable within a session
+        let env_info = self.format_environment_fragment();
+        if !env_info.is_empty() {
+            frags.push(PromptFragment {
+                category: FragmentCategory::Environment,
+                cache_priority: CachePriority::Stable,
+                compaction: CompactionBehavior::Keep,
+                content: env_info,
+            });
+        }
+
+        // 3. AGENTS.md — stable within a session, but can be large
+        if let Some(agents_md) = self.format_agents_md_section() {
+            frags.push(PromptFragment {
+                category: FragmentCategory::UserInstructions,
+                cache_priority: CachePriority::Stable,
+                compaction: CompactionBehavior::Summarize,
+                content: agents_md,
+            });
+        }
+
+        // 4. Role instructions — stable identity
+        if let Some(ref role) = self.role_instructions {
+            frags.push(PromptFragment {
+                category: FragmentCategory::UserInstructions,
+                cache_priority: CachePriority::Stable,
+                compaction: CompactionBehavior::Keep,
+                content: role.clone(),
+            });
+        }
+
+        // 5. Memory config — stable
+        if self.memory_enabled {
+            let mem = self.format_memory_fragment();
+            if !mem.is_empty() {
+                frags.push(PromptFragment {
+                    category: FragmentCategory::Capabilities,
+                    cache_priority: CachePriority::Stable,
+                    compaction: CompactionBehavior::Keep,
+                    content: mem,
+                });
+            }
+        }
+
+        // 6. Custom prompt body — variable, most likely to change
+        if let Some(ref body) = self.prompt_body {
+            frags.push(PromptFragment {
+                category: FragmentCategory::CustomBody,
+                cache_priority: CachePriority::Variable,
+                compaction: CompactionBehavior::Drop,
+                content: body.clone(),
+            });
+        }
+
+        frags
+    }
+
+    fn format_environment_fragment(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(ref os) = self.os_name {
+            parts.push(format!("os: {os}"));
+        }
+        if let Some(ref shell) = self.shell_path {
+            parts.push(format!("shell: {shell}"));
+        }
+        if let Some(ref cwd) = self.working_directory {
+            parts.push(format!("cwd: {cwd}"));
+        }
+        if let Some(ref date) = self.current_date {
+            parts.push(format!("date: {date}"));
+        }
+        parts.join(", ")
+    }
+
+    fn format_memory_fragment(&self) -> String {
+        let mut parts = vec!["memory: enabled".to_string()];
+        if let Some(ref p) = self.memory_global_path {
+            parts.push(format!("global_path: {p}"));
+        }
+        if let Some(ref p) = self.memory_workspace_path {
+            parts.push(format!("workspace_path: {p}"));
+        }
+        parts.join(", ")
+    }
+}
+
+/// A typed fragment of the system prompt (借鉴 Codex ContextFragment).
+///
+/// Each fragment is independently manageable during compaction:
+/// - `Keep` fragments are never modified or dropped
+/// - `Summarize` fragments are replaced with a summary when context is tight
+/// - `Drop` fragments are silently removed during compaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptFragment {
+    pub category: FragmentCategory,
+    pub cache_priority: CachePriority,
+    pub compaction: CompactionBehavior,
+    pub content: String,
+}
+
+/// Fragment category — determines ordering and grouping in the final prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FragmentCategory {
+    BaseInstructions,
+    Environment,
+    UserInstructions,
+    Capabilities,
+    TokenBudget,
+    CustomBody,
+}
+
+/// Cache stability tier — drives prompt cache breakpoint placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CachePriority {
+    /// Never changes across the session (system prompt, tool defs).
+    Immutable,
+    /// Changes rarely (env info, AGENTS.md, role).
+    Stable,
+    /// Changes frequently (custom body, injected context).
+    Variable,
+}
+
+/// What the compaction engine should do with this fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactionBehavior {
+    /// Never touch this fragment.
+    Keep,
+    /// Replace with a summary when context is tight.
+    Summarize,
+    /// Silently drop during compaction.
+    Drop,
 }
 #[cfg(test)]
 mod tests {

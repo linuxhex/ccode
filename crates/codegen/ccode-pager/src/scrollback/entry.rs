@@ -116,6 +116,13 @@ pub struct ScrollbackEntry {
     /// same-width rebuild reuse the estimate instead of re-cloning the block's
     /// source text. Cleared by `invalidate_cache`.
     cached_estimate_lines: RefCell<Option<(u16, u16)>>,
+
+    /// Whether this entry's content is immutable (tool finished, message
+    /// complete). Once finalized, `invalidate_cache()` becomes a no-op and the
+    /// cached render is frozen — it is only invalidated by width/theme changes
+    /// inside `ensure_cached()`. This prevents redundant re-renders of
+    /// completed entries during heavy streaming of subsequent entries.
+    pub(super) is_finalized: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +188,7 @@ impl ScrollbackEntry {
             cached_output: RefCell::new(None),
             cached_truncated_height: RefCell::new(None),
             cached_estimate_lines: RefCell::new(None),
+            is_finalized: false,
         }
     }
 
@@ -212,6 +220,7 @@ impl ScrollbackEntry {
             cached_output: RefCell::new(None),
             cached_truncated_height: RefCell::new(None),
             cached_estimate_lines: RefCell::new(None),
+            is_finalized: false,
         }
     }
 
@@ -226,7 +235,7 @@ impl ScrollbackEntry {
         if self.block.has_raw_mode() {
             self.raw = !self.raw;
             self.block.set_raw_mode(self.raw);
-            self.invalidate_cache();
+            self.invalidate_cache_force();
         }
     }
 
@@ -248,7 +257,7 @@ impl ScrollbackEntry {
                     _ => DisplayMode::Collapsed,
                 };
             }
-            self.invalidate_cache();
+            self.invalidate_cache_force();
         }
     }
 
@@ -261,22 +270,47 @@ impl ScrollbackEntry {
     pub fn set_display_mode(&mut self, mode: DisplayMode) {
         if self.display_mode != mode {
             self.display_mode = mode;
-            self.invalidate_cache();
+            self.invalidate_cache_force();
         }
     }
 
     /// Mark the block as completed (no longer running).
     ///
     /// Also clears `is_pending_user_input` since a completed tool cannot
-    /// be waiting on a user response anymore.
+    /// be waiting on a user response anymore. Sets `is_finalized` so the
+    /// render cache is frozen — subsequent `invalidate_cache()` calls become
+    /// no-ops, preventing redundant re-renders during streaming of later entries.
     pub fn mark_completed(&mut self) {
         self.is_running = false;
         self.is_pending_user_input = false;
-        self.invalidate_cache();
+        self.is_finalized = true;
+        self.finished_at = Some(std::time::Instant::now());
     }
 
     /// Invalidate cached output.
+    ///
+    /// No-op for finalized entries: their content is immutable, so the cached
+    /// render remains valid until width/theme changes (handled by the key
+    /// check inside `ensure_cached()`).
     pub fn invalidate_cache(&mut self) {
+        if self.is_finalized {
+            return;
+        }
+        *self.cached_output.borrow_mut() = None;
+        *self.cached_truncated_height.borrow_mut() = None;
+        *self.cached_estimate_lines.borrow_mut() = None;
+    }
+
+    /// Whether this entry has been finalized (content is immutable).
+    pub fn is_finalized(&self) -> bool {
+        self.is_finalized
+    }
+
+    /// Force-invalidate cached output regardless of finalized state.
+    ///
+    /// Used by user-initiated actions (fold toggle, raw toggle, display mode
+    /// change) that alter the rendered output even for finalized entries.
+    pub fn invalidate_cache_force(&mut self) {
         *self.cached_output.borrow_mut() = None;
         *self.cached_truncated_height.borrow_mut() = None;
         *self.cached_estimate_lines.borrow_mut() = None;

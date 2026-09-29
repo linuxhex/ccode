@@ -95,6 +95,7 @@ impl SessionActor {
                 client_version: sampling_config.client_version.clone(),
             });
         self.invalidate_model_auth_memo();
+        *self.config_cache.borrow_mut() = None;
         self.signals_handle()
             .record_model_usage(&sampling_config.model);
         if apply_prompt_override && !skip_prompt_rewrite {
@@ -330,10 +331,10 @@ impl SessionActor {
             self.inject_baseline_skill_reminder(&mut conversation).await;
             self.chat_state_handle.replace_conversation(conversation);
         }
-        save_prompt_context(&self.session_info, &new_prompt_context);
-        save_system_prompt(&self.session_info, &new_system_prompt);
+        save_prompt_context(&self.session_info, &new_prompt_context).await;
+        save_system_prompt(&self.session_info, &new_system_prompt).await;
         let snapshot = self.chat_state_handle.get_conversation().await;
-        persist_chat_history_jsonl_sync(&self.session_info, &snapshot);
+        persist_chat_history_jsonl_sync(&self.session_info, &snapshot).await;
         self.mcp_reminder_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.send_available_commands_update().await;
@@ -371,7 +372,7 @@ impl SessionActor {
             );
             return;
         };
-        save_system_prompt(&self.session_info, &system_prompt);
+        save_system_prompt(&self.session_info, &system_prompt).await;
         if changed {
             tracing::info!(
                 session_id = %self.session_info.id.0,

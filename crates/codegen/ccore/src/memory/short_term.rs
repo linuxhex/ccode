@@ -2,11 +2,38 @@
 //!
 //! 存储当前会话的完整对话历史（永不丢弃），支持语义检索
 //! 向量索引使用纯内存余弦相似度搜索，不依赖外部向量库
+//!
+//! ## 嵌入提供者
+//!
+//! 默认使用伪向量（字节特征哈希），可通过 `set_embedding_provider` 注入
+//! 真实嵌入模型（如 `all-MiniLM-L6-v2`）以提升语义检索质量。
 
 use serde::{Deserialize, Serialize};
 
 /// 伪向量的维度
 const PSEUDO_VECTOR_DIM: usize = 64;
+
+/// 嵌入提供者 trait — 允许注入真实嵌入模型替换伪向量
+///
+/// 实现者可以是本地模型（如 `all-MiniLM-L6-v2`）或远程 API（如 OpenAI embeddings）。
+/// 返回的向量维度应与 `dimension()` 一致。
+#[async_trait::async_trait]
+pub trait EmbeddingProvider: Send + Sync {
+    /// 嵌入向量维度
+    fn dimension(&self) -> usize;
+
+    /// 将文本转换为嵌入向量
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, anyhow::Error>;
+
+    /// 批量嵌入（默认逐条调用，实现者可覆盖为真正批量 API 调用）
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, anyhow::Error> {
+        let mut results = Vec::with_capacity(texts.len());
+        for text in texts {
+            results.push(self.embed(text).await?);
+        }
+        Ok(results)
+    }
+}
 
 /// L1 中的记忆条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +112,8 @@ pub struct ShortTermMemory {
     max_entries: usize,
     /// 当前轮次
     current_turn: u32,
+    /// 可选的真实嵌入提供者（None 时使用伪向量）
+    embedding_provider: Option<std::sync::Arc<dyn EmbeddingProvider>>,
 }
 
 /// 默认容量上限：500 条（足够覆盖常规会话深度，超出时淘汰最旧条目）
@@ -102,7 +131,13 @@ impl ShortTermMemory {
             entries: Vec::new(),
             max_entries: DEFAULT_MAX_ENTRIES,
             current_turn: 0,
+            embedding_provider: None,
         }
+    }
+
+    /// 注入真实嵌入提供者（替换伪向量，提升语义检索质量）
+    pub fn set_embedding_provider(&mut self, provider: std::sync::Arc<dyn EmbeddingProvider>) {
+        self.embedding_provider = Some(provider);
     }
 
     /// 设置最大容量上限

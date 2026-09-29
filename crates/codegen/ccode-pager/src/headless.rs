@@ -683,7 +683,7 @@ async fn fork_then_open(
         ensure_session_id_available(nid, &new_cwd_str)?;
     }
     let parent_is_worktree = parent_session_is_worktree(parent_id, &write_cwd);
-    let payload = fork_session_params(parent_id, &write_cwd, new_id, parent_is_worktree);
+    let payload = fork_session_params(parent_id, &write_cwd, new_id, parent_is_worktree, None);
     let req = acp::ExtRequest::new(
         "ccode.dev/session/fork",
         serde_json::value::to_raw_value(&payload)

@@ -23,6 +23,7 @@ use crate::persistence::ChatPersistence;
 use crate::types::{PruningConfig, TurnCapture};
 
 use state::ChatState;
+use ccode_compaction::cache_aware::CacheAwareState;
 use ccode_sampling_types::{ConversationItem, SamplingConfig};
 
 /// The actor that owns all chat state.
@@ -32,6 +33,9 @@ pub struct ChatStateActor {
     state: ChatState,
     /// Pruning configuration for tool-result trimming.
     pruning_config: PruningConfig,
+    /// Cache-aware microcompact state — tracks which content has already been
+    /// micro-compacted to avoid redundant work and produce `cache_edits`.
+    cache_aware_state: CacheAwareState,
     /// Persistence implementation — owned exclusively, called with `&mut self`.
     persistence: Box<dyn ChatPersistence>,
     /// Channel to receive commands from handles.
@@ -82,6 +86,7 @@ impl ChatStateActor {
         let actor = ChatStateActor {
             state: ChatState::new(initial_conversation, sampling_config),
             pruning_config,
+            cache_aware_state: CacheAwareState::default(),
             persistence,
             cmd_rx,
             event_tx,

@@ -1,0 +1,12 @@
+{
+  "requirement_id": "CCODE-006",
+  "phase": "analysis",
+  "main_service": "ccode",
+  "multi_service_mode": false,
+  "description": "基于 Claude Code 实际源码 + grok-build 对比的新一轮改进分析",
+  "new_sources": [
+    "claude-source-code/claude-code/ — Claude Code 实际 TypeScript 源码（~1884 文件），前序分析均为文档推断",
+    "ref-agents/grok-build/ — ccode 上游，Rust coding agent"
+  ],
+  "changes": []
+}

@@ -261,7 +261,7 @@ impl TerminalBackend for AcpTerminalAdapter {
         let description = request.description;
 
         {
-            let mut tasks = self.tasks.lock().unwrap();
+            let mut tasks = self.tasks.lock().expect("adapter tasks lock poisoned");
             tasks.insert(
                 task_id.clone(),
                 TrackedTask {
@@ -313,7 +313,7 @@ impl TerminalBackend for AcpTerminalAdapter {
             Missing,
         }
         let resolved = {
-            let tasks = self.tasks.lock().unwrap();
+            let tasks = self.tasks.lock().expect("adapter tasks lock poisoned");
             match (live, tasks.get(task_id)) {
                 (Some(output), Some(tracked)) => {
                     let (exit_code, signal) = parse_exit(&output.exit_status);
@@ -373,7 +373,7 @@ impl TerminalBackend for AcpTerminalAdapter {
 
     async fn kill_task(&self, task_id: &str) -> KillOutcome {
         {
-            let mut tasks = self.tasks.lock().unwrap();
+            let mut tasks = self.tasks.lock().expect("adapter tasks lock poisoned");
             if let Some(task) = tasks.get_mut(task_id) {
                 task.explicitly_killed = true;
             }
@@ -400,7 +400,7 @@ impl TerminalBackend for AcpTerminalAdapter {
         let timeout = timeout.unwrap_or(Duration::from_secs(30));
 
         {
-            let mut tasks = self.tasks.lock().unwrap();
+            let mut tasks = self.tasks.lock().expect("adapter tasks lock poisoned");
             if let Some(task) = tasks.get_mut(task_id) {
                 task.block_waited = true;
             }
@@ -430,7 +430,7 @@ impl TerminalBackend for AcpTerminalAdapter {
             }
             Err(_) => {
                 tracing::debug!(task_id, "timeout waiting for terminal exit");
-                let mut tasks = self.tasks.lock().unwrap();
+                let mut tasks = self.tasks.lock().expect("adapter tasks lock poisoned");
                 if let Some(task) = tasks.get_mut(task_id) {
                     task.block_waited = false;
                 }
@@ -442,7 +442,7 @@ impl TerminalBackend for AcpTerminalAdapter {
 
     async fn list_tasks(&self) -> Vec<TaskSnapshot> {
         let task_ids: Vec<String> = {
-            let tasks = self.tasks.lock().unwrap();
+            let tasks = self.tasks.lock().expect("adapter tasks lock poisoned");
             tasks.keys().cloned().collect()
         };
         let mut snapshots = Vec::new();
@@ -456,7 +456,7 @@ impl TerminalBackend for AcpTerminalAdapter {
 
     async fn kill_all_background_tasks(&self) {
         let task_ids: Vec<String> = {
-            let tasks = self.tasks.lock().unwrap();
+            let tasks = self.tasks.lock().expect("adapter tasks lock poisoned");
             tasks
                 .iter()
                 .filter(|(_, t)| !t.completed)

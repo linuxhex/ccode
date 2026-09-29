@@ -149,5 +149,29 @@ pub async fn run_hook(
             let (result, elapsed, http_info, _) = http::run_http_hook(spec, envelope, ctx, mode).await;
             (result, elapsed, http_info, HookRewriteInfo::default())
         }
+        crate::config::HandlerType::Prompt => {
+            // Prompt handler: inject instruction text into model context.
+            let prompt_text = spec.prompt_text.clone().unwrap_or_default();
+            let rewrite = HookRewriteInfo {
+                updated_input: None,
+                additional_context: Some(prompt_text),
+            };
+            (HookRunnerResult::Success, Duration::ZERO, None, rewrite)
+        }
+        crate::config::HandlerType::Agent => {
+            // Agent handler: fork a sub-agent to handle the event.
+            // Full implementation requires ccode-subagent integration.
+            // Returns agent info as additional context for the dispatcher.
+            let agent_info = format!(
+                "[agent_hook: type={}, max_turns={}]",
+                spec.agent_type.as_deref().unwrap_or("unknown"),
+                spec.agent_max_turns.unwrap_or(10),
+            );
+            let rewrite = HookRewriteInfo {
+                updated_input: None,
+                additional_context: Some(agent_info),
+            };
+            (HookRunnerResult::Success, Duration::ZERO, None, rewrite)
+        }
     }
 }

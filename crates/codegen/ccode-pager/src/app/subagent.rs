@@ -448,7 +448,7 @@ pub(crate) fn format_activity_label(activity: &crate::acp::tracker::TurnActivity
     match activity {
         TurnActivity::Thinking => "Thinking".to_string(),
         TurnActivity::Responding => "Responding".to_string(),
-        TurnActivity::ToolRunning { title, description } => {
+        TurnActivity::ToolRunning { title, description, .. } => {
             if let Some(desc) = description
                 .as_deref()
                 .map(str::trim)
@@ -1082,7 +1082,8 @@ mod tests {
         assert_eq!(
             format_activity_label(&TurnActivity::ToolRunning {
                 title: String::new(),
-                description: None
+                description: None,
+                started_at: std::time::Instant::now(),
             }),
             "Running tool",
         );
@@ -1093,7 +1094,8 @@ mod tests {
         assert_eq!(
             format_activity_label(&TurnActivity::ToolRunning {
                 title: "cargo build".into(),
-                description: None
+                description: None,
+                started_at: std::time::Instant::now(),
             }),
             "Running: cargo build",
         );
@@ -1105,6 +1107,7 @@ mod tests {
         let result = format_activity_label(&TurnActivity::ToolRunning {
             title: title.clone(),
             description: None,
+            started_at: std::time::Instant::now(),
         });
         assert_eq!(result, format!("Running: {title}"));
         assert!(!result.contains('\u{2026}'), "no ellipsis at boundary");
@@ -1116,6 +1119,7 @@ mod tests {
         let result = format_activity_label(&TurnActivity::ToolRunning {
             title,
             description: None,
+            started_at: std::time::Instant::now(),
         });
         let expected_prefix = "Running: ".to_string() + "a".repeat(40).as_str();
         assert!(result.starts_with(&expected_prefix));
@@ -1130,6 +1134,7 @@ mod tests {
         let result = format_activity_label(&TurnActivity::ToolRunning {
             title: title.clone(),
             description: None,
+            started_at: std::time::Instant::now(),
         });
         assert_eq!(result, format!("Running: {title}"));
         assert!(!result.contains('\u{2026}'), "no spurious ellipsis");
@@ -1141,11 +1146,11 @@ mod tests {
         let result = format_activity_label(&TurnActivity::ToolRunning {
             title,
             description: None,
+            started_at: std::time::Instant::now(),
         });
         assert!(result.ends_with('\u{2026}'), "truncated with ellipsis");
         let after_prefix = result.strip_prefix("Running: ").unwrap();
-        let content_chars: Vec<char> = after_prefix.chars().collect();
-        assert_eq!(content_chars.len(), 41);
+        assert_eq!(after_prefix.chars().count(), 41);
     }
     #[test]
     fn activity_label_tool_running_multiline_uses_first_line() {
@@ -1153,6 +1158,7 @@ mod tests {
         let result = format_activity_label(&TurnActivity::ToolRunning {
             title: "first line\nsecond line".into(),
             description: None,
+            started_at: std::time::Instant::now(),
         });
         assert_eq!(result, "Running: first line");
     }

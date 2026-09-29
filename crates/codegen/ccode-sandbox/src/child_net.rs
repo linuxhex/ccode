@@ -223,11 +223,21 @@ pub unsafe fn install_namespace_lockdown_filter() -> std::io::Result<()> {
     ns_lockdown::install(&mut filter)
 }
 
+/// # Safety
+/// On non-Linux platforms this is a no-op and always returns `Ok(())`. The
+/// caller must still ensure this is called at the correct point in the
+/// process lifecycle (after fork / before exec) for source-level portability
+/// with the Linux implementation.
 #[cfg(not(target_os = "linux"))]
 pub unsafe fn install_child_network_filter() -> std::io::Result<()> {
     Ok(())
 }
 
+/// # Safety
+/// On non-Linux platforms this is a no-op and always returns `Ok(())`. The
+/// caller must still ensure this is called at the correct point in the
+/// process lifecycle (process-wide, after bwrap re-exec / at apply) for
+/// source-level portability with the Linux implementation.
 #[cfg(not(target_os = "linux"))]
 pub unsafe fn install_namespace_lockdown_filter() -> std::io::Result<()> {
     Ok(())

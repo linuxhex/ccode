@@ -386,6 +386,19 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // For CustomToolCall this includes x_search results.
                 ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
                     match &done_event.item {
+                        rs::OutputItem::FunctionCall(fc) => {
+                            if let Some(&tool_index) =
+                                output_to_tool_index.get(&done_event.output_index)
+                            {
+                                yield SamplingEvent::ToolCallReady {
+                                    request_id: request_id.clone(),
+                                    tool_index,
+                                    id: fc.call_id.clone(),
+                                    name: fc.name.clone(),
+                                    arguments: fc.arguments.clone(),
+                                };
+                            }
+                        }
                         rs::OutputItem::WebSearchCall(ws) => {
                             let result = serde_json::to_value(ws).ok();
                             yield SamplingEvent::BackendToolCallCompleted {

@@ -1369,8 +1369,7 @@ mod tests {
             content: String::new().into(),
             tool_calls,
             model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })
     }
 
@@ -1933,8 +1932,7 @@ mod tests {
                 content: format!("a{i}").into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }));
         }
         hist.push(ConversationItem::User(UserItem {
@@ -2530,8 +2528,7 @@ mod tests {
                 content: format!("a{i}").into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }));
         }
         hist.push(ConversationItem::User(UserItem {

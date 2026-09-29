@@ -12,7 +12,7 @@
 //! - web_fetch: 网页抓取（HTML→文本转换）
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::bridge::ToolExecutor;
@@ -20,7 +20,7 @@ use super::output_formatter;
 use super::path_validator;
 use super::read_tracker;
 use super::gitignore_filter::GitignoreFilter;
-use super::file_transaction::TempFileGuard;
+use super::temp_guard::TempFileGuard;
 
 /// 全局 Gitignore 过滤器
 static GITIGNORE: std::sync::OnceLock<GitignoreFilter> = std::sync::OnceLock::new();
@@ -263,7 +263,7 @@ impl ToolExecutor for ReadExecutor {
     async fn execute(&self, args: &serde_json::Value) -> anyhow::Result<String> {
         let path = args["path"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("read: 缺少 path 参数"))?;
+            .ok_or_else(|| anyhow::anyhow!("read_file: 缺少 path 参数"))?;
 
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
         let limit = args["limit"].as_u64().unwrap_or(2000) as usize;
@@ -293,16 +293,20 @@ impl ToolExecutor for ReadExecutor {
             ));
         }
 
-        // gitignore 过滤
-        if get_gitignore().should_skip(&validation.canonical) {
-            let skipped = path.to_string();
+        // gitignore 状态：**不再拒读**。
+        //
+        // 六家参照（codex/opencode/deepcode-cli/grok-build/claude-code/harness-cli）没有一家
+        // 因为 .gitignore 就拒绝 read_file —— 被忽略的文件恰恰常是要查的东西
+        // （构建产物、本地配置、日志、生成代码）。真正需要拦的是敏感文件，
+        // 那由上面的 `validation.is_sensitive` 负责，与 gitignore 是两件事。
+        // 这里只在输出里挂一条提示，让模型知道该文件不在版本控制内。
+        let gitignored = get_gitignore().should_skip(&validation.canonical);
+        if gitignored {
             tracing::debug!(
                 target: "ccore::tool",
-                path = %skipped,
-                skipped = %skipped,
-                "gitignore filter"
+                path = %path,
+                "reading gitignored file"
             );
-            return Err(anyhow::anyhow!("read: 文件 {} 被 .gitignore 忽略", path));
         }
 
         // 读取文件
@@ -314,8 +318,15 @@ impl ToolExecutor for ReadExecutor {
                 _ => anyhow::anyhow!("read: 读取 {} 失败：{}", path, e),
             })?;
 
-        // 记录文件已被读取（先读后写约束）
-        read_tracker::mark_file_read(path);
+        // 记录文件已被读取（先读后写约束 + 版本追踪）
+        // 使用规范化路径，避免路径别名导致追踪失效
+        if let Ok(metadata) = tokio::fs::metadata(&validation.canonical).await {
+            let stamp = read_tracker::FileStamp::from_metadata(&metadata);
+            read_tracker::mark_file_read_with_stamp(&validation.canonical, stamp);
+        } else {
+            // fallback: 无法获取元数据时只记录路径
+            read_tracker::mark_file_read(&validation.canonical);
+        }
 
         // 文件大小检查
         let total_lines = content.lines().count();
@@ -346,6 +357,10 @@ impl ToolExecutor for ReadExecutor {
         // 文件头
         result.push_str(&output_formatter::format_file_header(path, file_size));
 
+        if gitignored {
+            result.push_str("   注意：该文件被 .gitignore 忽略，不在版本控制内\n");
+        }
+
         // 分页信息
         if offset > 0 || end < lines.len() {
             result.push_str(&format!("   行 {}-{} / {}\n", start + 1, end, total_lines));
@@ -362,7 +377,7 @@ impl ToolExecutor for ReadExecutor {
         Ok(result)
     }
 
-    fn name(&self) -> &str { "read" }
+    fn name(&self) -> &str { "read_file" }
 }
 
 // ─── WriteExecutor ───────────────────────────────────────────────────────────
@@ -374,10 +389,10 @@ impl ToolExecutor for WriteExecutor {
     async fn execute(&self, args: &serde_json::Value) -> anyhow::Result<String> {
         let path = args["path"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("write: 缺少 path 参数"))?;
+            .ok_or_else(|| anyhow::anyhow!("write_file: 缺少 path 参数"))?;
         let content = args["content"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("write: 缺少 content 参数"))?;
+            .ok_or_else(|| anyhow::anyhow!("write_file: 缺少 content 参数"))?;
 
         // 先读后写约束：检查文件是否已被读取
         // 如果文件已存在，必须先读取
@@ -390,16 +405,18 @@ impl ToolExecutor for WriteExecutor {
             ));
         }
 
-        // 如果文件已存在，检查是否已读取
+        // 如果文件已存在，检查是否已读取（严格版本检查）
         if validation.canonical.exists() {
-            let has_been_read = read_tracker::global_read_tracker().has_been_read(path);
+            let has_been_read = read_tracker::global_read_tracker().has_been_read(&validation.canonical);
             tracing::debug!(
                 target: "ccore::tool",
                 path = %path,
+                canonical = %validation.canonical.display(),
                 has_been_read = has_been_read,
                 "read-before-write check"
             );
-            read_tracker::require_file_read(path)?;
+            // write_file 全量覆盖风险高，使用严格版本检查
+            read_tracker::require_file_read(&validation.canonical)?;
         }
 
         // 二进制内容检测
@@ -409,19 +426,27 @@ impl ToolExecutor for WriteExecutor {
             ));
         }
 
+        // 文件检查点：编辑前保存原始内容（用于回滚）
+        if validation.canonical.exists() {
+            if let Ok(original) = tokio::fs::read_to_string(&validation.canonical).await {
+                super::file_history::global_file_history()
+                    .capture_before_edit(&validation.canonical, &original);
+            }
+        }
+
         // 确保父目录存在
         if let Some(parent) = validation.canonical.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
         // 原子写入：先写临时文件，再 rename
-        let tmp_path = validation.canonical.with_extension("tmp");
+        let tmp_path = unique_tmp_path(&validation.canonical);
         let _guard = TempFileGuard::new(&tmp_path);
         tokio::fs::write(&tmp_path, content).await
-            .map_err(|e| anyhow::anyhow!("write: 写入临时文件失败：{}", e))?;
+            .map_err(|e| anyhow::anyhow!("write_file: 写入临时文件失败：{}", e))?;
 
         tokio::fs::rename(&tmp_path, &validation.canonical).await
-            .map_err(|e| anyhow::anyhow!("write: 重命名到目标路径失败：{}", e))?;
+            .map_err(|e| anyhow::anyhow!("write_file: 重命名到目标路径失败：{}", e))?;
 
         // rename 成功，标记 guard 已提交（临时文件不再存在，无需清理）
         // _guard 在此处 drop，但文件已 rename 走，TempFileGuard 检查 exists() 为 false
@@ -429,7 +454,7 @@ impl ToolExecutor for WriteExecutor {
 
         // 写入后验证
         let verified = tokio::fs::read_to_string(&validation.canonical).await
-            .map_err(|e| anyhow::anyhow!("write: 验证写入失败：{}", e))?;
+            .map_err(|e| anyhow::anyhow!("write_file: 验证写入失败：{}", e))?;
 
         if verified.len() != content.len() {
             return Err(anyhow::anyhow!(
@@ -441,7 +466,254 @@ impl ToolExecutor for WriteExecutor {
         Ok(format!("已写入 {} ({} bytes, 已验证)", path, content.len()))
     }
 
-    fn name(&self) -> &str { "write" }
+    fn name(&self) -> &str { "write_file" }
+}
+
+// ─── 唯一临时文件路径（不用 with_extension，照抄 ccode-update unique_temp_sibling）────────
+
+/// 生成唯一临时文件路径：`<base>.{pid}-{seq}.tmp`
+///
+/// 不用 `Path::with_extension("tmp")`——它会**替换**最后一段扩展名而非追加
+/// （`data.json` → `data.tmp`），若仓里已有 `data.tmp` 会静默覆盖。
+/// PID + per-process counter 保证唯一，不会撞到既有文件。
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    path.with_file_name(name)
+}
+
+// ─── 模糊匹配（借鉴 codex seek_sequence 四级阶梯）──────────────────────────────
+
+/// 归一化行尾：`\r\n` / `\r` → `\n`
+fn normalize_line_endings(s: &str) -> String {
+    // 快速路径：无 \r 则原样返回
+    if !s.contains('\r') {
+        return s.to_string();
+    }
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            result.push('\n');
+            if chars.peek() == Some(&'\n') {
+                chars.next(); // 消费 \r\n 中的 \n
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// 检测文件主导行尾风格，返回 `\r\n` 或 `\n`
+fn detect_line_ending(s: &str) -> &str {
+    let crlf_count = s.matches("\r\n").count();
+    let lf_count = s.matches('\n').count();
+    if crlf_count > 0 && crlf_count * 2 >= lf_count {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// 将内容的行尾统一为目标风格
+///
+/// 先归一化为 LF，再按目标风格转换。
+fn preserve_eol(content: &str, target_eol: &str) -> String {
+    let normalized = normalize_line_endings(content);
+    if target_eol == "\r\n" {
+        normalized.replace('\n', "\r\n")
+    } else {
+        normalized
+    }
+}
+
+/// Unicode 标点归一化（照抄 codex seek_sequence.rs:81-99 的 normalise）
+fn unicode_normalise(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| match c {
+            // 各种 dash/hyphen → ASCII '-'
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            // 花单引号 → '\''
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            // 花双引号 → '"'
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            // 不间断空格等 → 普通空格
+            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+            | '\u{3000}' => ' ',
+            other => other,
+        })
+        .collect::<String>()
+}
+
+/// 在 content 中模糊查找 search 的**第一个**匹配。
+///
+/// 四级阶梯（从严到宽），与 codex `seek_sequence` 同构：
+/// 1. 精确子串匹配
+/// 2. 行尾归一化后匹配（解决 CRLF vs LF）
+/// 3. 逐行 trim 后匹配（解决首尾空白差异）
+/// 4. 逐行 Unicode 归一化后匹配（解决花引号/破折号等）
+///
+/// 返回 `(匹配起始字节偏移, 匹配字节长度)` 或 `None`。
+fn fuzzy_match_one(content: &str, search: &str) -> Option<(usize, usize)> {
+    // 1. 精确匹配
+    if let Some(byte_pos) = content.find(search) {
+        return Some((byte_pos, search.len()));
+    }
+
+    // 2. 行尾归一化后匹配
+    let norm_content = normalize_line_endings(content);
+    let norm_search = normalize_line_endings(search);
+    if norm_content != content || norm_search != search {
+        if let Some(pos) = norm_content.find(&norm_search) {
+            // 把归一化后的偏移映射回原文：在原文中找到对应位置
+            return map_normalized_offset(content, &norm_content, pos, norm_search.len());
+        }
+    }
+
+    // 3. 逐行 trim 匹配
+    if let Some(result) = fuzzy_match_linewise(content, search, |a, b| a.trim() == b.trim()) {
+        return Some(result);
+    }
+
+    // 4. 逐行 Unicode 归一化匹配
+    if let Some(result) = fuzzy_match_linewise(content, search, |a, b| {
+        unicode_normalise(a) == unicode_normalise(b)
+    }) {
+        return Some(result);
+    }
+
+    None
+}
+
+/// 把归一化内容中的字节偏移映射回原始内容。
+/// 因为归一化只可能缩短（\r\n → \n），所以原文偏移 ≥ 归一化偏移。
+fn map_normalized_offset(original: &str, _normalized: &str, norm_pos: usize, norm_len: usize) -> Option<(usize, usize)> {
+    // 逐字符对齐：归一化后的每个字符对应原文中一个或两个字符（\r\n → \n）
+    let mut orig_idx = 0usize;
+    let mut norm_idx = 0usize;
+    let mut orig_start = None;
+    let mut orig_end = None;
+
+    let orig_bytes = original.as_bytes();
+
+    while orig_idx < original.len() && norm_idx <= norm_pos + norm_len {
+        if norm_idx == norm_pos {
+            orig_start = Some(orig_idx);
+        }
+        if norm_idx == norm_pos + norm_len {
+            orig_end = Some(orig_idx);
+            break;
+        }
+
+        // 原文是 \r\n 而归一化是 \n
+        if orig_bytes[orig_idx] == b'\r' && orig_idx + 1 < original.len() && orig_bytes[orig_idx + 1] == b'\n' {
+            orig_idx += 2; // \r\n
+        } else {
+            orig_idx += 1;
+        }
+        norm_idx += 1;
+    }
+
+    // 处理 norm_pos + norm_len 恰好在末尾的情况
+    if orig_start.is_some() && orig_end.is_none() && norm_idx == norm_pos + norm_len {
+        orig_end = Some(orig_idx);
+    }
+
+    match (orig_start, orig_end) {
+        (Some(s), Some(e)) if e > s => Some((s, e - s)),
+        _ => None,
+    }
+}
+
+/// 逐行模糊匹配：把 content 和 search 都按行切分，用 `line_eq` 比较行对。
+/// 返回第一个匹配的起始字节偏移和字节长度。
+fn fuzzy_match_linewise<F>(content: &str, search: &str, line_eq: F) -> Option<(usize, usize)>
+where
+    F: Fn(&str, &str) -> bool,
+{
+    let content_lines: Vec<&str> = content.lines().collect();
+    let search_lines: Vec<&str> = search.lines().collect();
+    if search_lines.is_empty() || search_lines.len() > content_lines.len() {
+        return None;
+    }
+
+    // 逐行起始字节偏移表
+    let mut line_start_offsets: Vec<usize> = Vec::with_capacity(content_lines.len() + 1);
+    let mut current_offset = 0usize;
+    for line in &content_lines {
+        line_start_offsets.push(current_offset);
+        current_offset += line.len();
+        // 跳过行尾分隔符
+        if current_offset < content.len() {
+            if content.as_bytes().get(current_offset) == Some(&b'\r') {
+                current_offset += 1;
+                if current_offset < content.len() && content.as_bytes().get(current_offset) == Some(&b'\n') {
+                    current_offset += 1;
+                }
+            } else if content.as_bytes().get(current_offset) == Some(&b'\n') {
+                current_offset += 1;
+            }
+        }
+    }
+    line_start_offsets.push(current_offset); // 末尾哨兵
+
+    for start_line in 0..=content_lines.len() - search_lines.len() {
+        let mut matched = true;
+        for (i, search_line) in search_lines.iter().enumerate() {
+            if !line_eq(content_lines[start_line + i], search_line) {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            let byte_start = line_start_offsets[start_line];
+            // 匹配区域到 search 最后一行结尾（含行尾）
+            let last_line_end = line_start_offsets[start_line + search_lines.len() - 1]
+                + content_lines[start_line + search_lines.len() - 1].len();
+            return Some((byte_start, last_line_end - byte_start));
+        }
+    }
+    None
+}
+
+/// 查找 search 在 content 中的所有匹配位置（用于 replace_all）。
+/// 先尝试精确匹配，若命中则直接返回所有精确位置；
+/// 否则用 `fuzzy_match_one` 找到第一个模糊匹配，返回单元素列表。
+fn fuzzy_find_all(content: &str, search: &str) -> Vec<(usize, usize)> {
+    // 精确匹配：收集所有出现位置
+    let mut exact_positions = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(pos) = content[search_from..].find(search) {
+        let abs_pos = search_from + pos;
+        exact_positions.push((abs_pos, search.len()));
+        search_from = abs_pos + search.len();
+        if search_from >= content.len() {
+            break;
+        }
+    }
+    if !exact_positions.is_empty() {
+        return exact_positions;
+    }
+
+    // 模糊匹配：只返回第一个（多模糊匹配替换风险太大）
+    if let Some(match_info) = fuzzy_match_one(content, search) {
+        vec![match_info]
+    } else {
+        Vec::new()
+    }
 }
 
 // ─── EditExecutor ────────────────────────────────────────────────────────────
@@ -459,7 +731,7 @@ impl ToolExecutor for EditExecutor {
     async fn execute(&self, args: &serde_json::Value) -> anyhow::Result<String> {
         let path = args["path"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("edit: 缺少 path 参数"))?;
+            .ok_or_else(|| anyhow::anyhow!("search_replace: 缺少 path 参数"))?;
 
         let mode = args["mode"].as_str().unwrap_or("replace");
 
@@ -469,57 +741,84 @@ impl ToolExecutor for EditExecutor {
 
         if !validation.in_workspace {
             return Err(anyhow::anyhow!(
-                "edit: 路径 {} 在工作目录外，操作被拒绝", path
+                "search_replace: 路径 {} 在工作目录外，操作被拒绝", path
             ));
         }
 
         // 先读后写约束：编辑前必须先读取文件
-        read_tracker::require_file_read(path)?;
+        // search_replace 有精确匹配的天然保护，使用宽松版本检查
+        read_tracker::require_file_read_lenient(&validation.canonical)?;
+
+        // 文件检查点：编辑前保存原始内容（用于回滚）
+        if let Ok(original) = tokio::fs::read_to_string(&validation.canonical).await {
+            super::file_history::global_file_history()
+                .capture_before_edit(&validation.canonical, &original);
+        }
 
         match mode {
             "replace" => self.execute_replace(args, &validation.canonical).await,
             "insert" => self.execute_insert(args, &validation.canonical).await,
             "write" => self.execute_write(args, &validation.canonical).await,
-            _ => Err(anyhow::anyhow!("edit: 未知模式 '{}'，支持: replace/insert/write", mode)),
+            _ => Err(anyhow::anyhow!("search_replace: 未知模式 '{}'，支持: replace/insert/write", mode)),
         }
     }
 
-    fn name(&self) -> &str { "edit" }
+    fn name(&self) -> &str { "search_replace" }
 }
 
 impl EditExecutor {
     /// 替换模式（原有逻辑升级，含 diff 展示）
     async fn execute_replace(&self, args: &serde_json::Value, canonical: &Path) -> anyhow::Result<String> {
-        let old_text = args["old_text"]
+        // 参数名以工具声明（bridge.rs 的 search_replace 定义）为权威：search / replace。
+        // 同时回退兼容 old_text / new_text，避免既有调用方在改名后失效。
+        let old_text = args["search"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("edit: 缺少 old_text 参数"))?;
-        let new_text = args["new_text"]
+            .or_else(|| args["old_text"].as_str())
+            .ok_or_else(|| anyhow::anyhow!("search_replace: 缺少 search 参数"))?;
+        let new_text = args["replace"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("edit: 缺少 new_text 参数"))?;
+            .or_else(|| args["new_text"].as_str())
+            .ok_or_else(|| anyhow::anyhow!("search_replace: 缺少 replace 参数"))?;
 
         let content = tokio::fs::read_to_string(canonical).await
-            .map_err(|e| anyhow::anyhow!("edit: 读取 {} 失败：{}", canonical.display(), e))?;
+            .map_err(|e| anyhow::anyhow!("search_replace: 读取 {} 失败：{}", canonical.display(), e))?;
+
+        // EOL 保真：检测原文件行尾风格，替换文本统一为同一风格
+        let file_eol = detect_line_ending(&content);
+        let new_text = if file_eol == "\r\n" {
+            preserve_eol(new_text, file_eol)
+        } else {
+            new_text.to_string()
+        };
+        let new_text = new_text.as_str();
 
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
+        // 模糊查找所有匹配（四级阶梯：精确 → 行尾归一 → trim → Unicode 归一）
+        let matches = fuzzy_find_all(&content, old_text);
+        if matches.is_empty() {
+            return Err(anyhow::anyhow!("search_replace: 未找到搜索文本（已尝试精确/行尾归一/空白容忍/Unicode 归一四级匹配）"));
+        }
+
         let (new_content, _match_count) = if replace_all {
-            let count = content.matches(old_text).count();
-            if count == 0 {
-                return Err(anyhow::anyhow!("edit: 未找到搜索文本"));
+            // 从后往前替换，避免偏移失效
+            let mut result = content.clone();
+            let count = matches.len();
+            for (pos, len) in matches.iter().rev() {
+                result.replace_range(*pos..*pos + *len, new_text);
             }
-            (content.replace(old_text, new_text), count)
+            (result, count)
         } else {
-            let count = content.matches(old_text).count();
-            if count == 0 {
-                return Err(anyhow::anyhow!("edit: 未找到搜索文本"));
-            }
-            if count > 1 {
+            if matches.len() > 1 {
                 return Err(anyhow::anyhow!(
-                    "edit: 找到 {} 处匹配，请提供更具体的上下文或设置 replace_all=true",
-                    count
+                    "search_replace: 找到 {} 处匹配，请提供更具体的上下文或设置 replace_all=true",
+                    matches.len()
                 ));
             }
-            (content.replacen(old_text, new_text, 1), 1)
+            let (pos, len) = matches[0];
+            let mut result = content.clone();
+            result.replace_range(pos..pos + len, new_text);
+            (result, 1)
         };
 
         // 生成 diff（借鉴 Claude Code 编辑后的 diff 展示）
@@ -555,12 +854,15 @@ impl EditExecutor {
             .ok_or_else(|| anyhow::anyhow!("edit(insert): 缺少 content 参数"))?;
 
         let file_content = tokio::fs::read_to_string(canonical).await
-            .map_err(|e| anyhow::anyhow!("edit: 读取 {} 失败：{}", canonical.display(), e))?;
+            .map_err(|e| anyhow::anyhow!("search_replace: 读取 {} 失败：{}", canonical.display(), e))?;
+
+        // EOL 保真：检测原文件行尾风格
+        let file_eol = detect_line_ending(&file_content);
 
         let lines: Vec<&str> = file_content.lines().collect();
         if after_line > lines.len() {
             return Err(anyhow::anyhow!(
-                "edit: after_line {} 超出文件行数 {}",
+                "search_replace: after_line {} 超出文件行数 {}",
                 after_line, lines.len()
             ));
         }
@@ -571,7 +873,7 @@ impl EditExecutor {
         }
         new_lines.extend_from_slice(&lines[after_line..]);
 
-        let new_content = new_lines.join("\n");
+        let new_content = new_lines.join(file_eol);
 
         // 生成 diff
         let diff = output_formatter::generate_unified_diff(
@@ -596,7 +898,7 @@ impl EditExecutor {
 
     /// 原子写入
     async fn atomic_write(&self, path: &Path, content: &str) -> anyhow::Result<()> {
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = unique_tmp_path(path);
         let _guard = TempFileGuard::new(&tmp_path);
         tokio::fs::write(&tmp_path, content).await
             .map_err(|e| anyhow::anyhow!("写入临时文件失败：{}", e))?;
@@ -634,9 +936,42 @@ impl EditExecutor {
     }
 }
 
+// ─── 检索子进程超时 ──────────────────────────────────────────────────────────
+
+/// `rg` / `find` 子进程墙钟上限。
+///
+/// bash 与 web 工具早就有超时，只有检索工具漏了：一个灾难性回溯正则
+/// （如 `(a+)+b` 撞上长行）能让 `rg` 跑到天荒地老，agent 就此挂死且无任何输出。
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 带超时地跑一个检索子进程
+///
+/// `kill_on_drop(true)` 是关键：超时后 `timeout` 丢弃 future，`Child` 随之 drop，
+/// tokio 才会真正给子进程发 kill。缺这一句就只是「我们不等了」而不是「它停了」，
+/// 会留下孤儿 `rg` 继续吃 CPU。
+async fn run_search_command(
+    mut cmd: tokio::process::Command,
+    tool: &str,
+) -> anyhow::Result<Result<std::process::Output, std::io::Error>> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(SEARCH_TIMEOUT, cmd.output()).await {
+        Ok(res) => Ok(res),
+        Err(_) => Err(anyhow::anyhow!(
+            "{}: 检索超过 {} 秒被中止。\n\
+             常见原因：模式在大目录上过于宽泛，或正则存在灾难性回溯。\n\
+             建议：用 path 参数缩小范围，或简化正则（避免嵌套量词如 (a+)+）",
+            tool,
+            SEARCH_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 // ─── GrepExecutor ────────────────────────────────────────────────────────────
 
 pub struct GrepExecutor;
+
+/// grep 结果最多回显多少行（超出部分连同真实总数一起告知模型）
+const GREP_MAX_LINES: usize = 200;
 
 #[async_trait::async_trait]
 impl ToolExecutor for GrepExecutor {
@@ -655,7 +990,6 @@ impl ToolExecutor for GrepExecutor {
         cmd.arg("--line-number")
             .arg("--max-count").arg("200")
             .arg("--glob").arg("!.git");  // 排除 .git 目录（显式 gitignore 兼容）
-
         if case_insensitive {
             cmd.arg("-i");
         }
@@ -682,7 +1016,7 @@ impl ToolExecutor for GrepExecutor {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let output = cmd.output().await;
+        let output = run_search_command(cmd, "grep").await?;
 
         match output {
             Ok(out) => {
@@ -698,7 +1032,15 @@ impl ToolExecutor for GrepExecutor {
                         .len();
 
                     let mut result = format!("在 {} 个文件中找到 {} 处匹配\n\n", file_count, match_count);
-                    result.push_str(&output_formatter::truncate_lines(&stdout, 200));
+                    result.push_str(&output_formatter::truncate_lines(&stdout, GREP_MAX_LINES));
+                    // 截断必须回传模型，否则它会以为已经看完全部匹配并据此下结论
+                    if match_count > GREP_MAX_LINES {
+                        result.push_str(&format!(
+                            "\n\n[仅显示前 {} 行，共 {} 行匹配。另外 rg 对每个文件也最多报 200 处 —— \
+                             结果可能不完整，请用 path/include/file_type 收窄范围后重查]",
+                            GREP_MAX_LINES, match_count
+                        ));
+                    }
                     Ok(result)
                 }
             }
@@ -731,14 +1073,22 @@ impl GrepExecutor {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
 
-        let output = cmd.output().await
+        let output = run_search_command(cmd, "grep").await?
             .map_err(|e| anyhow::anyhow!("grep: 回退搜索也失败：{}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if stdout.is_empty() {
             Ok("未找到匹配结果".into())
         } else {
-            Ok(output_formatter::truncate_lines(&stdout, 200))
+            let match_count = stdout.lines().count();
+            let mut result = output_formatter::truncate_lines(&stdout, GREP_MAX_LINES);
+            if match_count > GREP_MAX_LINES {
+                result.push_str(&format!(
+                    "\n\n[仅显示前 {} 行，共 {} 行匹配 —— 结果不完整，请收窄范围后重查]",
+                    GREP_MAX_LINES, match_count
+                ));
+            }
+            Ok(result)
         }
     }
 }
@@ -746,6 +1096,9 @@ impl GrepExecutor {
 // ─── GlobExecutor ────────────────────────────────────────────────────────────
 
 pub struct GlobExecutor;
+
+/// glob 最多回显多少个文件（超出部分连同真实总数一起告知模型）
+const GLOB_MAX_FILES: usize = 200;
 
 #[async_trait::async_trait]
 impl ToolExecutor for GlobExecutor {
@@ -756,6 +1109,46 @@ impl ToolExecutor for GlobExecutor {
         let path = args["path"].as_str().unwrap_or(".");
         let exclude = args["exclude"].as_str();
 
+        // 首选 `rg --files`：
+        // - 支持 `**`（`find -name` 只匹配单层 basename，`crates/**/*.rs` 在它下面永远无结果）
+        // - 原生按 .gitignore 过滤，而不是先列全量再事后剔除
+        // 只有 rg 不存在时才退回 `find`。
+        let mut cmd = tokio::process::Command::new("rg");
+        cmd.arg("--files")
+            .arg("--glob").arg(pattern)
+            .arg("--glob").arg("!.git");
+        if let Some(exc) = exclude {
+            cmd.arg("--glob").arg(format!("!{}", exc));
+        }
+        cmd.arg(path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+
+        let stdout = match run_search_command(cmd, "glob").await? {
+            Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return self.fallback_glob(pattern, path, exclude).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("glob: 执行失败：{}", e)),
+        };
+
+        Ok(Self::format_matches(stdout.lines(), pattern, false))
+    }
+
+    fn name(&self) -> &str { "glob" }
+}
+
+impl GlobExecutor {
+    /// `find` 回退（ripgrep 不可用时）
+    ///
+    /// 语义弱于 rg：`-name` 只匹配 basename，`**` 不生效；gitignore 只能事后过滤。
+    /// 这一点会在输出里明确告知模型，避免它把「没找到」当成「不存在」。
+    async fn fallback_glob(
+        &self,
+        pattern: &str,
+        path: &str,
+        exclude: Option<&str>,
+    ) -> anyhow::Result<String> {
         let mut cmd = tokio::process::Command::new("find");
         cmd.arg(path)
             .arg("-name")
@@ -763,57 +1156,84 @@ impl ToolExecutor for GlobExecutor {
             .arg("-type")
             .arg("f");
 
-        // 排除模式
         if let Some(exc) = exclude {
-            cmd.arg("-not")
-                .arg("-path")
-                .arg(exc);
+            cmd.arg("-not").arg("-path").arg(exc);
         }
 
         // 排除常见忽略目录
-        cmd.arg("-not")
-            .arg("-path")
-            .arg("*/.git/*")
-            .arg("-not")
-            .arg("-path")
-            .arg("*/node_modules/*")
-            .arg("-not")
-            .arg("-path")
-            .arg("*/target/*");
+        cmd.arg("-not").arg("-path").arg("*/.git/*")
+            .arg("-not").arg("-path").arg("*/node_modules/*")
+            .arg("-not").arg("-path").arg("*/target/*");
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
 
-        let output = cmd.output().await
+        let output = run_search_command(cmd, "glob").await?
             .map_err(|e| anyhow::anyhow!("glob: 执行失败：{}", e))?;
-
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.is_empty() {
-            Ok("未找到匹配文件".into())
-        } else {
-            // 使用 gitignore 过滤结果
-            let gitignore = get_gitignore();
-            let mut lines: Vec<&str> = stdout.lines()
-                .filter(|line| {
-                    let path = std::path::Path::new(line);
-                    !gitignore.should_skip(path)
-                })
-                .take(200)
-                .collect();
-            lines.sort();
-            let count = lines.len();
-            let mut result = format!("找到 {} 个文件\n\n", count);
-            result.push_str(&lines.join("\n"));
-            Ok(result)
-        }
+
+        // find 不认 .gitignore，只能列完再剔
+        let gitignore = get_gitignore();
+        let kept: Vec<&str> = stdout
+            .lines()
+            .filter(|line| !gitignore.should_skip(std::path::Path::new(line)))
+            .collect();
+
+        Ok(Self::format_matches(kept.into_iter(), pattern, true))
     }
 
-    fn name(&self) -> &str { "glob" }
+    /// 统一的结果格式化：**先排序再截断**，且总数用真实值
+    ///
+    /// 此前是 `.take(200)` 之后才 sort，于是既拿到的是任意子集、
+    /// 又把「找到 200 个」当成总数报给模型 —— 5000 个匹配时这是错误信息，
+    /// 模型会据此认定已看全。
+    fn format_matches<'a>(
+        lines: impl Iterator<Item = &'a str>,
+        pattern: &str,
+        degraded: bool,
+    ) -> String {
+        let mut all: Vec<&str> = lines.filter(|l| !l.trim().is_empty()).collect();
+        if all.is_empty() {
+            let mut msg = format!("未找到匹配 {} 的文件", pattern);
+            if degraded {
+                msg.push_str(
+                    "\n（当前用 find 回退：`-name` 只匹配文件名单层，`**` 不生效。\
+                     装上 ripgrep 后 glob 支持完整 glob 语法）",
+                );
+            }
+            return msg;
+        }
+
+        all.sort();
+        let total = all.len();
+        let shown = total.min(GLOB_MAX_FILES);
+
+        let mut result = format!("找到 {} 个文件\n\n", total);
+        result.push_str(&all[..shown].join("\n"));
+        if total > shown {
+            result.push_str(&format!(
+                "\n\n[仅显示前 {} 个（按路径排序），共 {} 个 —— 请用更精确的 pattern 或 path 收窄]",
+                shown, total
+            ));
+        }
+        if degraded {
+            result.push_str(
+                "\n\n[注意：ripgrep 不可用，已用 find 回退，`**` 等 glob 语法不生效]",
+            );
+        }
+        result
+    }
 }
 
 // ─── ListDirExecutor ─────────────────────────────────────────────────────────
 
 pub struct ListDirExecutor;
+
+/// list_dir 最多回显多少个条目
+///
+/// 此前无上限：在仓库根上 `recursive=true` 会把 `target/` 整棵树列出来，
+/// 单次工具结果就能撑爆上下文窗口。
+const LIST_DIR_MAX_ENTRIES: usize = 500;
 
 #[async_trait::async_trait]
 impl ToolExecutor for ListDirExecutor {
@@ -824,7 +1244,16 @@ impl ToolExecutor for ListDirExecutor {
         let max_depth = args["max_depth"].as_u64().unwrap_or(if recursive { 3 } else { 1 }) as usize;
 
         let mut entries = Vec::new();
-        self.list_dir_recursive(path, 0, max_depth, show_hidden, &mut entries).await?;
+        let mut skipped = 0usize;
+        self.list_dir_recursive(
+            path,
+            0,
+            max_depth,
+            show_hidden,
+            &mut entries,
+            &mut skipped,
+        )
+        .await?;
 
         // 排序：目录在前，文件在后
         entries.sort_by(|a, b| {
@@ -838,16 +1267,34 @@ impl ToolExecutor for ListDirExecutor {
         });
 
         if entries.is_empty() {
-            Ok("(空目录)".into())
-        } else {
-            Ok(entries.join("\n"))
+            let mut msg = String::from("(空目录)");
+            if skipped > 0 {
+                msg.push_str(&format!("\n[{} 个条目被 .gitignore 过滤]", skipped));
+            }
+            return Ok(msg);
         }
+
+        let total = entries.len();
+        let shown = total.min(LIST_DIR_MAX_ENTRIES);
+        let mut out = entries[..shown].join("\n");
+        if total > shown {
+            out.push_str(&format!(
+                "\n\n[仅显示前 {} 个条目，共 {} 个 —— 用 path 指向更具体的子目录，\
+                 或用 glob 按模式检索]",
+                shown, total
+            ));
+        }
+        if skipped > 0 {
+            out.push_str(&format!("\n[另有 {} 个条目被 .gitignore 过滤]", skipped));
+        }
+        Ok(out)
     }
 
     fn name(&self) -> &str { "list_dir" }
 }
 
 impl ListDirExecutor {
+    #[allow(clippy::too_many_arguments)]
     async fn list_dir_recursive(
         &self,
         path: &str,
@@ -855,20 +1302,33 @@ impl ListDirExecutor {
         max_depth: usize,
         show_hidden: bool,
         entries: &mut Vec<String>,
+        skipped: &mut usize,
     ) -> anyhow::Result<()> {
         if depth >= max_depth {
+            return Ok(());
+        }
+        // 已经攒够回显量还要继续递归，只会白读磁盘
+        if entries.len() >= LIST_DIR_MAX_ENTRIES * 4 {
             return Ok(());
         }
 
         let mut dir_entries = tokio::fs::read_dir(path).await
             .map_err(|e| anyhow::anyhow!("list_dir: 读取 {} 失败：{}", path, e))?;
 
+        let gitignore = get_gitignore();
         let mut items = Vec::new();
         while let Some(entry) = dir_entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
 
             // 隐藏文件过滤
             if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+
+            // gitignore 过滤：与 grep/glob 对齐。
+            // 缺这一条时 `target/`、`node_modules/` 会被整棵列进上下文。
+            if gitignore.should_skip(&entry.path()) {
+                *skipped += 1;
                 continue;
             }
 
@@ -891,7 +1351,15 @@ impl ListDirExecutor {
             // 递归处理子目录
             if meta.is_dir() && depth + 1 < max_depth && !name.starts_with('.') {
                 let sub_path = format!("{}/{}", path, name);
-                Box::pin(self.list_dir_recursive(&sub_path, depth + 1, max_depth, show_hidden, entries)).await?;
+                Box::pin(self.list_dir_recursive(
+                    &sub_path,
+                    depth + 1,
+                    max_depth,
+                    show_hidden,
+                    entries,
+                    skipped,
+                ))
+                .await?;
             }
         }
 
@@ -1050,10 +1518,10 @@ impl ToolExecutor for WebFetchExecutor {
 
 /// 简单的 HTML → 文本转换（去除标签）
 fn html_to_text(html: &str) -> String {
-    let re_script = regex::Regex::new(r"(?s)<script[^>]*>.*?</script>").unwrap_or_else(|_| regex::Regex::new("").unwrap());
-    let re_style = regex::Regex::new(r"(?s)<style[^>]*>.*?</style>").unwrap_or_else(|_| regex::Regex::new("").unwrap());
-    let re_tag = regex::Regex::new(r"<[^>]+>").unwrap_or_else(|_| regex::Regex::new("").unwrap());
-    let re_entity = regex::Regex::new(r"&nbsp;|&amp;|&lt;|&gt;|&quot;").unwrap_or_else(|_| regex::Regex::new("").unwrap());
+    let re_script = regex::Regex::new(r"(?s)<script[^>]*>.*?</script>").unwrap_or_else(|_| regex::Regex::new("").expect("hardcoded regex should compile"));
+    let re_style = regex::Regex::new(r"(?s)<style[^>]*>.*?</style>").unwrap_or_else(|_| regex::Regex::new("").expect("hardcoded regex should compile"));
+    let re_tag = regex::Regex::new(r"<[^>]+>").unwrap_or_else(|_| regex::Regex::new("").expect("hardcoded regex should compile"));
+    let re_entity = regex::Regex::new(r"&nbsp;|&amp;|&lt;|&gt;|&quot;").unwrap_or_else(|_| regex::Regex::new("").expect("hardcoded regex should compile"));
 
     let text = re_script.replace_all(html, "").to_string();
     let text = re_style.replace_all(&text, "").to_string();
@@ -1080,6 +1548,8 @@ pub fn register_builtin_executors(bridge: &mut super::bridge::ToolBridge) {
     bridge.register_executor(Box::new(super::lsp::LspExecutor));
     bridge.register_executor(Box::new(super::skill::SkillExecutor));
 
+    // 注册 pre_hook：Write/Edit 前自动创建 git 快照，支持 undo
+    bridge.register_pre_hook(Box::new(super::git_snapshot_hook::GitSnapshotHook));
     // 注册 post_hook：Write/Edit 后对 .rs 文件运行 rustfmt --check 做增量验证
     bridge.register_post_hook(Box::new(super::rustfmt_hook::RustfmtHook));
 }
@@ -1172,16 +1642,17 @@ mod tests {
 
     #[test]
     fn test_read_tracker_integration() {
+        use std::path::Path;
         // 使用全局追踪器
         read_tracker::global_read_tracker().clear();
 
         // 未读取的文件应返回错误
-        let result = read_tracker::require_file_read("/test/unread.rs");
+        let result = read_tracker::require_file_read_lenient(Path::new("/test/unread.rs"));
         assert!(result.is_err());
 
         // 读取后应成功
-        read_tracker::mark_file_read("/test/read.rs");
-        let result = read_tracker::require_file_read("/test/read.rs");
+        read_tracker::mark_file_read(Path::new("/test/read.rs"));
+        let result = read_tracker::require_file_read_lenient(Path::new("/test/read.rs"));
         assert!(result.is_ok());
 
         // 清理
@@ -1204,5 +1675,186 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    // ── fuzzy_match 测试 ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_fuzzy_match_exact() {
+        let content = "fn main() {\n    println!(\"hello\");\n}\n";
+        let search = "println!(\"hello\");";
+        let result = fuzzy_match_one(content, search);
+        assert!(result.is_some());
+        let (pos, len) = result.unwrap();
+        assert_eq!(&content[pos..pos + len], search);
+    }
+
+    #[test]
+    fn test_fuzzy_match_crlf_content_lf_search() {
+        // 文件用 CRLF，模型给 LF search —— 这是 P0-1 的核心场景
+        let content = "fn main() {\r\n    println!(\"hello\");\r\n}\r\n";
+        let search = "println!(\"hello\");";
+        let result = fuzzy_match_one(content, search);
+        assert!(result.is_some(), "CRLF 内容 + LF search 应通过行尾归一化命中");
+    }
+
+    #[test]
+    fn test_fuzzy_match_crlf_multiline() {
+        // 多行 search，文件用 CRLF
+        let content = "fn old() {\r\n    42\r\n}\r\nfn new() {}\r\n";
+        let search = "fn old() {\n    42\n}";
+        let result = fuzzy_match_one(content, search);
+        assert!(result.is_some(), "多行 CRLF 内容 + LF search 应命中");
+    }
+
+    #[test]
+    fn test_fuzzy_match_trim_whitespace() {
+        // 文件行尾有空格，search 没有
+        let content = "fn main() {   \n    let x = 1;   \n}\n";
+        let search = "fn main() {\n    let x = 1;\n}";
+        let result = fuzzy_match_one(content, search);
+        assert!(result.is_some(), "首尾空白差异应通过 trim 级命中");
+    }
+
+    #[test]
+    fn test_fuzzy_match_unicode_normalise() {
+        // 文件用花引号和 en-dash，search 用直引号和 ASCII dash
+        let content = "let s = \u{201c}hello\u{201d}; // range 1\u{2013}3";
+        let search = "let s = \"hello\"; // range 1-3";
+        let result = fuzzy_match_one(content, search);
+        assert!(result.is_some(), "Unicode 标点差异应通过归一化级命中");
+    }
+
+    #[test]
+    fn test_fuzzy_match_no_match() {
+        let content = "fn main() {}\n";
+        let search = "fn missing() {}";
+        assert!(fuzzy_match_one(content, search).is_none());
+    }
+
+    #[test]
+    fn test_fuzzy_find_all_multiple_exact() {
+        let content = "let x = 1;\nlet x = 1;\nlet x = 1;\n";
+        let search = "let x = 1;";
+        let matches = fuzzy_find_all(content, search);
+        assert_eq!(matches.len(), 3, "精确匹配应找到全部 3 处");
+    }
+
+    #[test]
+    fn test_fuzzy_find_all_none() {
+        let content = "fn main() {}\n";
+        let search = "missing";
+        let matches = fuzzy_find_all(content, search);
+        assert!(matches.is_empty());
+    }
+
+    // ── unique_tmp_path 测试 ──────────────────────────────────────────────
+
+    #[test]
+    fn test_unique_tmp_path_preserves_extension() {
+        let path = std::path::Path::new("/tmp/data.json");
+        let tmp = unique_tmp_path(path);
+        let name = tmp.file_name().unwrap().to_str().unwrap();
+        // 应该是 data.json.{pid}-{seq}.tmp，不是 data.tmp
+        assert!(name.starts_with("data.json."), "扩展名应保留: {}", name);
+        assert!(name.ends_with(".tmp"), "应以 .tmp 结尾: {}", name);
+    }
+
+    #[test]
+    fn test_unique_tmp_path_no_extension() {
+        let path = std::path::Path::new("/tmp/Makefile");
+        let tmp = unique_tmp_path(path);
+        let name = tmp.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("Makefile."), "无扩展名文件应保留全名: {}", name);
+        assert!(name.ends_with(".tmp"));
+    }
+
+    #[test]
+    fn test_unique_tmp_path_unique() {
+        let path = std::path::Path::new("/tmp/data.json");
+        let tmp1 = unique_tmp_path(path);
+        let tmp2 = unique_tmp_path(path);
+        assert_ne!(tmp1, tmp2, "连续调用应产生不同路径（seq 递增）");
+    }
+
+    #[test]
+    fn test_unique_tmp_path_not_with_extension() {
+        // 对比 with_extension 的行为：它会替换扩展名
+        let path = std::path::Path::new("/tmp/data.json");
+        let with_ext = path.with_extension("tmp");
+        let unique = unique_tmp_path(path);
+        // with_extension 给 "data.tmp"，unique 给 "data.json.*.tmp"
+        assert_eq!(with_ext.file_name().unwrap(), "data.tmp");
+        assert_ne!(unique, with_ext, "unique_tmp_path 不应等于 with_extension");
+    }
+
+    // ── normalize_line_endings 测试 ───────────────────────────────────────
+
+    #[test]
+    fn test_normalize_line_endings_crlf() {
+        assert_eq!(normalize_line_endings("a\r\nb\r\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn test_normalize_line_endings_cr_only() {
+        assert_eq!(normalize_line_endings("a\rb\r"), "a\nb\n");
+    }
+
+    #[test]
+    fn test_normalize_line_endings_already_lf() {
+        assert_eq!(normalize_line_endings("a\nb\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn test_normalize_line_endings_no_newlines() {
+        assert_eq!(normalize_line_endings("hello"), "hello");
+    }
+
+    // ── glob 结果格式化（P1-4 / P1-6）──
+
+    #[test]
+    fn glob_reports_true_total_not_the_truncated_count() {
+        // 回归 P1-6：此前先 take(200) 再报数，5000 个匹配会被报成「找到 200 个」，
+        // 模型据此认定已经看全
+        let paths: Vec<String> = (0..GLOB_MAX_FILES + 50)
+            .map(|i| format!("src/f{:04}.rs", i))
+            .collect();
+        let out = GlobExecutor::format_matches(paths.iter().map(|s| s.as_str()), "*.rs", false);
+
+        assert!(out.starts_with(&format!("找到 {} 个文件", GLOB_MAX_FILES + 50)));
+        assert!(out.contains(&format!("仅显示前 {} 个", GLOB_MAX_FILES)));
+        assert!(out.contains("收窄"));
+    }
+
+    #[test]
+    fn glob_sorts_before_truncating() {
+        // 回归 P1-6 的另一半：此前 take 在 sort 之前，拿到的是文件系统顺序的任意子集
+        let mut paths: Vec<String> = (0..GLOB_MAX_FILES + 10)
+            .map(|i| format!("f{:04}.rs", i))
+            .collect();
+        paths.reverse(); // 模拟文件系统给出的乱序
+        let out = GlobExecutor::format_matches(paths.iter().map(|s| s.as_str()), "*.rs", false);
+
+        // 排序后的前 200 个必须是 f0000..f0199，而不是倒序的尾巴
+        assert!(out.contains("f0000.rs"));
+        assert!(out.contains("f0199.rs"));
+        assert!(!out.contains("f0209.rs"));
+    }
+
+    #[test]
+    fn glob_no_match_flags_find_degradation() {
+        let empty: Vec<&str> = Vec::new();
+        let rg_msg = GlobExecutor::format_matches(empty.iter().copied(), "**/*.rs", false);
+        assert!(!rg_msg.contains("find 回退"));
+
+        let find_msg = GlobExecutor::format_matches(empty.iter().copied(), "**/*.rs", true);
+        assert!(find_msg.contains("`**` 不生效"), "回退时必须告知模型语义已降级");
+    }
+
+    #[test]
+    fn glob_skips_blank_lines() {
+        let lines = ["a.rs", "", "  ", "b.rs"];
+        let out = GlobExecutor::format_matches(lines.iter().copied(), "*.rs", false);
+        assert!(out.starts_with("找到 2 个文件"));
     }
 }

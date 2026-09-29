@@ -1,5 +1,6 @@
-//! ConversationRequest assembly — image compaction, pruning, repair, memory injection.
+//! ConversationRequest assembly — image compaction, pruning, cache-aware microcompact, repair, memory injection.
 
+use ccode_compaction::cache_aware::CacheAwareState;
 use ccode_sampling_types::{
     ContentPart, ConversationItem, ConversationRequest, ToolSpec, TraceContext,
 };
@@ -75,7 +76,7 @@ impl ChatStateActor {
 
         // Only allocate the mutable working copy when a mutation path is taken.
         let mut eviction: Option<ImageEvictionOutcome> = None;
-        let items = if needs_mutation {
+        let (items, cache_edits) = if needs_mutation {
             let mut items = self.state.conversation.clone();
 
             // Step 1: When the body nears the 50 MB ceiling, evict oldest
@@ -96,16 +97,27 @@ impl ChatStateActor {
                 prune_conversation(&mut items, &self.pruning_config);
             }
 
+            // Step 2.5: Cache-aware microcompact — skip already-compacted
+            // content, compact only new/changed tool results. Produces
+            // `cache_edits` fingerprints for prompt-cache savings.
+            // Runs on the request clone (same as prune), never mutates
+            // the in-memory conversation.
+            let cache_edits = if self.cache_aware_state.is_enabled() {
+                cache_aware_micro_compact(&mut items, &mut self.cache_aware_state)
+            } else {
+                vec![]
+            };
+
             // Step 3: Inject memory reminder into the system message
             if let Some(reminder) = memory_reminder {
                 inject_memory_reminder(&mut items, &reminder);
             }
 
-            items
+            (items, cache_edits)
         } else {
             // Hot path: no pruning, no memory reminder, no old images —
             // clone directly into the request without any intermediate mutation passes.
-            self.state.conversation.clone()
+            (self.state.conversation.clone(), vec![])
         };
 
         // Per-turn image-budget record for local verification. Emitted on the
@@ -143,6 +155,7 @@ impl ChatStateActor {
             x_ccode_user_id: None,
             trace,
             prompt_cache_key: None,
+            cache_edits,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
         }
@@ -158,6 +171,59 @@ impl ChatStateActor {
 /// Returns `true` when `total_tokens` exceeds 50% of `context_window`.
 pub(crate) fn should_prune(total_tokens: u64, context_window: std::num::NonZeroU64) -> bool {
     total_tokens > context_window.get() / 2
+}
+
+/// Cache-aware microcompact on the request clone.
+///
+/// Walks tool results, fingerprints each by `tool_call_id + content_head_hash`,
+/// skips those already seen in `state`, and replaces oversized content with a
+/// summary + cleared marker. Returns fingerprints of newly compacted items
+/// for `cache_edits` injection into the API request.
+fn cache_aware_micro_compact(
+    items: &mut [ConversationItem],
+    state: &mut CacheAwareState,
+) -> Vec<String> {
+    use ccode_compaction::micro_compact::{MicroCompactConfig, CLEARED_MESSAGE};
+
+    let config = MicroCompactConfig::default();
+    let mut cache_edits = Vec::new();
+
+    for item in items.iter_mut() {
+        let ConversationItem::ToolResult(tr) = item else {
+            continue;
+        };
+
+        // Fingerprint: tool_call_id + FNV-1a hash of content head
+        let content_head: String = tr.content.chars().take(64).collect();
+        let fp = format!("{}:{}", tr.tool_call_id, fnv1a_hash(&content_head));
+
+        if state.contains(&fp) {
+            continue; // Already compacted, skip
+        }
+
+        // Compact oversized tool results (content length as proxy for age)
+        let content_len = tr.content.chars().count();
+        if content_len > config.summary_max_chars {
+            let summary: String = tr.content.chars().take(config.summary_max_chars).collect();
+            let new_content = format!("{summary}\n\n{CLEARED_MESSAGE}");
+            tr.content = std::sync::Arc::<str>::from(new_content);
+        }
+
+        state.record(&fp);
+        cache_edits.push(fp);
+    }
+
+    cache_edits
+}
+
+/// FNV-1a 64-bit hash → hex string. Not cryptographic; used for dedup only.
+fn fnv1a_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
 }
 
 /// Prune old, large tool results from the conversation in place.

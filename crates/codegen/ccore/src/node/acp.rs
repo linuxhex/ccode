@@ -75,6 +75,13 @@ impl AcpNode {
             return;
         }
 
+        // 仅在显式设置 CCODE_ACP_STDOUT=1 时启动 stdio 任务
+        // 避免与 TUI Node 的 headless 纯文本输出交错
+        if std::env::var("CCODE_ACP_STDOUT").is_err() {
+            tracing::debug!("AcpNode: ACP stdio 未启用，跳过 stdio 任务启动");
+            return;
+        }
+
         let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<serde_json::Value>();
         self.stdout_tx = Some(stdout_tx.clone());
 
@@ -189,7 +196,9 @@ impl AcpNode {
                     node_id_str,
                     &payload,
                 ) {
-                    let _ = transport.publish_data(&msg).await;
+                    if let Err(e) = transport.publish_data(&msg).await {
+                        tracing::warn!(target: "ccore::acp", "publish_data failed: {e}");
+                    }
                 }
             }
             "session/cancel" => {
@@ -204,7 +213,9 @@ impl AcpNode {
                     node_id_str,
                     &payload,
                 ) {
-                    let _ = transport.publish_data(&msg).await;
+                    if let Err(e) = transport.publish_data(&msg).await {
+                        tracing::warn!(target: "ccore::acp", "publish_data failed: {e}");
+                    }
                 }
             }
             _ => {
@@ -253,7 +264,7 @@ impl Node for AcpNode {
 
         // agent/{id}/output → stdout JSON-RPC notification
         if topic.ends_with("/output") {
-            let payload: serde_json::Value = serde_json::from_slice(&msg.payload)
+            let payload: serde_json::Value = FrameCodec::decode_payload(&msg)
                 .unwrap_or_default();
             let channel = payload["channel"].as_str().unwrap_or("text");
             let content = payload["content"].as_str().unwrap_or("");
@@ -277,7 +288,7 @@ impl Node for AcpNode {
 
         // agent/{id}/permission → stdout JSON-RPC notification
         if topic.ends_with("/permission") {
-            let payload: serde_json::Value = serde_json::from_slice(&msg.payload)
+            let payload: serde_json::Value = FrameCodec::decode_payload(&msg)
                 .unwrap_or_default();
             let notification = JsonRpcNotification {
                 jsonrpc: "2.0",

@@ -231,6 +231,11 @@ pub struct UserItem {
     /// prompts), so markers stamped before and after a restart may disagree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_index: Option<usize>,
+    /// Set when this user message corrects or contradicts a prior assistant
+    /// response. Enables the compaction pipeline to preserve correction pairs
+    /// and flag retracted assistant content.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_correction: bool,
 }
 
 /// Assistant response with tool calls.
@@ -242,7 +247,7 @@ pub struct UserItem {
 /// interleaved order the model emits. Old sessions on disk may still carry
 /// a `reasoning` field; serde silently ignores it on read (no
 /// `deny_unknown_fields`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssistantItem {
     /// Text content of the response
     pub content: Arc<str>,
@@ -266,6 +271,15 @@ pub struct AssistantItem {
     /// backends that don't echo it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<crate::ReasoningEffort>,
+    /// Set when the user identifies this assistant response as incorrect.
+    /// The compaction pipeline preserves retracted content with a [RETRACTED]
+    /// prefix rather than summarizing it as valid knowledge.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retracted: bool,
+    /// Optional explanation of why this response was retracted (e.g. the
+    /// user's correction text). Helps the model avoid repeating the error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retracted_reason: Option<String>,
 }
 
 /// Tool result message
@@ -583,6 +597,11 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_ccode_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// Cache-aware microcompact edits: fingerprints of content that was
+    /// micro-compacted in this request, to be injected as `cache_edits` in
+    /// the API call for prompt-cache savings. Empty when cache-aware
+    /// microcompact is disabled or found nothing new to compact.
+    pub cache_edits: Vec<String>,
 }
 
 impl ConversationRequest {
@@ -897,10 +916,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: None,
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -910,10 +926,7 @@ impl ConversationItem {
     pub fn user_with_parts(parts: Vec<ContentPart>) -> Self {
         Self::User(UserItem {
             content: parts,
-            synthetic_reason: None,
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -928,9 +941,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::CompactionMeta),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -946,9 +957,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::SystemReminder),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -975,9 +984,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::ProjectInstructions),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -989,8 +996,7 @@ impl ConversationItem {
             }],
             synthetic_reason: Some(SyntheticReason::WorkingDirectorySwitch),
             cwd_generation: Some(cwd_generation),
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1005,9 +1011,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::AutoContinue),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1022,9 +1026,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::AutoRecovery),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1040,9 +1042,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::Interjection),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1053,9 +1053,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::TaskCompleted),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1066,9 +1064,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::SubagentCompleted),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1079,9 +1075,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::NotificationDrain),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1092,9 +1086,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::GoalSummary),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1109,9 +1101,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::GoalClassifierNudge),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1122,9 +1112,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::SchedulerFired),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1135,9 +1123,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             synthetic_reason: Some(SyntheticReason::StopHookFeedback),
-            cwd_generation: None,
-            prior_turn_interrupt: None,
-            prompt_index: None,
+            ..Default::default()
         })
     }
 
@@ -1146,9 +1132,7 @@ impl ConversationItem {
         Self::Assistant(AssistantItem {
             content: Arc::<str>::from(content.into()),
             tool_calls: Vec::new(),
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })
     }
 
@@ -1162,8 +1146,7 @@ impl ConversationItem {
             content: Arc::<str>::from(content.into()),
             tool_calls: Vec::new(),
             model_id: Some(model_id.into()),
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })
     }
 
@@ -1172,9 +1155,7 @@ impl ConversationItem {
         Self::Assistant(AssistantItem {
             content: Arc::<str>::from(""),
             tool_calls,
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })
     }
 
@@ -1684,8 +1665,7 @@ impl From<ChatRequestMessage> for ConversationItem {
                     content: Arc::<str>::from(content),
                     tool_calls,
                     model_id,
-                    model_fingerprint: None,
-                    reasoning_effort: None,
+                    ..Default::default()
                 })
             }
             Role::Tool => {
@@ -1991,9 +1971,7 @@ impl From<ChatResponseMessage> for ConversationItem {
         ConversationItem::Assistant(AssistantItem {
             content: Arc::<str>::from(content),
             tool_calls,
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })
     }
 }
@@ -2109,6 +2087,7 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
         model_id: Some(model_id),
         model_fingerprint,
         reasoning_effort,
+        ..Default::default()
     }));
 
     items
@@ -3413,8 +3392,7 @@ impl From<crate::messages::MessagesResponse> for ConversationItem {
             content: Arc::<str>::from(content),
             tool_calls,
             model_id: Some(resp.model),
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })
     }
 }
@@ -4319,8 +4297,7 @@ mod tests {
                 arguments: r#"{"path": "/test.txt"}"#.into(),
             }],
             model_id: Some("ccode-3".to_string()),
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         };
 
         let item = ConversationItem::Assistant(assistant.clone());
@@ -4774,8 +4751,7 @@ mod tests {
             content: "The answer is 42.".into(),
             tool_calls: vec![],
             model_id: Some("ccode-3".to_string()),
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         });
 
         for item in [reasoning_item, assistant_item] {
@@ -4806,8 +4782,7 @@ mod tests {
                 content: "The answer is 4.".into(),
                 tool_calls: vec![],
                 model_id: Some("ccode-3".to_string()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             // New user message
             ConversationItem::user("Now what is 3+3?"),
@@ -4866,8 +4841,7 @@ mod tests {
                 content: "Hi!".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ]);
 
@@ -5507,8 +5481,7 @@ mod tests {
             content: "Here is the answer.".into(),
             tool_calls: vec![],
             model_id: Some("messages-compatible-model".into()),
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         });
 
         // Reasoning now lives as a sibling `ConversationItem::Reasoning`,
@@ -5703,8 +5676,7 @@ mod tests {
                 content: "I'll look at the code.".into(),
                 tool_calls: vec![],
                 model_id: Some("messages-compatible-model".into()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             // Completed tool pair
             ConversationItem::Assistant(AssistantItem {
@@ -5715,16 +5687,14 @@ mod tests {
                     arguments: r#"{"path":"src/main.rs"}"#.into(),
                 }],
                 model_id: Some("messages-compatible-model".into()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("call_1", "fn main() {}"),
             ConversationItem::Assistant(AssistantItem {
                 content: "I see the issue.".into(),
                 tool_calls: vec![],
                 model_id: Some("messages-compatible-model".into()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             // Mid-turn: orphaned tool_use (no result yet)
             ConversationItem::Assistant(AssistantItem {
@@ -5735,8 +5705,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 model_id: Some("messages-compatible-model".into()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ]
     }
@@ -6469,9 +6438,7 @@ mod tests {
                     ).into(),
                 },
             ],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })];
 
         transform_conversation_cwd(&mut items, worktree, root);
@@ -6536,8 +6503,7 @@ mod tests {
                 content: format!("I edited {worktree}/src/main.rs").into(),
                 tool_calls: vec![],
                 model_id: Some("ccode-3".to_string()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ];
 
@@ -6593,8 +6559,7 @@ mod tests {
                     ).into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ];
 
@@ -6644,8 +6609,7 @@ mod tests {
                     arguments: format!(r#"{{"target_file":"{root}/src/main.rs"}}"#).into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ];
 
@@ -6751,9 +6715,7 @@ mod tests {
                 name: "run_terminal_cmd".to_string(),
                 arguments: r#"{"command":"echo hello"}"#.into(),
             }],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })];
 
         transform_conversation_cwd(&mut items, "/old/path", "/new/path");
@@ -6867,8 +6829,7 @@ mod tests {
                 content: String::new().into(),
                 tool_calls: vec![],
                 model_id: Some("test-model".to_string()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             })],
             stop_reason: Some(StopReason::Stop),
             usage: None,
@@ -6887,9 +6848,7 @@ mod tests {
             items: vec![ConversationItem::Assistant(AssistantItem {
                 content: "Here is my answer.".into(),
                 tool_calls: vec![],
-                model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             })],
             stop_reason: Some(StopReason::Stop),
             usage: None,
@@ -6913,8 +6872,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             })],
             stop_reason: Some(StopReason::ToolCalls),
             usage: None,
@@ -7109,9 +7067,7 @@ mod tests {
         let item = AssistantItem {
             content: "Hello".into(),
             tool_calls: vec![],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         }
         .with_model_id("ccode-3");
 
@@ -7198,9 +7154,7 @@ mod tests {
                     arguments: "{}".into(),
                 })
                 .collect(),
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         })
     }
 
@@ -7901,8 +7855,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result_with_images(
                 "call_1",
@@ -8434,9 +8387,7 @@ mod tests {
                 ConversationItem::Assistant(AssistantItem {
                     content: String::new().into(),
                     tool_calls: Vec::new(),
-                    model_id: None,
-                    model_fingerprint: None,
-                    reasoning_effort: None,
+                    ..Default::default()
                 }),
             ],
             stop_reason: Some(StopReason::Stop),
@@ -9668,8 +9619,7 @@ mod tests {
                     arguments: Arc::<str>::from("{}"),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("call_1", "file contents"),
         ]);

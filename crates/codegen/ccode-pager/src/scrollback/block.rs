@@ -88,6 +88,16 @@ pub trait BlockContent {
         true
     }
 
+    /// Fast vpad check without context (for streaming height estimation).
+    ///
+    /// Default: delegates to `has_vpad()` with a default context.
+    /// Blocks can override for a cheaper check.
+    fn has_vpad_fast(&self) -> bool {
+        // Most blocks have constant vpad regardless of context.
+        // AgentMessageBlock returns false for has_vpad, so this default is safe.
+        true
+    }
+
     /// Whether block supports raw mode toggle.
     fn has_raw_mode(&self) -> bool {
         false
@@ -240,6 +250,20 @@ pub trait BlockContent {
     /// affordance row or fallback caption per detected diagram). Default: `0`.
     fn estimate_extra_rows(&self) -> u16 {
         0
+    }
+
+    /// Fast line count estimate for streaming entries.
+    ///
+    /// Returns `Some(lines)` if the block can provide a fast estimate without
+    /// full rendering (syntect highlighting + word-wrap). Returns `None` to
+    /// fall back to full rendering via `output()`.
+    ///
+    /// Used during streaming to avoid expensive re-renders on every token.
+    /// The estimate is intentionally conservative to avoid layout jumps.
+    ///
+    /// Default: `None` (all blocks fall back to full rendering).
+    fn estimate_line_count(&self, _width: usize) -> Option<usize> {
+        None
     }
 
     /// For media blocks on terminals without inline-graphics support, returns

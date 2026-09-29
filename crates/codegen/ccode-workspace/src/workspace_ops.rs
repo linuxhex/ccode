@@ -1763,6 +1763,10 @@ mod tests {
             timeout_ms: 5000,
             source_dir: std::path::PathBuf::from("/home/u/.ccode/hooks"),
             extra_env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            async_run: false,
+            async_rewake: false,
+            rewake_message: None,
+            condition: None,
         };
         let mut registry = ccode_hooks::discovery::HookRegistry::default();
         registry.append_specs(vec![spec]);
@@ -1803,6 +1807,12 @@ mod tests {
                 E::SubagentEnd => HookEventNameWire::SubagentEnd,
                 E::PreCompact => HookEventNameWire::PreCompact,
                 E::PostCompact => HookEventNameWire::PostCompact,
+                E::TaskCreated => HookEventNameWire::TaskCreated,
+                E::TaskCompleted => HookEventNameWire::TaskCompleted,
+                E::FileChanged => HookEventNameWire::FileChanged,
+                E::ConfigChange => HookEventNameWire::ConfigChange,
+                E::PermissionRequest => HookEventNameWire::PermissionRequest,
+                E::CwdChanged => HookEventNameWire::CwdChanged,
             }
         }
         for e in [
@@ -1821,6 +1831,12 @@ mod tests {
             E::SubagentEnd,
             E::PreCompact,
             E::PostCompact,
+            E::TaskCreated,
+            E::TaskCompleted,
+            E::FileChanged,
+            E::ConfigChange,
+            E::PermissionRequest,
+            E::CwdChanged,
         ] {
             assert_eq!(
                 serde_json::to_value(e).unwrap(),
@@ -1857,6 +1873,10 @@ mod tests {
                 timeout_ms,
                 source_dir,
                 extra_env,
+                async_run,
+                async_rewake,
+                rewake_message,
+                condition,
             } = spec;
             let event = serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
             HookSpecWire {
@@ -1872,6 +1892,10 @@ mod tests {
                 timeout_ms,
                 source_dir,
                 extra_env,
+                async_run,
+                async_rewake,
+                rewake_message,
+                condition,
             }
         }
         let spec = HookSpec {
@@ -1888,6 +1912,12 @@ mod tests {
             timeout_ms: 5000,
             source_dir: std::path::PathBuf::from("/home/u/.ccode/hooks"),
             extra_env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            // Non-default values so the shape assertion exercises the fields
+            // rather than comparing two nulls.
+            async_run: true,
+            async_rewake: true,
+            rewake_message: Some("hook wants the model back".to_string()),
+            condition: Some("Bash(git *)".to_string()),
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),

@@ -62,6 +62,12 @@ pub struct PromptCacheTracker {
     break_reasons: RwLock<HashMap<String, u64>>,
 }
 
+impl Default for PromptCacheTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PromptCacheTracker {
     pub fn new() -> Self {
         Self {
@@ -83,8 +89,8 @@ impl PromptCacheTracker {
 
         if reason.is_none() && !event.cache_hit {
             // 自动检测断裂原因
-            let last_sys = self.last_system_prompt_hash.read().unwrap();
-            let last_tool = self.last_tool_schema_hash.read().unwrap();
+            let last_sys = self.last_system_prompt_hash.read().expect("cache_break RwLock poisoned");
+            let last_tool = self.last_tool_schema_hash.read().expect("cache_break RwLock poisoned");
 
             if let Some(last) = *last_sys {
                 if last != event.system_prompt_hash {
@@ -105,26 +111,26 @@ impl PromptCacheTracker {
 
         // 更新hash
         {
-            let mut last_sys = self.last_system_prompt_hash.write().unwrap();
+            let mut last_sys = self.last_system_prompt_hash.write().expect("cache_break RwLock poisoned");
             *last_sys = Some(event.system_prompt_hash);
         }
         {
-            let mut last_tool = self.last_tool_schema_hash.write().unwrap();
+            let mut last_tool = self.last_tool_schema_hash.write().expect("cache_break RwLock poisoned");
             *last_tool = Some(event.tool_schema_hash);
         }
 
         // 更新统计
         if event.cache_hit {
-            *self.total_hits.write().unwrap() += 1;
+            *self.total_hits.write().expect("cache_break RwLock poisoned") += 1;
         } else {
-            *self.total_misses.write().unwrap() += 1;
+            *self.total_misses.write().expect("cache_break RwLock poisoned") += 1;
         }
-        *self.total_cache_creation_tokens.write().unwrap() += event.cache_creation_tokens;
-        *self.total_cache_read_tokens.write().unwrap() += event.cache_read_tokens;
+        *self.total_cache_creation_tokens.write().expect("cache_break RwLock poisoned") += event.cache_creation_tokens;
+        *self.total_cache_read_tokens.write().expect("cache_break RwLock poisoned") += event.cache_read_tokens;
 
         if let Some(ref r) = reason {
             let key = format!("{:?}", r);
-            *self.break_reasons.write().unwrap().entry(key).or_insert(0) += 1;
+            *self.break_reasons.write().expect("cache_break RwLock poisoned").entry(key).or_insert(0) += 1;
         }
 
         // 日志
@@ -146,10 +152,10 @@ impl PromptCacheTracker {
         // 存储事件
         let mut stored = event;
         stored.break_reason = reason;
-        self.events.write().unwrap().push(stored);
+        self.events.write().expect("cache_break RwLock poisoned").push(stored);
 
         // 限制事件历史大小
-        let mut events = self.events.write().unwrap();
+        let mut events = self.events.write().expect("cache_break RwLock poisoned");
         if events.len() > 100 {
             events.drain(0..50);
         }
@@ -157,8 +163,8 @@ impl PromptCacheTracker {
 
     /// 获取缓存命中率
     pub fn hit_rate(&self) -> f64 {
-        let hits = *self.total_hits.read().unwrap();
-        let misses = *self.total_misses.read().unwrap();
+        let hits = *self.total_hits.read().expect("cache_break RwLock poisoned");
+        let misses = *self.total_misses.read().expect("cache_break RwLock poisoned");
         let total = hits + misses;
         if total == 0 { return 0.0; }
         hits as f64 / total as f64
@@ -167,19 +173,19 @@ impl PromptCacheTracker {
     /// 获取缓存节省的token数
     pub fn tokens_saved(&self) -> usize {
         // 缓存读取的token即节省的token
-        *self.total_cache_read_tokens.read().unwrap()
+        *self.total_cache_read_tokens.read().expect("cache_break RwLock poisoned")
     }
 
     /// 获取统计信息
     pub fn stats(&self) -> CacheStats {
         CacheStats {
-            total_hits: *self.total_hits.read().unwrap(),
-            total_misses: *self.total_misses.read().unwrap(),
+            total_hits: *self.total_hits.read().expect("cache_break RwLock poisoned"),
+            total_misses: *self.total_misses.read().expect("cache_break RwLock poisoned"),
             hit_rate: self.hit_rate(),
-            total_cache_creation_tokens: *self.total_cache_creation_tokens.read().unwrap(),
-            total_cache_read_tokens: *self.total_cache_read_tokens.read().unwrap(),
+            total_cache_creation_tokens: *self.total_cache_creation_tokens.read().expect("cache_break RwLock poisoned"),
+            total_cache_read_tokens: *self.total_cache_read_tokens.read().expect("cache_break RwLock poisoned"),
             tokens_saved: self.tokens_saved(),
-            break_reasons: self.break_reasons.read().unwrap().clone(),
+            break_reasons: self.break_reasons.read().expect("cache_break RwLock poisoned").clone(),
         }
     }
 

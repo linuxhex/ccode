@@ -73,6 +73,23 @@ pub struct RawHandler {
     /// (see its rustdoc for precedence and reserved-key stripping).
     #[serde(default, deserialize_with = "deserialize_optional_string_map")]
     pub env: HashMap<String, String>,
+    /// Run the hook in the background (non-blocking).
+    #[serde(default)]
+    pub async_run: bool,
+    /// When true and `async_run` is true, wake the model on exit code 2.
+    #[serde(default)]
+    pub async_rewake: bool,
+    /// Message shown to the model when an asyncRewake hook fires.
+    pub rewake_message: Option<String>,
+    /// Permission-rule-style condition filter (e.g. `"Bash(git *)"`)
+    /// that must match before the hook runs.
+    pub condition: Option<String>,
+    /// For prompt handlers: the instruction text to inject into model context.
+    pub prompt: Option<String>,
+    /// For agent handlers: the agent type to fork.
+    pub agent_type: Option<String>,
+    /// For agent handlers: maximum turns for the sub-agent.
+    pub agent_max_turns: Option<u32>,
 }
 
 /// Accepts `null`, an absent field, or a string map. Serde otherwise rejects an
@@ -111,6 +128,10 @@ fn default_timeout_ms(event: crate::event::HookEventName) -> u64 {
 pub enum HandlerType {
     Command,
     Http,
+    /// Injects additional instructions into the model context.
+    Prompt,
+    /// Forks a sub-agent to handle the event.
+    Agent,
 }
 
 impl HandlerType {
@@ -118,6 +139,8 @@ impl HandlerType {
         match self {
             Self::Command => "command",
             Self::Http => "http",
+            Self::Prompt => "prompt",
+            Self::Agent => "agent",
         }
     }
 }
@@ -176,6 +199,20 @@ pub struct HookSpec {
     /// Besides being passed to the child, this map is consulted by the load-time
     /// expansion of `command` and `url` (see [`crate::env_expand`]).
     pub extra_env: std::collections::HashMap<String, String>,
+    /// Run the hook in the background (non-blocking).
+    pub async_run: bool,
+    /// When true and `async_run` is true, wake the model on exit code 2.
+    pub async_rewake: bool,
+    /// Message shown to the model when an asyncRewake hook fires.
+    pub rewake_message: Option<String>,
+    /// Permission-rule-style condition filter (e.g. `"Bash(git *)"`).
+    pub condition: Option<String>,
+    /// For prompt handlers: the instruction text to inject into model context.
+    pub prompt_text: Option<String>,
+    /// For agent handlers: the agent type to fork.
+    pub agent_type: Option<String>,
+    /// For agent handlers: maximum turns for the sub-agent.
+    pub agent_max_turns: Option<u32>,
 }
 
 /// Parse hooks from a JSON value (e.g. from agent definition frontmatter).
@@ -305,6 +342,8 @@ pub fn parse_hook_file(content: &str, file_path: &Path) -> (Vec<HookSpec>, Vec<H
                 let handler_type = match handler.handler_type.as_str() {
                     "command" => HandlerType::Command,
                     "http" => HandlerType::Http,
+                    "prompt" => HandlerType::Prompt,
+                    "agent" => HandlerType::Agent,
                     _ => {
                         errors.push(HookError::UnsupportedHandlerType {
                             name,
@@ -314,6 +353,31 @@ pub fn parse_hook_file(content: &str, file_path: &Path) -> (Vec<HookSpec>, Vec<H
                         continue;
                     }
                 };
+
+                // Validate handler-specific required fields
+                match handler_type {
+                    HandlerType::Prompt => {
+                        if handler.prompt.is_none() {
+                            errors.push(HookError::InvalidConfig {
+                                name,
+                                path: file_path.to_path_buf(),
+                                detail: "prompt handler requires a 'prompt' field".into(),
+                            });
+                            continue;
+                        }
+                    }
+                    HandlerType::Agent => {
+                        if handler.agent_type.is_none() {
+                            errors.push(HookError::InvalidConfig {
+                                name,
+                                path: file_path.to_path_buf(),
+                                detail: "agent handler requires an 'agent_type' field".into(),
+                            });
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
 
                 // Expand `command`/`url` now (`extra_env` first, then process
                 // env). Unset refs are preserved: command hooks defer to the
@@ -346,6 +410,7 @@ pub fn parse_hook_file(content: &str, file_path: &Path) -> (Vec<HookSpec>, Vec<H
                             crate::env_expand::expand_env_vars_with_extra(&url, &extra_env);
                         (None, None, Some(expanded), Some(url))
                     }
+                    HandlerType::Prompt | HandlerType::Agent => (None, None, None, None),
                 };
 
                 specs.push(HookSpec {
@@ -362,6 +427,13 @@ pub fn parse_hook_file(content: &str, file_path: &Path) -> (Vec<HookSpec>, Vec<H
                     timeout_ms,
                     source_dir: source_dir.clone(),
                     extra_env,
+                    async_run: handler.async_run,
+                    async_rewake: handler.async_rewake,
+                    rewake_message: handler.rewake_message,
+                    condition: handler.condition,
+                    prompt_text: handler.prompt,
+                    agent_type: handler.agent_type,
+                    agent_max_turns: handler.agent_max_turns,
                 });
             }
         }
@@ -600,7 +672,7 @@ mod tests {
         let json = r#"{
             "hooks": {
                 "PreToolUse": [
-                    { "hooks": [{ "type": "prompt", "command": "test" }] }
+                    { "hooks": [{ "type": "websocket", "command": "test" }] }
                 ]
             }
         }"#;
@@ -750,11 +822,17 @@ mod tests {
         }"#;
         let (specs, errors) = parse_hook_file(json, Path::new("/tmp/settings.json"));
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-        assert_eq!(specs.len(), 2);
+        assert_eq!(specs.len(), 5);
         let has_pre = specs.iter().any(|s| s.event == HookEventName::PreToolUse);
         let has_post = specs.iter().any(|s| s.event == HookEventName::PostToolUse);
+        let has_perm = specs.iter().any(|s| s.event == HookEventName::PermissionRequest);
+        let has_task = specs.iter().any(|s| s.event == HookEventName::TaskCreated);
+        let has_file = specs.iter().any(|s| s.event == HookEventName::FileChanged);
         assert!(has_pre, "expected PreToolUse hook");
         assert!(has_post, "expected PostToolUse hook");
+        assert!(has_perm, "expected PermissionRequest hook");
+        assert!(has_task, "expected TaskCreated hook");
+        assert!(has_file, "expected FileChanged hook");
     }
 
     /// A `command` referencing a process-env var must be expanded at load time,

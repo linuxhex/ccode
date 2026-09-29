@@ -88,6 +88,12 @@ pub struct EpisodicMemoryStore {
     insertion_order: RwLock<Vec<MemoryId>>,
 }
 
+impl Default for EpisodicMemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EpisodicMemoryStore {
     /// 默认最大记忆容量
     const DEFAULT_MAX_MEMORIES: usize = 1000;
@@ -149,7 +155,7 @@ impl EpisodicMemoryStore {
 
         // Step 3: 双向更新链接（Zettelkasten核心）
         {
-            let mut nodes = self.nodes.write().unwrap();
+            let mut nodes = self.nodes.write().expect("episodic RwLock poisoned");
             for related_id in &related {
                 if let Some(existing) = nodes.get_mut(related_id) {
                     existing.back_links.push(id.clone());
@@ -158,12 +164,12 @@ impl EpisodicMemoryStore {
                 }
             }
             nodes.insert(id.clone(), node);
-            self.insertion_order.write().unwrap().push(id.clone());
+            self.insertion_order.write().expect("episodic RwLock poisoned").push(id.clone());
         }
 
         // FIFO 淘汰：超出容量时移除最早插入的记忆
         {
-            let mut insertion_order = self.insertion_order.write().unwrap();
+            let mut insertion_order = self.insertion_order.write().expect("episodic RwLock poisoned");
             while insertion_order.len() > self.max_memories {
                 let oldest_id = insertion_order.remove(0);
                 self.evict_memory(&oldest_id);
@@ -174,7 +180,7 @@ impl EpisodicMemoryStore {
         for keyword in &keywords {
             self.keyword_index
                 .write()
-                .unwrap()
+                .expect("episodic RwLock poisoned")
                 .entry(keyword.clone())
                 .or_default()
                 .push(id.clone());
@@ -182,7 +188,7 @@ impl EpisodicMemoryStore {
 
         self.type_index
             .write()
-            .unwrap()
+            .expect("episodic RwLock poisoned")
             .entry(memory_type)
             .or_default()
             .push(id.clone());
@@ -200,27 +206,27 @@ impl EpisodicMemoryStore {
     /// 淘汰指定记忆：从节点图和所有索引中移除
     fn evict_memory(&self, id: &MemoryId) {
         // 从节点图中移除，并清理其他节点中指向该记忆的链接
-        if let Some(removed) = self.nodes.write().unwrap().remove(id) {
+        if let Some(removed) = self.nodes.write().expect("episodic RwLock poisoned").remove(id) {
             // 清理前向链接引用
             for forward_id in &removed.forward_links {
-                if let Some(node) = self.nodes.write().unwrap().get_mut(forward_id) {
+                if let Some(node) = self.nodes.write().expect("episodic RwLock poisoned").get_mut(forward_id) {
                     node.back_links.retain(|l| l != id);
                 }
             }
             // 清理后向链接引用
             for back_id in &removed.back_links {
-                if let Some(node) = self.nodes.write().unwrap().get_mut(back_id) {
+                if let Some(node) = self.nodes.write().expect("episodic RwLock poisoned").get_mut(back_id) {
                     node.forward_links.retain(|l| l != id);
                 }
             }
             // 清理关键词索引
             for kw in &removed.keywords {
-                if let Some(vec) = self.keyword_index.write().unwrap().get_mut(kw) {
+                if let Some(vec) = self.keyword_index.write().expect("episodic RwLock poisoned").get_mut(kw) {
                     vec.retain(|l| l != id);
                 }
             }
             // 清理类型索引
-            if let Some(vec) = self.type_index.write().unwrap().get_mut(&removed.memory_type) {
+            if let Some(vec) = self.type_index.write().expect("episodic RwLock poisoned").get_mut(&removed.memory_type) {
                 vec.retain(|l| l != id);
             }
         }
@@ -232,7 +238,7 @@ impl EpisodicMemoryStore {
     /// 不是被动检索，而是在激活的记忆片段内本地推理，
     /// 提取上下文感知的证据后聚合
     pub fn reconstruct_context(&self, query: &str, max_depth: usize) -> String {
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read().expect("episodic RwLock poisoned");
         let mut visited = std::collections::HashSet::new();
         let mut result = Vec::new();
 
@@ -285,7 +291,7 @@ impl EpisodicMemoryStore {
     ///
     /// 根据记忆的实际有用性调整奖励值
     pub fn annotate_reward(&self, memory_id: &str, was_useful: bool) {
-        if let Some(node) = self.nodes.write().unwrap().get_mut(memory_id) {
+        if let Some(node) = self.nodes.write().expect("episodic RwLock poisoned").get_mut(memory_id) {
             let delta = if was_useful { 0.1 } else { -0.2 };
             node.reward = (node.reward + delta).clamp(0.0, 1.0);
             node.access_count += 1;
@@ -297,7 +303,7 @@ impl EpisodicMemoryStore {
     ///
     /// 合并语义相似的低奖励记忆
     pub fn merge_similar(&self, similarity_threshold: f64) -> usize {
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read().expect("episodic RwLock poisoned");
         let mut to_merge: Vec<(MemoryId, MemoryId)> = Vec::new();
         let node_ids: Vec<_> = nodes.keys().cloned().collect();
 
@@ -318,7 +324,7 @@ impl EpisodicMemoryStore {
         drop(nodes);
 
         let mut merged = 0;
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = self.nodes.write().expect("episodic RwLock poisoned");
         for (id_a, id_b) in to_merge {
             if let (Some(a), Some(b)) = (nodes.remove(&id_a), nodes.remove(&id_b)) {
                 // 合并：保留高奖励的，吸收低奖励的链接
@@ -350,7 +356,7 @@ impl EpisodicMemoryStore {
         let now = chrono::Utc::now().timestamp();
         let day_secs = 86400i64;
 
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = self.nodes.write().expect("episodic RwLock poisoned");
         let before = nodes.len();
 
         nodes.retain(|_, node| {
@@ -367,7 +373,7 @@ impl EpisodicMemoryStore {
 
     /// 查找相关记忆
     fn find_related(&self, content: &str, keywords: &[String]) -> Vec<MemoryId> {
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read().expect("episodic RwLock poisoned");
         let mut scored: Vec<(MemoryId, f64)> = Vec::new();
 
         for (id, node) in nodes.iter() {
@@ -402,7 +408,7 @@ impl EpisodicMemoryStore {
 
     /// 获取统计信息
     pub fn stats(&self) -> (usize, usize, usize) {
-        let nodes = self.nodes.read().unwrap();
+        let nodes = self.nodes.read().expect("episodic RwLock poisoned");
         let semantic = nodes
             .values()
             .filter(|n| n.memory_type == MemoryType::Semantic)

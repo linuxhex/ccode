@@ -36,6 +36,24 @@ impl Default for MicroCompactConfig {
     }
 }
 
+impl MicroCompactConfig {
+    /// 自适应年龄阈值：根据 token 压力动态调整
+    ///
+    /// `pressure` 范围 0.0~1.0（0.0 = 无压力，1.0 = 上下文已满）。
+    /// 压力越大，保留时间越短（积极清理旧工具结果）。
+    ///
+    /// - pressure 0.0 → 使用原始 max_age（5 分钟）
+    /// - pressure 0.5 → max_age * 0.75（3.75 分钟）
+    /// - pressure 1.0 → max_age * 0.2（1 分钟）
+    pub fn adaptive_max_age(&self, pressure: f64) -> Duration {
+        let pressure = pressure.clamp(0.0, 1.0);
+        // 线性插值：1.0 → 0.2x, 0.0 → 1.0x
+        let factor = 1.0 - pressure * 0.8;
+        let secs = (self.max_age.as_secs_f64() * factor).max(60.0); // 最低 60 秒
+        Duration::from_secs_f64(secs)
+    }
+}
+
 /// 微压缩结果统计
 #[derive(Debug, Clone)]
 pub struct MicroCompactResult {

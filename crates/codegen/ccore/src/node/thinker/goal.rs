@@ -16,6 +16,28 @@ impl ThinkerNode {
         self.goal_loop = Some(goal_loop);
     }
 
+    /// 启动目标驱动循环并注入规划提示
+    ///
+    /// `/goal` 命令与 `cortex/goal_start` 消息的统一入口——两条路径此前各自
+    /// 复制了「建 GoalLoop + 注入拆解提示」的逻辑，改一处漏一处，故收敛到此。
+    ///
+    /// 注入后由调用方决定如何驱动采样：`/goal` 走 handler 末尾的统一采样出口，
+    /// `cortex/goal_start` 因不经该出口需自行开启 agentic session。
+    pub(crate) fn start_goal_with_planning(&mut self, description: String) {
+        self.start_goal(description);
+        if let Some(ref gl) = self.goal_loop {
+            let desc = gl.description().to_string();
+            let prompt = format!(
+                "请将以下目标拆解为可执行的子任务列表（JSON 数组格式，每项包含 description 和 verification 字段）：\n{}",
+                desc
+            );
+            // 按提示全文估算，而非只算目标描述——此前两处都只传了 desc 的
+            // token 数，低估了实际注入量（提示模板本身约 40 token）
+            let tokens = Self::estimate_tokens(&prompt);
+            self.working_memory.push_user(prompt, tokens);
+        }
+    }
+
     /// 处理 GoalLoop 动作（由 on_turn_complete / on_verification_result 产生）
     ///
     /// 根据动作类型：注入工作记忆、发送验证请求、或清除 goal_loop。

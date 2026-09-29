@@ -10,6 +10,7 @@ authors = ["ccode"]
 rmcp = { version = "2.1", features = [
     "auth",
     "client",
+    "server",
     "transport-async-rw",
     "transport-streamable-http-client-reqwest",
     "reqwest",

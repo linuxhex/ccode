@@ -122,9 +122,7 @@ impl ExperienceLog {
                 // 从成功条目的信号中提取模式提示
                 // 取第一条成功条目的信号前 50 个字符
                 let pattern_hint = entries
-                    .iter()
-                    .filter(|e| e.result)
-                    .next()
+                    .iter().find(|e| e.result)
                     .map(|e| e.signal.chars().take(50).collect())
                     .unwrap_or_default();
 
@@ -164,7 +162,7 @@ impl ExperienceLog {
     /// 获取最近执行结果的摘要文本
     pub fn recent_outcome_summary(&self) -> String {
         self.entries.iter().rev().take(5)
-            .filter_map(|e| if e.result { Some("success") } else { Some("failure") })
+            .map(|e| if e.result { "success" } else { "failure" })
             .collect::<Vec<_>>()
             .join(",")
     }

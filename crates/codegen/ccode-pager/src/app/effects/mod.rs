@@ -4039,6 +4039,7 @@ pub(crate) fn execute(
             parent_cwd,
             parent_is_worktree,
             new_session_id,
+            target_prompt_index,
         } => {
             let tx = acp_tx.clone();
             tasks
@@ -4061,6 +4062,7 @@ pub(crate) fn execute(
                         &parent_cwd,
                         new_session_id.as_deref(),
                         parent_is_worktree,
+                        target_prompt_index,
                     );
                     let req = acp::ExtRequest::new(
                         "ccode.dev/session/fork",

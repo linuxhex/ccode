@@ -386,6 +386,13 @@ pub struct PruningConfig {
     pub soft_trim_head: usize,
     /// Characters to keep from the end of a soft-trimmed result.
     pub soft_trim_tail: usize,
+    /// Turn age after which tool results are soft-cleared: content replaced
+    /// with a short summary (first `soft_clear_summary_chars` chars) plus
+    /// a cleared marker. This is a middle tier between soft-trim (head+tail)
+    /// and hard-clear (full placeholder). Must be < `hard_clear_age_turns`.
+    pub soft_clear_age_turns: usize,
+    /// Number of leading characters to retain as a summary when soft-clearing.
+    pub soft_clear_summary_chars: usize,
     /// Turn age after which tool results are hard-cleared (replaced with placeholder).
     pub hard_clear_age_turns: usize,
 }
@@ -398,6 +405,8 @@ impl Default for PruningConfig {
             soft_trim_threshold: 4000,
             soft_trim_head: 1500,
             soft_trim_tail: 1500,
+            soft_clear_age_turns: 6,
+            soft_clear_summary_chars: 200,
             hard_clear_age_turns: 10,
         }
     }

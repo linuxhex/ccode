@@ -76,6 +76,17 @@ pub enum EditHighlightPhase {
     },
 }
 
+/// Diff layout mode — controls how old/new lines are arranged visually.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffLayout {
+    /// Standard unified diff: one line per source line, `-`/`+` prefixed.
+    #[default]
+    Unified,
+    /// Old and new side-by-side, separated by a vertical divider.
+    /// Falls back to Unified when the terminal is too narrow (< 80 cols).
+    SideBySide,
+}
+
 /// Configuration for diff rendering (tweakable for dev testing).
 #[derive(Debug, Clone)]
 pub struct DiffRenderConfig {
@@ -93,6 +104,8 @@ pub struct DiffRenderConfig {
     /// Show two line-number columns (old + new) like GitHub's unified diff.
     /// When false (default), show a single column with the new-file line number.
     pub dual_line_numbers: bool,
+    /// Layout mode: unified (default) or side-by-side.
+    pub layout: DiffLayout,
 }
 
 impl Default for DiffRenderConfig {
@@ -103,6 +116,7 @@ impl Default for DiffRenderConfig {
             indent_bg: false,
             hunk_separator: "…".to_string(),
             dual_line_numbers: false,
+            layout: DiffLayout::Unified,
         }
     }
 }
@@ -161,6 +175,189 @@ pub fn render_diff_hunks_highlighted(
     render_diff_hunks_core(hunks, path, None, theme, width, config)
 }
 
+/// Compute word-level changed ranges between old and new text.
+///
+/// Returns `(old_changed_ranges, new_changed_ranges)` as byte offset ranges
+/// within the respective strings. Used to highlight intra-line changes in
+/// diff views (e.g., which specific words changed within a modified line).
+///
+/// The offsets are only meaningful against the exact strings passed in; callers
+/// must render their spans from those same strings (see `apply_word_highlights`).
+fn compute_word_diff_ranges(
+    old: &str,
+    new: &str,
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let diff = similar::TextDiff::from_words(old, new);
+    let mut old_ranges = Vec::new();
+    let mut new_ranges = Vec::new();
+    let mut old_offset = 0usize;
+    let mut new_offset = 0usize;
+
+    for change in diff.iter_all_changes() {
+        let len = change.value().len();
+        match change.tag() {
+            ChangeTag::Equal => {
+                old_offset += len;
+                new_offset += len;
+            }
+            ChangeTag::Delete => {
+                if !change.value().trim().is_empty() {
+                    old_ranges.push(old_offset..old_offset + len);
+                }
+                old_offset += len;
+            }
+            ChangeTag::Insert => {
+                if !change.value().trim().is_empty() {
+                    new_ranges.push(new_offset..new_offset + len);
+                }
+                new_offset += len;
+            }
+        }
+    }
+    (old_ranges, new_ranges)
+}
+
+/// Apply word-level background highlights to spans.
+///
+/// Takes rendered content spans and a list of byte ranges that should receive
+/// a stronger background color (indicating intra-line changes). Splits spans
+/// at range boundaries and applies `highlight_bg` to the changed portions.
+fn apply_word_highlights(
+    spans: Vec<Span<'static>>,
+    changed_ranges: &[Range<usize>],
+    highlight_bg: Color,
+) -> Vec<Span<'static>> {
+    if changed_ranges.is_empty() {
+        return spans;
+    }
+
+    // Sort and merge first. Emitting per raw range duplicated any span that
+    // straddled two of them (prefix + middle + suffix pushed once per range);
+    // after merging, each span is cut at most once per disjoint region.
+    let mut merged: Vec<Range<usize>> = changed_ranges.to_vec();
+    merged.sort_by_key(|r| r.start);
+    merged.dedup_by(|next, prev| {
+        if next.start <= prev.end {
+            prev.end = prev.end.max(next.end);
+            true
+        } else {
+            false
+        }
+    });
+
+    let mut result = Vec::with_capacity(spans.len());
+    let mut byte_offset = 0usize;
+
+    for span in spans {
+        let span_len = span.content.len();
+        let span_start = byte_offset;
+        let span_end = span_start + span_len;
+        byte_offset = span_end;
+
+        // Local cut points, ascending and disjoint because `merged` is.
+        let mut cuts: Vec<(usize, usize)> = Vec::new();
+        for range in &merged {
+            if range.end <= span_start || range.start >= span_end {
+                continue;
+            }
+            let local_start = range.start.max(span_start) - span_start;
+            let local_end = range.end.min(span_end) - span_start;
+            // Ranges are char-aligned in the text they were computed from, but the
+            // span stream can still drift from it. Slicing mid-char panics, so a
+            // misaligned range drops its highlight rather than killing the render.
+            if !span.content.is_char_boundary(local_start)
+                || !span.content.is_char_boundary(local_end)
+            {
+                cuts.clear();
+                break;
+            }
+            cuts.push((local_start, local_end));
+        }
+
+        if cuts.is_empty() {
+            result.push(span);
+            continue;
+        }
+
+        let mut cursor = 0usize;
+        for (local_start, local_end) in cuts {
+            if local_start > cursor {
+                result.push(Span {
+                    content: span.content[cursor..local_start].to_string().into(),
+                    style: span.style,
+                });
+            }
+            result.push(Span {
+                content: span.content[local_start..local_end].to_string().into(),
+                style: span.style.bg(highlight_bg),
+            });
+            cursor = local_end;
+        }
+        if cursor < span_len {
+            result.push(Span {
+                content: span.content[cursor..].to_string().into(),
+                style: span.style,
+            });
+        }
+    }
+
+    result
+}
+
+/// Pre-compute word-level highlights for Delete/Insert pairs in a hunk.
+///
+/// Scans the hunk for consecutive groups of Delete followed by Insert lines.
+/// Within each group, pairs up lines by index and computes word-level diffs.
+/// Returns a map from `(tag, line_index_within_hunk)` to changed byte ranges.
+fn compute_hunk_word_highlights(
+    hunk: &DiffHunk,
+    _theme: &Theme,
+) -> HashMap<(ChangeTag, usize), Vec<Range<usize>>> {
+    let mut result = HashMap::new();
+    let lines: Vec<_> = hunk.iter().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        // Find start of a Delete/Insert group
+        if lines[i].tag == ChangeTag::Delete {
+            let mut deletes = Vec::new();
+            let mut inserts = Vec::new();
+
+            // Collect consecutive Delete lines. Tabs are expanded here because the
+            // ranges are applied to spans rendered from `expand_tabs(trimmed)`; on the
+            // raw text every tab would shift later offsets by `tab_width - 1` bytes,
+            // mislabeling words and — landing mid-char — panicking the slice.
+            while i < lines.len() && lines[i].tag == ChangeTag::Delete {
+                deletes.push((i, expand_tabs(lines[i].text.trim_end_matches(['\r', '\n']))));
+                i += 1;
+            }
+            // Collect consecutive Insert lines
+            while i < lines.len() && lines[i].tag == ChangeTag::Insert {
+                inserts.push((i, expand_tabs(lines[i].text.trim_end_matches(['\r', '\n']))));
+                i += 1;
+            }
+
+            // Pair up lines and compute word-level diffs
+            let pair_count = deletes.len().min(inserts.len());
+            for j in 0..pair_count {
+                let (del_idx, del_text) = &deletes[j];
+                let (ins_idx, ins_text) = &inserts[j];
+                let (old_ranges, new_ranges) = compute_word_diff_ranges(del_text, ins_text);
+                if !old_ranges.is_empty() {
+                    result.insert((ChangeTag::Delete, *del_idx), old_ranges);
+                }
+                if !new_ranges.is_empty() {
+                    result.insert((ChangeTag::Insert, *ins_idx), new_ranges);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    result
+}
+
 /// The single hunk walker behind both public fronts, so gutters, backgrounds,
 /// separators, and wrap behavior are identical across highlight phases by
 /// construction. Every line renders its per-hunk syntect spans (keeping the
@@ -211,17 +408,32 @@ fn render_diff_hunks_core(
         // the new side and advance both.
         let mut old_highlighter = syntect.highlight_lines_by_file_path(path);
         let mut new_highlighter = syntect.highlight_lines_by_file_path(path);
-        for line in hunk {
+
+        // Pre-compute word-level diffs for Delete/Insert pairs within this hunk.
+        // Keyed by (tag, line_index_within_hunk) → changed byte ranges.
+        let word_highlights = compute_hunk_word_highlights(hunk, theme);
+
+        for (line_idx, line) in hunk.iter().enumerate() {
             let trimmed = line.text.trim_end_matches(['\r', '\n']);
             let text = expand_tabs(trimmed);
             // Cold spans render unconditionally so Delete lines and any map
             // miss (text drift) paint exactly like the hunk-only phase.
             let mut content_spans = match line.tag {
                 ChangeTag::Delete => {
-                    render_content_spans(&text, line.tag, theme, &mut old_highlighter, syntect)
+                    let spans = render_content_spans(&text, line.tag, theme, &mut old_highlighter, syntect);
+                    if let Some(ranges) = word_highlights.get(&(ChangeTag::Delete, line_idx)) {
+                        apply_word_highlights(spans, ranges, theme.diff_delete_bg)
+                    } else {
+                        spans
+                    }
                 }
                 ChangeTag::Insert => {
-                    render_content_spans(&text, line.tag, theme, &mut new_highlighter, syntect)
+                    let spans = render_content_spans(&text, line.tag, theme, &mut new_highlighter, syntect);
+                    if let Some(ranges) = word_highlights.get(&(ChangeTag::Insert, line_idx)) {
+                        apply_word_highlights(spans, ranges, theme.diff_insert_bg)
+                    } else {
+                        spans
+                    }
                 }
                 ChangeTag::Equal => {
                     let spans =
@@ -370,6 +582,293 @@ pub fn render_diff_hunks_with_styles(
     config: &DiffRenderConfig,
 ) -> Vec<DiffLineOutput> {
     render_diff_hunks_core(hunks, path, Some(by_new_line), theme, width, config)
+}
+
+/// Minimum terminal width for side-by-side layout. Below this, falls back to unified.
+const SIDE_BY_SIDE_MIN_WIDTH: u16 = 80;
+
+/// Render diff hunks in a side-by-side layout.
+///
+/// Each output line contains old content on the left and new content on the right,
+/// separated by a `│` divider. Delete lines show content on the left with an empty
+/// right side; Insert lines show the reverse; Equal lines show content on both sides.
+///
+/// Falls back to unified layout when `width < SIDE_BY_SIDE_MIN_WIDTH`.
+pub fn render_diff_hunks_side_by_side(
+    hunks: &[DiffHunk],
+    path: &Path,
+    theme: &Theme,
+    width: u16,
+    config: &DiffRenderConfig,
+) -> Vec<DiffLineOutput> {
+    if width < SIDE_BY_SIDE_MIN_WIDTH {
+        return render_diff_hunks_core(hunks, path, None, theme, width, config);
+    }
+
+    let syntect = get_syntect();
+    let mut lines = Vec::new();
+
+    let divider = " │ ";
+    let divider_width: u16 = 3;
+    let half_width = (width.saturating_sub(divider_width)) / 2;
+
+    let gutter_w = 4u16;
+    let content_w = half_width.saturating_sub(gutter_w).max(10);
+
+    let mut first_line = true;
+
+    for hunk in hunks {
+        if !first_line && !config.hunk_separator.is_empty() {
+            let sep_line = DiffLineOutput {
+                line: Line::from(Span::styled(
+                    format!("  {} {}", config.hunk_separator, config.hunk_separator),
+                    Style::default().fg(theme.gray_dim),
+                )),
+                background: None,
+                content_start_col: 0,
+                gutter_span_count: 0,
+                content_text: String::new(),
+                joiner: None,
+                is_separator: true,
+            };
+            lines.push(sep_line);
+        }
+        first_line = false;
+
+        let mut old_hl = syntect.highlight_lines_by_file_path(path);
+        let mut new_hl = syntect.highlight_lines_by_file_path(path);
+
+        let mut i = 0;
+        while i < hunk.len() {
+            let line = &hunk[i];
+            match line.tag {
+                ChangeTag::Equal => {
+                    let text = expand_tabs(line.text.trim_end_matches('\n'));
+                    let style = side_highlight(&mut new_hl, &text, syntect);
+                    let left_gutter = format!("{:>w$} ", line.lo, w = gutter_w as usize - 1);
+                    let right_gutter = format!("{:>w$} ", line.ln, w = gutter_w as usize - 1);
+                    let left_content = truncate_or_pad(&text, content_w as usize);
+                    let right_content = truncate_or_pad(&text, content_w as usize);
+
+                    let spans_out = vec![
+                        Span::styled(left_gutter, Style::default().fg(theme.gray_dim)),
+                        Span::styled(left_content, style),
+                        Span::styled(divider.to_string(), Style::default().fg(theme.gray_dim)),
+                        Span::styled(right_gutter, Style::default().fg(theme.gray_dim)),
+                        Span::styled(right_content, style),
+                    ];
+
+                    lines.push(DiffLineOutput {
+                        line: Line::from(spans_out),
+                        background: None,
+                        content_start_col: gutter_w,
+                        gutter_span_count: 2,
+                        content_text: text.to_string(),
+                        joiner: Some(String::new()),
+                        is_separator: false,
+                    });
+                    // Advance both highlighters for the equal line.
+                    if let Some(hl) = old_hl.as_mut() {
+                        let owned = format!("{}\n", text.trim_end());
+                        let _ = hl.highlight_line(&owned, &syntect.syntax_set);
+                    }
+                    i += 1;
+                }
+                ChangeTag::Delete => {
+                    let mut delete_group = vec![line];
+                    let mut j = i + 1;
+                    while j < hunk.len() && hunk[j].tag == ChangeTag::Delete {
+                        delete_group.push(&hunk[j]);
+                        j += 1;
+                    }
+                    let mut insert_group: Vec<&crate::diff::DiffLine> = Vec::new();
+                    while j < hunk.len() && hunk[j].tag == ChangeTag::Insert {
+                        insert_group.push(&hunk[j]);
+                        j += 1;
+                    }
+
+                    let pair_count = delete_group.len().max(insert_group.len());
+                    for k in 0..pair_count {
+                        let del = delete_group.get(k);
+                        let ins = insert_group.get(k);
+
+                        let del_text = del
+                            .map(|l| expand_tabs(l.text.trim_end_matches('\n')))
+                            .unwrap_or_default();
+                        let ins_text = ins
+                            .map(|l| expand_tabs(l.text.trim_end_matches('\n')))
+                            .unwrap_or_default();
+
+                        let del_gutter = del
+                            .map(|l| format!("{:>w$} ", l.lo, w = gutter_w as usize - 1))
+                            .unwrap_or_else(|| " ".repeat(gutter_w as usize));
+                        let ins_gutter = ins
+                            .map(|l| format!("{:>w$} ", l.ln, w = gutter_w as usize - 1))
+                            .unwrap_or_else(|| " ".repeat(gutter_w as usize));
+
+                        let del_bg = if del.is_some() {
+                            Some(theme.diff_delete_bg)
+                        } else {
+                            None
+                        };
+                        let ins_bg = if ins.is_some() {
+                            Some(theme.diff_insert_bg)
+                        } else {
+                            None
+                        };
+
+                        let left_content = truncate_or_pad(&del_text, content_w as usize);
+                        let right_content = truncate_or_pad(&ins_text, content_w as usize);
+
+                        let del_style = Style::default()
+                            .fg(theme.diff_delete_fg)
+                            .bg(theme.diff_delete_bg);
+                        let ins_style = Style::default()
+                            .fg(theme.diff_insert_fg)
+                            .bg(theme.diff_insert_bg);
+
+                        let spans_out = vec![
+                            Span::styled(
+                                del_gutter,
+                                Style::default().fg(theme.gray_dim).bg(theme.diff_delete_bg),
+                            ),
+                            Span::styled(left_content, del_style),
+                            Span::styled(
+                                divider.to_string(),
+                                Style::default().fg(theme.gray_dim),
+                            ),
+                            Span::styled(
+                                ins_gutter,
+                                Style::default().fg(theme.gray_dim).bg(theme.diff_insert_bg),
+                            ),
+                            Span::styled(right_content, ins_style),
+                        ];
+
+                        let bg = del_bg.or(ins_bg);
+                        let content_text = if del.is_some() {
+                            del_text.to_string()
+                        } else {
+                            ins_text.to_string()
+                        };
+
+                        lines.push(DiffLineOutput {
+                            line: Line::from(spans_out),
+                            background: bg,
+                            content_start_col: gutter_w,
+                            gutter_span_count: 2,
+                            content_text,
+                            joiner: Some(String::new()),
+                            is_separator: false,
+                        });
+
+                        // Advance the old-side highlighter for the delete.
+                        if del.is_some()
+                            && let Some(hl) = old_hl.as_mut() {
+                                let owned = format!("{}\n", del_text.trim_end());
+                                let _ = hl.highlight_line(&owned, &syntect.syntax_set);
+                            }
+                        // Advance the new-side highlighter for the insert.
+                        if ins.is_some()
+                            && let Some(hl) = new_hl.as_mut() {
+                                let owned = format!("{}\n", ins_text.trim_end());
+                                let _ = hl.highlight_line(&owned, &syntect.syntax_set);
+                            }
+                    }
+                    i = j;
+                }
+                ChangeTag::Insert => {
+                    let text = expand_tabs(line.text.trim_end_matches('\n'));
+                    let gutter = format!("{:>w$} ", line.ln, w = gutter_w as usize - 1);
+                    let left_empty = " ".repeat(content_w as usize);
+                    let right_content = truncate_or_pad(&text, content_w as usize);
+
+                    let ins_style = Style::default()
+                        .fg(theme.diff_insert_fg)
+                        .bg(theme.diff_insert_bg);
+
+                    let spans_out = vec![
+                        Span::styled(
+                            " ".repeat(gutter_w as usize),
+                            Style::default().bg(theme.bg_base),
+                        ),
+                        Span::styled(left_empty, Style::default()),
+                        Span::styled(
+                            divider.to_string(),
+                            Style::default().fg(theme.gray_dim),
+                        ),
+                        Span::styled(
+                            gutter,
+                            Style::default().fg(theme.gray_dim).bg(theme.diff_insert_bg),
+                        ),
+                        Span::styled(right_content, ins_style),
+                    ];
+
+                    lines.push(DiffLineOutput {
+                        line: Line::from(spans_out),
+                        background: Some(theme.diff_insert_bg),
+                        content_start_col: gutter_w,
+                        gutter_span_count: 2,
+                        content_text: text.to_string(),
+                        joiner: Some(String::new()),
+                        is_separator: false,
+                    });
+                    // Advance the new-side highlighter for the insert.
+                    if let Some(hl) = new_hl.as_mut() {
+                        let owned = format!("{}\n", text.trim_end());
+                        let _ = hl.highlight_line(&owned, &syntect.syntax_set);
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    lines
+}
+
+/// Highlight a single line using an optional highlighter, falling back to default style.
+fn side_highlight(
+    hl: &mut Option<HighlightLines<'_>>,
+    text: &str,
+    syntect: &Syntect,
+) -> Style {
+    let Some(hl) = hl.as_mut() else {
+        return Style::default();
+    };
+    let owned = format!("{text}\n");
+    let ranges = hl
+        .highlight_line(&owned, &syntect.syntax_set)
+        .unwrap_or_default();
+    if let Some((st, _)) = ranges.first() {
+        Style::default().fg(Color::Rgb(st.foreground.r, st.foreground.g, st.foreground.b))
+    } else {
+        Style::default()
+    }
+}
+
+fn truncate_or_pad(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let text_width = text.width();
+    if text_width <= width {
+        format!("{text}{}", " ".repeat(width - text_width))
+    } else {
+        let mut result = String::with_capacity(width);
+        let mut w = 0;
+        for ch in text.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > width.saturating_sub(1) {
+                result.push('…');
+                break;
+            }
+            result.push(ch);
+            w += cw;
+        }
+        let remaining = width.saturating_sub(unicode_width::UnicodeWidthStr::width(result.as_str()));
+        if remaining > 0 {
+            result.push_str(&" ".repeat(remaining));
+        }
+        result
+    }
 }
 
 /// Full-file map spans for one line, when they may override the cold spans:
@@ -947,7 +1446,7 @@ impl EditToolCallBlock {
         let suffix_spans: Vec<Span<'static>> =
             if collapsed && show_summary && !self.hunks.is_empty() && !self.summary_untrusted {
                 let (ins, del) = self.count_changes();
-                if ins > 0 || del > 0 {
+                let mut spans = if ins > 0 || del > 0 {
                     vec![
                         Span::styled(
                             format!(" +{ins}"),
@@ -958,12 +1457,59 @@ impl EditToolCallBlock {
                     ]
                 } else {
                     Vec::new()
+                };
+                // Add execution time if available
+                if let Some(ms) = self.elapsed_ms {
+                    let elapsed_str = if ms < 1000 {
+                        format!("{}ms", ms)
+                    } else if ms < 10_000 {
+                        format!("{:.1}s", ms as f64 / 1000.0)
+                    } else {
+                        format!("{}s", ms / 1000)
+                    };
+                    spans.push(Span::styled(
+                        format!(" ({})", elapsed_str),
+                        detail_style,
+                    ));
                 }
+                spans
             } else if collapsed && self.edit_count > 1 {
-                vec![Span::styled(
+                let mut spans = vec![Span::styled(
                     format!(" ({} edits)", self.edit_count),
                     detail_style,
-                )]
+                )];
+                // Add execution time if available
+                if let Some(ms) = self.elapsed_ms {
+                    let elapsed_str = if ms < 1000 {
+                        format!("{}ms", ms)
+                    } else if ms < 10_000 {
+                        format!("{:.1}s", ms as f64 / 1000.0)
+                    } else {
+                        format!("{}s", ms / 1000)
+                    };
+                    spans.push(Span::styled(
+                        format!(" ({})", elapsed_str),
+                        detail_style,
+                    ));
+                }
+                spans
+            } else if collapsed {
+                // Show execution time even without diffstat
+                if let Some(ms) = self.elapsed_ms {
+                    let elapsed_str = if ms < 1000 {
+                        format!("{}ms", ms)
+                    } else if ms < 10_000 {
+                        format!("{:.1}s", ms as f64 / 1000.0)
+                    } else {
+                        format!("{}s", ms / 1000)
+                    };
+                    vec![Span::styled(
+                        format!(" ({})", elapsed_str),
+                        detail_style,
+                    )]
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             };
@@ -1007,6 +1553,9 @@ impl EditToolCallBlock {
         config: &DiffRenderConfig,
     ) -> Vec<DiffLineOutput> {
         let path = Path::new(&self.path);
+        if config.layout == DiffLayout::SideBySide {
+            return render_diff_hunks_side_by_side(&self.hunks, path, theme, width, config);
+        }
         match &self.highlight {
             EditHighlightPhase::FileScoped {
                 by_new_line,
@@ -1245,6 +1794,13 @@ impl EditToolCallBlock {
                     indent_bg: edit_cfg.indent_bg,
                     hunk_separator: edit_cfg.hunk_separator.clone(),
                     dual_line_numbers: edit_cfg.dual_line_numbers,
+                    layout: if crate::appearance::cache::load_diff_layout_side_by_side()
+                        || edit_cfg.diff_layout == "side_by_side"
+                    {
+                        DiffLayout::SideBySide
+                    } else {
+                        DiffLayout::Unified
+                    },
                 };
                 // Header with word-wrap and hanging indent
                 let header = self.header_line(
@@ -2922,5 +3478,109 @@ class ProcessQueueItem(BaseModel):
             "expected cold-start mismatch (hunk-only string spill vs full-file); \
              if equal, the bug may already be fixed or the fixture no longer triggers"
         );
+    }
+
+    /// The word-highlight path shipped without ever being compiled, so its
+    /// invariants are pinned here rather than trusted.
+    fn words(spans: &[Span<'static>]) -> Vec<(String, bool)> {
+        spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.bg == Some(Color::Red)))
+            .collect()
+    }
+
+    #[test]
+    fn apply_word_highlights_splits_a_single_range() {
+        let spans = vec![Span::raw("let x = 1;")];
+        let out = apply_word_highlights(spans, &[4..5], Color::Red);
+        assert_eq!(
+            words(&out),
+            vec![
+                ("let ".to_string(), false),
+                ("x".to_string(), true),
+                (" = 1;".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_word_highlights_does_not_duplicate_across_ranges() {
+        // One span overlapping two ranges: the pre-merge version emitted
+        // prefix+middle+suffix once per range, so "let x = 1;" came out twice as
+        // long. Concatenation must still reproduce the input exactly.
+        let spans = vec![Span::raw("let x = 1;")];
+        let out = apply_word_highlights(spans, &[4..5, 8..9], Color::Red);
+        let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "let x = 1;", "content must be preserved, not duplicated");
+        assert_eq!(
+            words(&out),
+            vec![
+                ("let ".to_string(), false),
+                ("x".to_string(), true),
+                (" = ".to_string(), false),
+                ("1".to_string(), true),
+                (";".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_word_highlights_merges_touching_ranges() {
+        let spans = vec![Span::raw("abcdef")];
+        let out = apply_word_highlights(spans, &[1..3, 3..5], Color::Red);
+        assert_eq!(
+            words(&out),
+            vec![
+                ("a".to_string(), false),
+                ("bcde".to_string(), true),
+                ("f".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_word_highlights_survives_misaligned_range() {
+        // A range landing mid-UTF-8 (offset 1 splits '中') must drop the
+        // highlight, not panic — this crate has a history of CJK slice panics.
+        let spans = vec![Span::raw("中文")];
+        let out = apply_word_highlights(spans, &[1..4], Color::Red);
+        let joined: String = out.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "中文");
+        assert!(
+            out.iter().all(|s| s.style.bg != Some(Color::Red)),
+            "misaligned range must not highlight anything"
+        );
+    }
+
+    #[test]
+    fn apply_word_highlights_spans_range_crossing_span_boundary() {
+        let spans = vec![Span::raw("foo"), Span::raw("bar")];
+        let out = apply_word_highlights(spans, &[2..4], Color::Red);
+        assert_eq!(
+            words(&out),
+            vec![
+                ("fo".to_string(), false),
+                ("o".to_string(), true),
+                ("b".to_string(), true),
+                ("ar".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn word_diff_ranges_are_char_aligned_on_cjk() {
+        let (old, new) = compute_word_diff_ranges("你好 世界", "你好 苍穹");
+        for r in old.iter() {
+            assert!(
+                "你好 世界".is_char_boundary(r.start) && "你好 世界".is_char_boundary(r.end),
+                "old range {r:?} must not split a char"
+            );
+        }
+        for r in new.iter() {
+            assert!(
+                "你好 苍穹".is_char_boundary(r.start) && "你好 苍穹".is_char_boundary(r.end),
+                "new range {r:?} must not split a char"
+            );
+        }
     }
 }

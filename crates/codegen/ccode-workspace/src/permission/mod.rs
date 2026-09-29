@@ -10,6 +10,7 @@ mod prompter;
 pub mod resolution;
 pub mod rules;
 mod shell_access;
+pub mod side_effect_eval;
 mod state;
 pub mod types;
 

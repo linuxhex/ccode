@@ -153,7 +153,7 @@ impl Bm25ToolSearchIndex {
 
 impl ToolSearchIndex for Bm25ToolSearchIndex {
     fn search_snapshot(&self, query: &str, limit: usize) -> SearchSnapshot {
-        let snapshot = self.snapshot.lock().unwrap().clone();
+        let snapshot = self.snapshot.lock().expect("tool_index snapshot lock poisoned").clone();
 
         let is_ready = snapshot.mcp_initialized;
         let total_hidden_tools = snapshot.tools.len();
@@ -220,7 +220,7 @@ impl ToolSearchIndex for Bm25ToolSearchIndex {
 
     fn list_server_summaries(&self) -> Vec<ServerSummary> {
         let (tools_snapshot, servers) = {
-            let snapshot = self.snapshot.lock().unwrap();
+            let snapshot = self.snapshot.lock().expect("tool_index snapshot lock poisoned");
             let tools: Vec<(String, String)> = snapshot
                 .tools
                 .iter()

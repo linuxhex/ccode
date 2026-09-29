@@ -297,6 +297,26 @@ pub struct BashToolInput {
         deserialize_with = "crate::types::schema::deserialize_lenient_bool"
     )]
     pub is_background: bool,
+
+    /// Declare the side-effect scopes of this command. The permission system
+    /// evaluates these declarations to decide allow/deny/ask — faster and more
+    /// accurate than static shell analysis.
+    ///
+    /// Valid scopes:
+    /// - `read-in-cwd` — read files inside the project directory
+    /// - `read-out-cwd` — read files outside the project directory
+    /// - `write-in-cwd` — create/modify files inside the project directory
+    /// - `write-out-cwd` — create/modify files outside the project directory
+    /// - `delete-in-cwd` — delete files inside the project directory
+    /// - `delete-out-cwd` — delete files outside the project directory
+    /// - `query-git-log` — read-only git operations (log, status, diff)
+    /// - `mutate-git-log` — mutating git operations (commit, push, reset)
+    /// - `network` — network access (curl, wget, npm install, etc.)
+    #[schemars(
+        description = "Declare the side-effect scopes of this command. Valid: read-in-cwd, read-out-cwd, write-in-cwd, write-out-cwd, delete-in-cwd, delete-out-cwd, query-git-log, mutate-git-log, network."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_effects: Option<Vec<String>>,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -2608,6 +2628,7 @@ mod tests {
             timeout: None,
             description: "test".to_string(),
             is_background: false,
+            side_effects: None,
         }
     }
 
@@ -2617,6 +2638,7 @@ mod tests {
             timeout: None,
             description: "test".to_string(),
             is_background: true,
+            side_effects: None,
         }
     }
 

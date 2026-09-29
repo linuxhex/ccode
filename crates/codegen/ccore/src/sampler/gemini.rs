@@ -44,7 +44,10 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new(config: GeminiConfig) -> Self {
         let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(300))
+            .pool_idle_timeout(std::time::Duration::from_secs(600))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { config, client }
@@ -72,8 +75,22 @@ impl GeminiProvider {
     fn build_request_body(&self, request: &SampleRequest) -> serde_json::Value {
         let mut body = serde_json::json!({});
 
-        // 系统提示：Gemini 使用顶层 systemInstruction
-        if let Some(ref system_prompt) = request.system_prompt {
+        // 剔除 system 条目：Gemini 的 contents 只接受 user/model 两种角色，
+        // 混入 role:"system" 会被拒绝。而 ccore 工作记忆会在对话中途注入 system
+        // 条目（反射弧建议、doom loop 逃脱提示、元认知建议、压缩摘要、CCODE.md），
+        // 且 build_sample_request 把 system_prompt 置为 None，全落在 messages 里。
+        let (inline_system, without_system) =
+            super::claude_compat::ClaudeCompatProvider::extract_system_messages(&request.messages);
+
+        // 系统提示：Gemini 使用顶层 systemInstruction。
+        // 显式 system_prompt 与内联 system 条目都要带上，按 显式 → 内联 顺序拼接。
+        let system_text = match (request.system_prompt.as_deref(), inline_system.as_deref()) {
+            (Some(explicit), Some(inline)) => Some(format!("{explicit}\n\n{inline}")),
+            (Some(explicit), None) => Some(explicit.to_string()),
+            (None, Some(inline)) => Some(inline.to_string()),
+            (None, None) => None,
+        };
+        if let Some(ref system_prompt) = system_text {
             body["systemInstruction"] = serde_json::json!({
                 "parts": [{"text": system_prompt}]
             });
@@ -81,7 +98,7 @@ impl GeminiProvider {
 
         // 构建 contents 数组
         let mut contents = Vec::new();
-        for m in &request.messages {
+        for m in &without_system {
             // Gemini 角色映射：assistant → model
             let role = match m.role.as_str() {
                 "assistant" => "model",
@@ -94,10 +111,12 @@ impl GeminiProvider {
         }
         body["contents"] = serde_json::json!(contents);
 
-        // 工具定义 → functionDeclarations
+        // 工具定义 → functionDeclarations（按名称排序确保跨轮次字节稳定）
         if !request.tools.is_empty() {
-            let function_declarations: Vec<serde_json::Value> = request
-                .tools
+            let mut sorted_tools: Vec<_> = request.tools.iter().collect();
+            sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+            let function_declarations: Vec<serde_json::Value> = sorted_tools
                 .iter()
                 .map(|t| {
                     serde_json::json!({
@@ -154,7 +173,7 @@ impl GeminiProvider {
                 });
             }
         }
-        if generation_config.as_object().map_or(false, |o| !o.is_empty()) {
+        if generation_config.as_object().is_some_and(|o| !o.is_empty()) {
             body["generationConfig"] = generation_config;
         }
 
@@ -429,6 +448,12 @@ impl Provider for GeminiProvider {
             })
             .flat_map(futures::stream::iter);
 
+        let stream = super::idle_timeout::with_idle_timeout(
+            stream,
+            request.idle_timeout_secs,
+            request_id,
+        );
+
         Ok(Box::pin(stream))
     }
 
@@ -498,6 +523,20 @@ impl Provider for GeminiProvider {
 
     fn name(&self) -> &str {
         &self.config.name
+    }
+
+    async fn warm_up(&self) -> Result<()> {
+        let url = self.stream_url(self.config.models.first().map(|s| s.as_str()).unwrap_or("gemini-pro"));
+        tracing::info!("预热 Provider {} 连接：{}", self.config.name, url);
+        match self.client.head(&url).send().await {
+            Ok(resp) => {
+                tracing::info!("Provider {} 连接预热完成，status={}", self.config.name, resp.status());
+            }
+            Err(e) => {
+                tracing::warn!("Provider {} 连接预热失败（非致命）：{}", self.config.name, e);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -577,7 +616,9 @@ mod tests {
             tool_choice: None,
             prompt_cache_key: None,
             goal_verify: false,
+            summarize: false,
             extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
         };
 
         let body = provider.build_request_body(&request);
@@ -588,6 +629,77 @@ mod tests {
         );
         // 消息角色应为 user（非 assistant 不变）
         assert_eq!(body["contents"][0]["role"], "user");
+    }
+
+    /// Gemini 的 contents 只接受 user/model。工作记忆中途注入的 system 条目
+    /// 必须提到顶层 systemInstruction，否则请求被拒。
+    ///
+    /// 字段名与 Anthropic 不同（systemInstruction vs system、model vs assistant），
+    /// 故需独立覆盖，claude_compat 的测试不能替代。
+    #[test]
+    fn request_body_hoists_inline_system_messages() {
+        let config = GeminiConfig {
+            name: "gemini".into(),
+            api_key: "test-key".into(),
+            base_url: "https://generativelanguage.googleapis.com".into(),
+            models: vec!["gemini-2.5-pro".into()],
+        };
+        let provider = GeminiProvider::new(config);
+
+        let mk = |role: &str, content: &str| super::super::provider::ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            cache_control: None,
+        };
+
+        let request = SampleRequest {
+            request_id: "req-1".into(),
+            agent_id: "agent-1".into(),
+            model: "gemini-2.5-pro".into(),
+            messages: vec![
+                mk("system", "项目上下文：Rust 工程"),
+                mk("user", "帮我看下代码"),
+                mk("assistant", "好的"),
+                mk("system", "[反射弧建议] 换个方法"),
+            ],
+            tools: Vec::new(),
+            stream: true,
+            reasoning_effort: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            system_prompt: Some("You are helpful.".into()),
+            tool_choice: None,
+            prompt_cache_key: None,
+            goal_verify: false,
+            summarize: false,
+            extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
+        };
+
+        let body = provider.build_request_body(&request);
+
+        // 显式 system_prompt 与两条内联 system 都应进入 systemInstruction
+        let si = body["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .expect("应有 systemInstruction");
+        assert!(si.contains("You are helpful."), "显式 system_prompt 不能丢");
+        assert!(si.contains("项目上下文"));
+        assert!(si.contains("[反射弧建议]"), "中途注入的 system 不能丢");
+
+        // contents 里只能有 user/model
+        let contents = body["contents"].as_array().expect("应有 contents");
+        assert_eq!(contents.len(), 2, "两条 system 应已剔除");
+        for c in contents {
+            let role = c["role"].as_str().unwrap();
+            assert!(
+                role == "user" || role == "model",
+                "contents 只接受 user/model，实际出现：{role}"
+            );
+        }
+        // assistant 应映射为 model
+        assert_eq!(contents[1]["role"], "model");
     }
 
     #[test]
@@ -624,7 +736,9 @@ mod tests {
             tool_choice: Some(super::super::provider::ToolChoice::Auto),
             prompt_cache_key: None,
             goal_verify: false,
+            summarize: false,
             extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
         };
 
         let body = provider.build_request_body(&request);

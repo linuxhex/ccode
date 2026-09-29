@@ -101,6 +101,15 @@ pub enum HookEvent {
     // Compaction
     PreCompact,
     PostCompact,
+    // Task lifecycle
+    TaskCreated,
+    TaskCompleted,
+    // File/config/cwd changes
+    FileChanged,
+    ConfigChange,
+    CwdChanged,
+    // Permission
+    PermissionRequest,
 }
 
 impl std::fmt::Display for HookEvent {
@@ -120,6 +129,12 @@ impl std::fmt::Display for HookEvent {
             Self::SubagentStop => write!(f, "Subagent Stop"),
             Self::PreCompact => write!(f, "Pre-Compact"),
             Self::PostCompact => write!(f, "Post-Compact"),
+            Self::TaskCreated => write!(f, "Task Created"),
+            Self::TaskCompleted => write!(f, "Task Completed"),
+            Self::FileChanged => write!(f, "File Changed"),
+            Self::ConfigChange => write!(f, "Config Change"),
+            Self::CwdChanged => write!(f, "CWD Changed"),
+            Self::PermissionRequest => write!(f, "Permission Request"),
         }
     }
 }

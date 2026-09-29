@@ -29,8 +29,7 @@ fn assistant_text(text: &str) -> ConversationItem {
         content: text.into(),
         tool_calls: vec![],
         model_id: None,
-        model_fingerprint: None,
-        reasoning_effort: None,
+        ..Default::default()
     })
 }
 
@@ -43,8 +42,7 @@ fn assistant_with_tool_call(text: &str, name: &str, args: &str) -> ConversationI
             arguments: args.into(),
         }],
         model_id: None,
-        model_fingerprint: None,
-        reasoning_effort: None,
+        ..Default::default()
     })
 }
 
@@ -84,8 +82,7 @@ fn assistant_with_reasoning_items(
         content: content.into(),
         tool_calls,
         model_id: None,
-        model_fingerprint: None,
-        reasoning_effort: None,
+        ..Default::default()
     }));
     out
 }
@@ -203,8 +200,7 @@ fn flatten_skips_reasoning_when_encrypted_only() {
             content: "ok".into(),
             tool_calls: vec![],
             model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         }),
     ];
     let out = flatten_transcript_for_classifier(&items, true);
@@ -235,8 +231,7 @@ fn flatten_skips_reasoning_when_text_is_empty() {
             content: "ok".into(),
             tool_calls: vec![],
             model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
+            ..Default::default()
         }),
     ];
     let out = flatten_transcript_for_classifier(&items, true);
@@ -540,8 +535,7 @@ fn window_assistant_text_pin_skips_empty_assistant_turns() {
             arguments: "{}".into(),
         }],
         model_id: None,
-        model_fingerprint: None,
-        reasoning_effort: None,
+        ..Default::default()
     });
     // 5 real text turns at idxs 0..5, then 10 empty turns.
     let mut items: Vec<ConversationItem> =

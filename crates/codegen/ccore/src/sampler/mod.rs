@@ -8,6 +8,9 @@ pub mod router;
 pub mod retry;
 pub mod token_budget;
 pub mod cache_break;
+pub mod cache_placement;
+pub mod idle_timeout;
+pub mod tool_stability;
 
 pub use provider::{Provider, SampleRequest, StreamChunk, SampleResponse, TokenUsage, ChatMessage, ToolDefinition as SamplerToolDefinition, ToolChoice, SamplerEvent, CancellationHandle, ContentBlock, ThinkingConfig};
 pub use router::ProviderRouter;

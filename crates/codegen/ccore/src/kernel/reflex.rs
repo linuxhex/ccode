@@ -96,9 +96,14 @@ pub enum ReflexAction {
 pub struct ReflexRouter {
     /// 规则库：signal_topic_prefix → 规则列表
     rules: HashMap<String, Vec<ReflexRule>>,
-    /// 已编译的正则：rule_id → regex::Regex
-    #[allow(dead_code)]
+    /// 编译后的正则表达式缓存（rule.id → Regex）
     compiled_patterns: HashMap<String, regex::Regex>,
+}
+
+impl Default for ReflexRouter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReflexRouter {
@@ -130,7 +135,18 @@ impl ReflexRouter {
         }
 
         let key = rule.signal_topic.clone();
-        self.rules.entry(key).or_default().push(rule);
+        let bucket = self.rules.entry(key).or_default();
+        bucket.push(rule);
+        // 同一 topic 下按「具体性」排序，避免先注册的宽泛规则永久遮蔽后注册的规则。
+        //
+        // `route` 返回首个匹配，若纯按注册顺序，`pattern: ".*"` 的规则会吃掉
+        // 同 topic 所有信号（内置的 log_compile_error 就会遮蔽 compile_error_slow_down）。
+        // 排序键：pattern 非 `.*` 者优先（更具体），其次产出 motor 指令者优先于纯日志。
+        bucket.sort_by_key(|r| {
+            let catch_all = if r.pattern == ".*" { 1 } else { 0 };
+            let log_only = if r.action == "kernel/log" { 1 } else { 0 };
+            (catch_all, log_only)
+        });
     }
 
     /// 匹配感官信号，返回对应的反射动作
@@ -412,6 +428,53 @@ pub fn builtin_reflex_rules() -> Vec<ReflexRule> {
             consecutive_fails: 0,
             disabled: false,
         },
+
+        // ── L1_formal 反射：产出 motor 指令，调整 ThinkerNode 行为 ──
+        //
+        // action 里的 `{agent_id}` 由 Kernel 用信号 payload 的 agent_id 替换
+        // （见 `Kernel::resolve_action_topic`）——ThinkerNode 订阅的是
+        // `motor/{自身id}/adjust`，而规则表是静态的。
+        //
+        // params 即 motor 消息的 payload，字段契约由 `handle_motor_adjust` 定义：
+        // `action` 必填（slow_down / switch_strategy / disable_tool），
+        // `switch_strategy` 需 `hint`，`disable_tool` 需 `tool`。
+
+        // 工具执行失败 → 建议换策略
+        // sensory/skin/{tool} 的 payload 含 "success": false
+        ReflexRule {
+            id: "tool_failure_switch_strategy".into(),
+            pattern: r#""success"\s*:\s*false"#.into(),
+            signal_topic: "sensory/skin".into(),
+            level: ReflexLevel::L1Formal,
+            action: "motor/{agent_id}/adjust".into(),
+            params: serde_json::json!({
+                "action": "switch_strategy",
+                "hint": "上一个工具调用失败了，换一种方法或先排查原因，不要重复相同的调用"
+            }),
+            source: "manual".into(),
+            use_count: 0,
+            success_count: 0,
+            consecutive_fails: 0,
+            disabled: false,
+        },
+
+        // 编译错误 → 提高 doom loop 检测灵敏度
+        // 编译错误往往伴随反复试错，收紧阈值可更早发现循环
+        ReflexRule {
+            id: "compile_error_slow_down".into(),
+            pattern: r".*".into(),
+            signal_topic: "sensory/nose/compile_error".into(),
+            level: ReflexLevel::L1Formal,
+            action: "motor/{agent_id}/adjust".into(),
+            params: serde_json::json!({
+                "action": "slow_down"
+            }),
+            source: "manual".into(),
+            use_count: 0,
+            success_count: 0,
+            consecutive_fails: 0,
+            disabled: false,
+        },
     ]
 }
 
@@ -459,11 +522,15 @@ mod tests {
             r#"{"error_count": 3, "errors": ["error[E0277]: mismatched types"]}"#,
         );
         assert!(action.is_some());
+        // 行为变更（2026-08-25）：编译错误现在优先命中 L1_formal 的 slow_down 规则，
+        // 而非此前的纯日志规则。日志能力未丢失——Kernel 的 L1_formal 分支自带
+        // tracing::info! 记录，而 slow_down 还能真正收紧 doom loop 检测灵敏度。
         match action {
-            Some(ReflexAction::Direct { action, .. }) => {
-                assert_eq!(action, "kernel/log"); // 纯日志通知
+            Some(ReflexAction::Instinct { action, params }) => {
+                assert_eq!(action, "motor/{agent_id}/adjust");
+                assert_eq!(params["action"], "slow_down");
             }
-            _ => panic!("L0 规则应返回 Direct"),
+            other => panic!("编译错误应命中 L1_formal motor 规则，实际：{other:?}"),
         }
     }
 
@@ -560,5 +627,135 @@ mod tests {
 
         let rule = router.all_rules().into_iter().find(|r| r.id == "test_rule").expect("规则应存在");
         assert!(rule.disabled);
+    }
+
+    /// 反射弧回路已接通：内置规则表必须能产出 motor 指令。
+    ///
+    /// 此前两条内置规则的 action 都是 `kernel/log`，走 kernel 的"只记日志"分支，
+    /// 导致 ThinkerNode 的 `handle_motor_adjust`（slow_down / switch_strategy /
+    /// disable_tool）零触发。本测试守住回路不再退化。
+    #[test]
+    fn builtin_rules_emit_motor_actions() {
+        const THINKER_MOTOR_ACTIONS: &[&str] = &["slow_down", "switch_strategy", "disable_tool"];
+
+        let rules = builtin_reflex_rules();
+        let motor_rules: Vec<&ReflexRule> = rules
+            .iter()
+            .filter(|r| r.action.starts_with("motor/"))
+            .collect();
+
+        assert!(
+            !motor_rules.is_empty(),
+            "内置规则表必须至少有一条产出 motor 指令的规则"
+        );
+
+        for r in &motor_rules {
+            // motor topic 必须带 {agent_id} 占位符——ThinkerNode 订阅 per-agent topic
+            assert!(
+                r.action.contains("{agent_id}"),
+                "规则 {} 的 motor topic 缺少 {{agent_id}} 占位符：{}",
+                r.id,
+                r.action
+            );
+            // params 里的 action 必须是 handle_motor_adjust 认识的值
+            let action = r.params["action"]
+                .as_str()
+                .unwrap_or_else(|| panic!("规则 {} 的 params 缺少 action 字段", r.id));
+            assert!(
+                THINKER_MOTOR_ACTIONS.contains(&action),
+                "规则 {} 的 params.action='{}' 不是 handle_motor_adjust 支持的值",
+                r.id,
+                action
+            );
+            // switch_strategy 需要 hint，disable_tool 需要 tool
+            match action {
+                "switch_strategy" => assert!(
+                    r.params["hint"].is_string(),
+                    "规则 {} 的 switch_strategy 缺少 hint",
+                    r.id
+                ),
+                "disable_tool" => assert!(
+                    r.params["tool"].is_string(),
+                    "规则 {} 的 disable_tool 缺少 tool",
+                    r.id
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    /// 宽泛规则（pattern `.*`、纯日志）不得遮蔽同 topic 下更具体的规则。
+    ///
+    /// `route` 返回首个匹配，若纯按注册顺序，内置的 `log_compile_error`
+    /// （`.*` + kernel/log）会吃掉 `sensory/nose/compile_error` 的所有信号，
+    /// 使 `compile_error_slow_down` 永不生效。
+    #[test]
+    fn specific_rules_are_not_shadowed_by_catch_all() {
+        let router = ReflexRouter::with_rules(builtin_reflex_rules());
+
+        let action = router
+            .route("sensory/nose/compile_error", r#"{"error_count":3,"agent_id":"a1"}"#)
+            .expect("编译错误应命中规则");
+
+        // 应命中产出 motor 的规则，而非仅记日志的那条
+        match action {
+            ReflexAction::Instinct { action, params } => {
+                assert!(action.starts_with("motor/"), "应产出 motor 指令，实际：{action}");
+                assert_eq!(params["action"], "slow_down");
+            }
+            other => panic!("编译错误应命中 L1_formal motor 规则，实际：{other:?}"),
+        }
+    }
+
+    /// 工具失败信号（payload 含 "success": false）应触发换策略建议。
+    #[test]
+    fn tool_failure_triggers_switch_strategy() {
+        let router = ReflexRouter::with_rules(builtin_reflex_rules());
+
+        let action = router
+            .route(
+                "sensory/skin/bash",
+                r#"{"tool_name":"bash","success":false,"agent_id":"a1"}"#,
+            )
+            .expect("工具失败应命中规则（前缀匹配 sensory/skin）");
+
+        match action {
+            ReflexAction::Instinct { action, params } => {
+                assert_eq!(action, "motor/{agent_id}/adjust");
+                assert_eq!(params["action"], "switch_strategy");
+                assert!(params["hint"].is_string());
+            }
+            other => panic!("应命中 switch_strategy 规则，实际：{other:?}"),
+        }
+    }
+
+    /// 工具成功时不应触发换策略——避免正常路径被误判。
+    #[test]
+    fn tool_success_does_not_trigger_switch_strategy() {
+        let router = ReflexRouter::with_rules(builtin_reflex_rules());
+
+        let action = router.route(
+            "sensory/skin/bash",
+            r#"{"tool_name":"bash","success":true,"agent_id":"a1"}"#,
+        );
+
+        // 成功信号不匹配 "success": false 模式，不应产出 switch_strategy
+        if let Some(ReflexAction::Instinct { ref params, .. }) = action {
+            assert_ne!(
+                params["action"], "switch_strategy",
+                "工具成功不应触发换策略建议"
+            );
+        }
+    }
+
+    /// 前缀匹配语义：`sensory/eye/read_file` 应命中 `sensory/eye` 规则。
+    #[test]
+    fn route_prefix_matches_sensory_subtopic() {
+        let router = ReflexRouter::with_rules(builtin_reflex_rules());
+        let action = router.route("sensory/eye/read_file", r#"{"tool_name":"read_file"}"#);
+        assert!(
+            action.is_some(),
+            "sensory/eye/read_file 应通过前缀匹配命中 sensory/eye 规则"
+        );
     }
 }

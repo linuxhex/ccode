@@ -116,7 +116,7 @@ pub fn validate_compaction_text(
 fn detect_repetition_ratio(text: &str) -> f64 {
     // 按句号、换行、分号分割为片段
     let fragments: Vec<&str> = text
-        .split(|c| c == '.' || c == '\n' || c == ';' || c == '。')
+        .split(['.', '\n', ';', '。'])
         .map(|s| s.trim())
         .filter(|s| s.len() >= 10) // 只检测长度 >= 10 的有意义片段
         .collect();

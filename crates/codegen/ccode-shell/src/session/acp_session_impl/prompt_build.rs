@@ -522,9 +522,41 @@ impl SessionActor {
         use ccode_agent::prompt::user_message::UserMessageContext;
         self.wait_for_mcp_templated_prefix_ready(&template).await;
         let cwd_str = cwd.to_string_lossy().to_string();
+        tracing::info!(
+            session_id = %self.session_info.id,
+            "gathering context (vcs/agents/skills/mcp)..."
+        );
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let (vcs_root, vcs_status) = self.gather_vcs_for_prefix(cwd).await;
-        let agents_files = read_agents_config_with_paths(&cwd_str, self.rebuild_spec.compat).await;
+        let (vcs_result, agents_result, skills, mcp_servers) = tokio::select! {
+            result = async {
+                tokio::join!(
+                    self.gather_vcs_for_prefix(cwd),
+                    read_agents_config_with_paths(&cwd_str, self.rebuild_spec.compat),
+                    bridge.slash_skills(),
+                    self.gather_mcp_servers(cwd),
+                )
+            } => result,
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                tracing::error!(
+                    session_id = %self.session_info.id,
+                    "prompt build timeout: one of vcs/agents/skills/mcp hung for 5s"
+                );
+                (
+                    (None, None),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+        };
+        tracing::info!(
+            session_id = %self.session_info.id,
+            skills_count = skills.len(),
+            mcp_servers_count = mcp_servers.len(),
+            "context gathered, building prompt..."
+        );
+        let (vcs_root, vcs_status) = vcs_result;
+        let agents_files = agents_result;
         let ccode_home = ccode_config::ccode_home();
         let vendor_homes = dirs::home_dir()
             .map(|home_dir| {
@@ -550,8 +582,6 @@ impl SessionActor {
             &vendor_homes,
             Some(&workspace_root),
         );
-        let skills = bridge.slash_skills().await;
-        let mcp_servers = self.gather_mcp_servers(cwd).await;
         let shell = resolve_session_shell();
         let today_local = chrono::Local::now().date_naive();
         let mcps_root = Self::workspace_mcps_root(cwd).map(|p| p.to_string_lossy().to_string());

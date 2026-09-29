@@ -12,7 +12,7 @@ use agent_client_protocol as acp;
 use serial_test::serial;
 use tokio::sync::{mpsc, oneshot};
 use ccode_acp::{AcpAgentGatewaySender, AcpClientMessage};
-use ccode_pathss::AbsPathBuf;
+use ccode_paths::AbsPathBuf;
 use ccode_workspace::permission::types::{
     PatternMode, PermissionConfig, PermissionRule, RuleAction, ToolFilter,
 };
@@ -162,6 +162,7 @@ async fn request(handle: &PermissionHandle, access: AccessKind, id: &str) -> Dec
         session_id: None,
         subagent_type: None,
         subagent_description: None,
+        side_effects: None,
     };
     let PermissionHandle::Actor { cmd_tx, .. } = handle else {
         panic!("expected actor handle");
@@ -242,7 +243,7 @@ fn rule(action: RuleAction, pattern: &str) -> PermissionRule {
 #[tokio::test]
 #[serial]
 async fn mcp_tool_grant_persists_and_short_circuits_next_request() {
-    run_actor_test(ClientType::CcodePager, |handle, gw, cwd| async move {
+    run_actor_test(ClientType::CcodePager, |handle, gw: FakeGateway, cwd| async move {
         // First request prompts; user picks tool-scope.
         gw.expect_allow_always_mcp_tool("linear__list");
         let d = request(&handle, mcp("linear__list"), "1").await;
@@ -304,7 +305,7 @@ async fn fallback_client_plain_allow_always_persists_mcp_tool() {
     // submit the legacy `"always-allow"` option id. The prompter maps that
     // to plain `PromptOutcome::AllowAlways`, and the manager's plain arm
     // must persist tool-scope into `allowed_mcp_tools`.
-    run_actor_test(ClientType::Generic, |handle, gw, cwd| async move {
+    run_actor_test(ClientType::Generic, |handle, gw: FakeGateway, cwd| async move {
         gw.expect_plain_allow_always();
         let d = request(&handle, mcp("notion__fetch"), "1").await;
         assert!(matches!(d, Decision::Allow));
@@ -500,7 +501,7 @@ async fn empty_server_prefix_falls_back_to_tool_scope() {
     // somehow makes it through, the prompter must downgrade to tool-scope
     // and persist via `AllowAlwaysMcpTool` — never write an empty server
     // prefix into `allowed_mcp_servers`.
-    run_actor_test(ClientType::CcodePager, |handle, gw, cwd| async move {
+    run_actor_test(ClientType::CcodePager, |handle, gw: FakeGateway, cwd| async move {
         let meta = serde_json::json!({
             "kind": "server",
             "server": "",
@@ -532,7 +533,7 @@ async fn allow_always_mcp_tool_ignores_client_supplied_tool_name() {
     // only. The manager MUST persist the name from `AccessKind::MCPTool`
     // so a buggy or malicious client cannot whitelist a different tool
     // than the one the user saw in the prompt.
-    run_actor_test(ClientType::CcodePager, |handle, gw, cwd| async move {
+    run_actor_test(ClientType::CcodePager, |handle, gw: FakeGateway, cwd| async move {
         // Request approves `linear__list`, but the response claims a
         // different tool name (e.g. `notion__fetch`).
         let meta = serde_json::json!({
@@ -572,7 +573,7 @@ async fn allow_always_mcp_server_rejects_mismatched_prefix() {
     // canonical server prefix derived from the access kind. On mismatch,
     // the manager downgrades to tool-scope on the access-kind name -- the
     // smallest blast radius the user actually approved.
-    run_actor_test(ClientType::CcodePager, |handle, gw, cwd| async move {
+    run_actor_test(ClientType::CcodePager, |handle, gw: FakeGateway, cwd| async move {
         // Approve `linear__list` (canonical server prefix is `linear`),
         // but the client claims `notion` as the server.
         let meta = serde_json::json!({
@@ -614,7 +615,7 @@ async fn allow_always_mcp_server_rejects_mismatched_prefix() {
 async fn allow_always_mcp_server_persists_canonical_prefix_on_match() {
     // Sanity: a client that supplies the correct canonical prefix
     // succeeds (this is the common case post-fix).
-    run_actor_test(ClientType::CcodePager, |handle, gw, cwd| async move {
+    run_actor_test(ClientType::CcodePager, |handle, gw: FakeGateway, cwd| async move {
         let meta = serde_json::json!({
             "kind": "server",
             "server": "linear",
@@ -646,7 +647,7 @@ async fn allow_always_mcp_server_downgrades_when_access_has_no_separator() {
     // malformed `ToolInput::MCPTool`), the canonical prefix is None and
     // server-scope is unreachable. The manager downgrades to tool-scope
     // on the raw access name rather than persisting the client prefix.
-    run_actor_test(ClientType::CcodePager, |handle, gw, cwd| async move {
+    run_actor_test(ClientType::CcodePager, |handle, gw: FakeGateway, cwd| async move {
         let meta = serde_json::json!({
             "kind": "server",
             "server": "linear",

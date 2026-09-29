@@ -777,8 +777,7 @@ mod tests {
                     tc("grep", r#"{"pattern":"x","path":"src/"}"#),
                 ],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("c", "file contents"),
         ];

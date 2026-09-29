@@ -200,7 +200,14 @@ impl McpCredentialStore {
         }
 
         let content = serde_json::to_string_pretty(self)?;
-        let tmp_path = path.with_extension("tmp");
+        // 生成唯一临时文件路径：`<base>.{pid}.tmp`
+        // 不用 with_extension("tmp")——它会替换扩展名（data.json → data.tmp）
+        let mut tmp_name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        tmp_name.push(format!(".{}.tmp", std::process::id()));
+        let tmp_path = path.with_file_name(tmp_name);
 
         {
             use std::io::Write;

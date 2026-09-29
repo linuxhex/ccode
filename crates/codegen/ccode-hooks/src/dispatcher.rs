@@ -137,7 +137,7 @@ pub async fn dispatch_pre_tool_use(
         if let Some(ctx) = rewrite_info.additional_context {
             // Append additional context from each hook.
             if let Some(ref mut existing) = combined_rewrite.additional_context {
-                existing.push_str("\n");
+                existing.push('\n');
                 existing.push_str(&ctx);
             } else {
                 combined_rewrite.additional_context = Some(ctx);
@@ -436,6 +436,9 @@ pub async fn dispatch_stop(
 }
 
 /// Dispatch an observe-only event against all matching hooks; never denies.
+///
+/// Hooks run sequentially in config order. Use [`dispatch_non_blocking_parallel`]
+/// for concurrent execution when hook ordering doesn't matter.
 pub async fn dispatch_non_blocking(
     registry: &HookRegistry,
     event: HookEventName,
@@ -515,6 +518,102 @@ pub async fn dispatch_non_blocking(
 
     record_dispatch_counts(&span, &results);
 
+    results
+}
+
+/// Dispatch an observe-only event with all matching hooks running concurrently.
+///
+/// Unlike [`dispatch_non_blocking`], hooks execute in parallel via
+/// `tokio::task::JoinSet`. Results are collected in completion order but
+/// returned sorted by hook name for deterministic output. Use this when
+/// observe hooks are independent and latency matters.
+pub async fn dispatch_non_blocking_parallel(
+    registry: &HookRegistry,
+    event: HookEventName,
+    envelope: &HookEventEnvelope,
+    ctx: &RunContext<'_>,
+) -> Vec<HookRunResult> {
+    debug_assert!(
+        event.traits().gate == GateKind::Observe,
+        "dispatch_non_blocking_parallel called with gate event {event:?}"
+    );
+    let hooks = registry.hooks_for_canonical(event);
+    if hooks.is_empty() {
+        return Vec::new();
+    }
+
+    let span = dispatch_span(event, hooks.len());
+    let _enter = span.enter();
+
+    let match_value = envelope.payload.match_value().map(str::to_string);
+    let mut pre_results = Vec::new();
+    let eligible: Vec<&HookSpec> = hooks
+        .iter()
+        .filter(|spec| eligible_or_record_skip(spec, match_value.as_deref(), &mut pre_results))
+        .copied()
+        .collect();
+
+    if eligible.is_empty() {
+        return pre_results;
+    }
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for spec in eligible {
+        let spec = spec.clone();
+        let envelope = envelope.clone();
+        let session_id = ctx.session_id.to_string();
+        let workspace_root = ctx.workspace_root.to_string();
+        join_set.spawn(async move {
+            let run_ctx = RunContext {
+                session_id: &session_id,
+                workspace_root: &workspace_root,
+            };
+            let (result, elapsed, http_info, _) =
+                runner::run_hook(&spec, &envelope, &run_ctx, GateKind::Observe).await;
+            (spec.name, result, elapsed, http_info)
+        });
+    }
+
+    let mut results = pre_results;
+    while let Some(Ok((hook_name, result, elapsed, http_info))) = join_set.join_next().await {
+        match result {
+            HookRunnerResult::Success => {
+                tracing::info!(
+                    hook_name = %hook_name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "hook completed (parallel)"
+                );
+                results.push(HookRunResult::Success {
+                    hook_name,
+                    elapsed,
+                    http_info,
+                });
+            }
+            HookRunnerResult::Failed(err) => {
+                tracing::warn!(
+                    hook_name = %hook_name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    error = %err,
+                    "hook failed (parallel)"
+                );
+                results.push(HookRunResult::Failed {
+                    hook_name,
+                    error: err,
+                    elapsed,
+                    http_info,
+                });
+            }
+            _ => {
+                results.push(HookRunResult::Success {
+                    hook_name,
+                    elapsed,
+                    http_info,
+                });
+            }
+        }
+    }
+
+    record_dispatch_counts(&span, &results);
     results
 }
 
@@ -632,6 +731,10 @@ mod tests {
             timeout_ms: 5000,
             source_dir: PathBuf::from("/tmp"),
             extra_env: HashMap::new(),
+            async_run: false,
+            async_rewake: false,
+            rewake_message: None,
+            condition: None,
         }
     }
 
@@ -1184,6 +1287,7 @@ mod tests {
     #[test]
     fn hub_hook_kind_maps_all_hub_forwarded_events() {
         assert_eq!(hub_hook_kind(HookEventName::PreToolUse), None);
+        assert_eq!(hub_hook_kind(HookEventName::PermissionRequest), None);
 
         let cases: &[(HookEventName, &str)] = &[
             (HookEventName::SessionStart, "hook.session_start"),
@@ -1203,6 +1307,11 @@ mod tests {
             (HookEventName::SubagentEnd, "hook.subagent_stop"),
             (HookEventName::PreCompact, "hook.pre_compact"),
             (HookEventName::PostCompact, "hook.post_compact"),
+            (HookEventName::TaskCreated, "hook.task_created"),
+            (HookEventName::TaskCompleted, "hook.task_completed"),
+            (HookEventName::FileChanged, "hook.file_changed"),
+            (HookEventName::ConfigChange, "hook.config_change"),
+            (HookEventName::CwdChanged, "hook.cwd_changed"),
         ];
 
         // Exhaustive match: adding a new HookEventName variant causes a
@@ -1223,11 +1332,17 @@ mod tests {
                 | HookEventName::SubagentStop
                 | HookEventName::SubagentEnd
                 | HookEventName::PreCompact
-                | HookEventName::PostCompact => 15,
+                | HookEventName::PostCompact
+                | HookEventName::TaskCreated
+                | HookEventName::TaskCompleted
+                | HookEventName::FileChanged
+                | HookEventName::ConfigChange
+                | HookEventName::PermissionRequest
+                | HookEventName::CwdChanged => 21,
             }
         };
         assert_eq!(
-            cases.len() + 1, // +1 for PreToolUse (blocking, tested separately)
+            cases.len() + 2, // +2 for PreToolUse and PermissionRequest (hub_forward=false)
             total_variants(HookEventName::SessionStart),
             "update hub_hook_kind test when new HookEventName variants are added"
         );

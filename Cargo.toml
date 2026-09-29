@@ -1,4 +1,10 @@
-# Auto-generated workspace root. Prefer editing per-crate Cargo.toml files.
+# 本文件手工维护（此前注释称 "Auto-generated" 但 scripts/ 下并无生成器，已更正）。
+#
+# 维护规则：新增 crate 必须显式列进 members 或 exclude 之一。
+# 只是不列进 members 并不等于排除——若无任何依赖者，该 crate 会静默掉出构建图，
+# cargo 在其目录内会报 "believes it's in a workspace when it's not"，
+# 而根目录的 `cargo check --workspace` 对它零覆盖（改动不会被编译，测试不会跑）。
+# 验证某 crate 是否真在构建图内：`cargo metadata --no-deps` 按 manifest_path 比对。
 
 [patch.crates-io]
 async-openai = { git = "https://github.com/our-forks/async-openai.git", rev = "95b52ebdedf42143083cf3d6f0e0be7c84e9c808" }
@@ -7,83 +13,63 @@ async-openai = { git = "https://github.com/our-forks/async-openai.git", rev = "9
 resolver = "2"
 members = [
     "crates/codegen/ccore",
+    "crates/codegen/ccore-advanced",
+    "crates/codegen/ccore-python",
     "crates/codegen/ccode-cli",
-    "crates/build/ccode-proto-build",
-    "crates/codegen/ptyctl",
-    "crates/codegen/ptyctl-cli",
-    "crates/codegen/ccode-acp",
-    "crates/codegen/ccode-lifecycle",
-    "crates/codegen/ccode-chat",
-    "crates/codegen/ccode-graph",
-    "crates/codegen/ccode-crash",
-    "crates/codegen/ccode-worktree",
-    "crates/codegen/ccode-fs",
-    "crates/codegen/ccode-fsnotify",
-    "crates/codegen/ccode-git",
-    "crates/codegen/ccode-agent",
-    "crates/codegen/ccode-announcements",
     "crates/codegen/ccode-auth",
     "crates/codegen/ccode-config",
-    "crates/codegen/ccode-config-types",
     "crates/codegen/ccode-env",
+    "crates/codegen/ccode-fs",
     "crates/codegen/ccode-hooks",
-    "crates/codegen/ccode-http",
     "crates/codegen/ccode-markdown",
     "crates/codegen/ccode-markdown-core",
-    "crates/codegen/ccode-mcp",
-    "crates/codegen/ccode-memory",
-    "crates/codegen/ccode-mermaid",
-    "crates/codegen/ccode-models",
-    "crates/codegen/ccode-pager",
-    "crates/codegen/ccode-pager-pty",
-    "crates/codegen/ccode-pager-render",
-    "crates/codegen/ccode-paths",
-    "crates/codegen/ccode-marketplace",
-    "crates/codegen/ccode-sampler",
-    "crates/codegen/ccode-sampling-types",
     "crates/codegen/ccode-sandbox",
-    "crates/codegen/ccode-secrets",
-    "crates/codegen/ccode-shared",
-    "crates/codegen/ccode-shell",
-    "crates/codegen/ccode-shell-base",
-    "crates/codegen/ccode-session",
-    "crates/codegen/ccode-subagent",
-    "crates/codegen/ccode-telemetry",
-    "crates/codegen/ccode-test-support",
+    "crates/codegen/ccode-textarea",
+    "crates/codegen/ccode-tokens",
     "crates/codegen/ccode-tools",
     "crates/codegen/ccode-tools-api",
-    "crates/codegen/ccode-update",
-    "crates/codegen/ccode-version",
-    "crates/codegen/ccode-voice",
-    "crates/codegen/ccode-workspace",
-    "crates/codegen/ccode-workspace-client",
-    "crates/codegen/ccode-workspace-types",
-    "crates/codegen/ccode-hooks-types",
-    "crates/codegen/ccode-hunk",
-    "crates/codegen/ccode-analytics",
-    "crates/codegen/ccode-prompt",
-    "crates/codegen/ccode-ratatui",
-    "crates/codegen/ccode-textarea",
-    "crates/codegen/ccode-journal",
-    "crates/codegen/ccode-power",
-    "crates/codegen/ccode-tokens",
     "crates/codegen/ccode-tty",
-    "crates/codegen/ccode-workflow",
+    "crates/codegen/ccode-version",
+    "crates/codegen/ccode-workspace-types",
     "crates/common/ccode-circuit-breaker",
-    "crates/common/ccode-hub-core",
-    "crates/common/ccode-hub-mcp",
-    "crates/common/ccode-hub-sdk",
     "crates/common/ccode-compaction",
+    "crates/common/ccode-hub-core",
+    "crates/common/ccode-hub-sdk",
     "crates/common/ccode-interjection",
-    "crates/common/ccode-test-utils",
     "crates/common/ccode-tool-protocol",
     "crates/common/ccode-tool-runtime",
     "crates/common/ccode-tool-types",
     "crates/common/ccode-tracing",
     "prod/mc/cli-chat-proxy-types",
+    # TUI 栈。ccode-pager 及其下方 6 项是它的传递依赖，必须一同入图，
+    # 否则 pager 无法解析（曾误将它们 exclude，报 "failed to get ccode-crash as a dependency"）。
+    "crates/codegen/ccode-pager",
+    "crates/codegen/ccode-pager-pty",
+    "crates/codegen/ccode-pager-render",
+    "crates/codegen/ccode-crash",
+    "crates/codegen/ccode-mermaid",
+    "crates/codegen/ccode-ratatui",
+    "crates/codegen/ccode-update",
+    "crates/codegen/ccode-voice",
+    "crates/codegen/ptyctl",
+    # ccode-mermaid 依赖的类型桩（完整实现已移除，render 一律返回错误触发降级）。
+    "third_party/mermaid-to-svg",
+]
+
+exclude = [
+    # 无任何依赖者、且不属于发布物的 crate。显式 exclude 而非「不列进 members」，
+    # 是为了避免悬空状态：不列也不排除的 crate 会静默掉出构建图，改动不被编译、
+    # 测试不会跑，而 cargo 只在其目录内报 "believes it's in a workspace when it's not"。
+    #
+    # 注意：exclude 后这些 crate 用 `edition.workspace = true` 就无法解析根清单，
+    # 因此**连单独 cargo build 也不可行**（报 "failed to find a workspace root"）。
+    # 它们是惰性的：要启用必须移回上面的 members，而不是在其目录内单独构建。
+
+    # ptyctl 的 CLI 前端，产出 ptyctl 二进制；npm/scripts/CI 均无引用，开发工具。
+    "crates/codegen/ptyctl-cli",
+    # 三个纯占位桩，各仅一行 `// placeholder`，无任何依赖者。
     "third_party/dagre_rust",
     "third_party/graphlib_rust",
-    "third_party/mermaid-to-svg",
     "third_party/ordered_hashmap",
 ]
 
@@ -297,7 +283,6 @@ ccode-memory = { path = "crates/codegen/ccode-memory" }
 ccode-mermaid = { path = "crates/codegen/ccode-mermaid" }
 ccode-models = { path = "crates/codegen/ccode-models" }
 ccode-sampler = { path = "crates/codegen/ccode-sampler" }
-ccode-secrets = { path = "crates/codegen/ccode-secrets" }
 ccode-shared = { path = "crates/codegen/ccode-shared" }
 ccode-shell = { path = "crates/codegen/ccode-shell" }
 ccode-shell-base = { path = "crates/codegen/ccode-shell-base" }
@@ -312,7 +297,6 @@ ccode-workspace = { path = "crates/codegen/ccode-workspace" }
 ccode-workspace-types = { path = "crates/codegen/ccode-workspace-types" }
 ccode-hooks-types = { path = "crates/codegen/ccode-hooks-types" }
 ccode-interjection = { path = "crates/common/ccode-interjection" }
-ccode-analytics = { path = "crates/codegen/ccode-analytics" }
 ccode-prompt = { path = "crates/codegen/ccode-prompt" }
 ccode-proto-build = { path = "crates/build/ccode-proto-build" }
 ccode-ratatui = { path = "crates/codegen/ccode-ratatui" }
@@ -379,6 +363,9 @@ debug = "line-tables-only"
 opt-level = 0
 lto = false
 incremental = true
+
+[profile.test]
+inherits = "dev"
 
 [profile.bench]
 debug = true

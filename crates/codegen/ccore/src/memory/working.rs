@@ -30,11 +30,23 @@
 //! 读取 O(1)，避免每次全量遍历。
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use super::embedding::{EmbeddingIndex, EmbeddingVector};
 use super::mmr::mmr_select;
 
-use ccode_compaction::micro_compact::{micro_compact_messages, MicroCompactable, MicroCompactConfig};
+/// 统一的 token 估算入口
+///
+/// 委托 `sampler::token_budget::TokenBudgetManager::estimate_tokens`（CJK/ASCII 分权重）。
+/// 压缩相关的估算值会汇总进 `used_tokens_cached`，进而决定压缩触发时机——
+/// 各处若用不同口径（曾并存 `len()/4` 与 `len()/3`）会让记账口径分叉，
+/// 且按字节除法会低估中文，属危险方向（以为还有余量，实际已溢出）。
+fn estimate_tokens_u32(text: &str) -> u32 {
+    crate::sampler::token_budget::TokenBudgetManager::estimate_tokens(text) as u32
+}
+
+use ccode_compaction::cache_aware::{cached_micro_compact, default_fingerprint, CacheAwareState};
+use ccode_compaction::micro_compact::{MicroCompactable, MicroCompactConfig};
 
 /// LLM 摘要客户端 trait
 ///
@@ -82,6 +94,29 @@ impl LlmSummarizer for TruncatingSummarizer {
             content.chars().take(self.max_chars).collect::<String>()
         ))
     }
+}
+
+/// Embedding 提供者 trait
+///
+/// 抽象 embedding 计算能力，用于自动计算消息间语义相似度。
+#[async_trait::async_trait]
+pub trait EmbeddingProvider: Send + Sync {
+    /// 批量计算文本的 embedding 向量
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, anyhow::Error>;
+}
+
+/// 计算两个向量的余弦相似度
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+    let norm_a: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+    let norm_b: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
 }
 
 /// 消息角色（标准 LLM API 格式）
@@ -168,6 +203,10 @@ pub struct CompactionPolicy {
     ///
     /// 0.5 表示保留首尾各 25%，中间替换为 [...已省略...]
     pub micro_compact_retain_ratio: f64,
+    /// 最大连续压缩失败次数（超过后停止自动压缩，类似断路器）
+    ///
+    /// 借鉴 Claude Code MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+    pub max_consecutive_compact_failures: u32,
 }
 
 impl Default for CompactionPolicy {
@@ -182,6 +221,19 @@ impl Default for CompactionPolicy {
             stable_prefix_enabled: true,
             tool_output_snip_threshold: 2000,
             micro_compact_retain_ratio: 0.5,
+            max_consecutive_compact_failures: 3,
+        }
+    }
+}
+
+impl From<&CompactionPolicy> for MicroCompactConfig {
+    fn from(policy: &CompactionPolicy) -> Self {
+        // micro_compact_retain_ratio 用于控制保留比例，但 MicroCompactConfig
+        // 使用 summary_max_chars（绝对字符数）。将 ratio 映射到 200~600 字符范围。
+        let summary_max_chars = (200.0 + policy.micro_compact_retain_ratio * 400.0) as usize;
+        Self {
+            max_age: Duration::from_secs(policy.wall_clock_budget_secs.max(60)),
+            summary_max_chars,
         }
     }
 }
@@ -235,6 +287,8 @@ pub enum WorkingEntry {
         role: MessageRole,
         content: String,
         token_count: u32,
+        /// 原始工具名（仅工具结果条目有值，用于微压缩指纹区分）
+        tool_name: Option<String>,
         /// 创建时间（用于微压缩的年龄判断；不参与序列化）
         #[serde(skip, default = "default_created_at")]
         created_at: std::time::Instant,
@@ -294,13 +348,14 @@ impl MicroCompactable for WorkingEntry {
     }
 
     fn tool_name(&self) -> Option<&str> {
-        // WorkingEntry 不存工具名。为让 micro_compact_messages 能按年龄处理
-        // Hot User 条目（工具结果），返回一个在 COMPACTABLE_TOOLS 白名单中的
-        // 名字作为务实降级。这样超龄的工具结果会被清除，新条目保持原样。
-        if matches!(self, Self::Hot { role: MessageRole::User, .. }) {
-            Some("FileRead")
-        } else {
-            None
+        match self {
+            Self::Hot {
+                role: MessageRole::User,
+                tool_name: Some(ref name),
+                ..
+            } => Some(name.as_str()),
+            // Warm/Cold 已是压缩态，不参与微压缩处理
+            _ => None,
         }
     }
 
@@ -317,15 +372,20 @@ impl MicroCompactable for WorkingEntry {
             Self::Hot {
                 role,
                 token_count,
+                tool_name,
                 created_at,
                 ..
             } => {
-                // 按新内容长度粗估 token（~4 字符/token），至少 1
-                let new_tokens = (new_content.len() as u32 / 4).max(1);
+                // 按新内容估算 token，至少 1。
+                // 复用统一估算器（CJK/ASCII 分权重）——按字节 len()/4 会低估中文，
+                // 而这些值会汇总进 used_tokens_cached 决定压缩触发时机，低估会导致
+                // 上下文实际溢出但记账以为还有余量。
+                let new_tokens = estimate_tokens_u32(&new_content).max(1);
                 Self::Hot {
                     role: *role,
                     content: new_content,
                     token_count: new_tokens.min(*token_count),
+                    tool_name: tool_name.clone(),
                     created_at: *created_at,
                 }
             }
@@ -356,6 +416,10 @@ pub struct WorkingMemory {
     /// 压缩操作只影响前缀之后的条目，最大化 API 侧 Prompt Cache 命中率。
     /// 在首次 push_system 后锁定，后续 push 操作不增加前缀长度。
     stable_prefix_len: usize,
+    /// Cache-Aware 压缩状态（追踪已压缩内容指纹，避免重复压缩）
+    cache_state: CacheAwareState,
+    /// 连续压缩失败次数（断路器，超过阈值后停止自动压缩）
+    consecutive_compact_failures: u32,
 }
 
 impl WorkingMemory {
@@ -368,6 +432,8 @@ impl WorkingMemory {
             embedding_index: EmbeddingIndex::new(),
             summarizer: None,
             stable_prefix_len: 0,
+            cache_state: CacheAwareState::default(),
+            consecutive_compact_failures: 0,
         }
     }
 
@@ -409,6 +475,97 @@ impl WorkingMemory {
         fallback.summarize(prompt, content).await
     }
 
+    /// Level 4 异步路径：真正的 LLM 全量摘要替换
+    ///
+    /// 收集 stable prefix 之后的所有条目，调用 LLM 生成摘要，
+    /// 然后用摘要替换这些条目。如果 LLM 不可用或失败，回退到同步的 AutoCompact。
+    ///
+    /// 返回压缩结果。调用方应在 `compact()` 返回 ReactiveCompact 级别后调用此方法。
+    pub async fn compact_reactive_llm(&mut self) -> CompactionResult {
+        let tokens_before = self.used_tokens_cached;
+        let prefix_end = if self.compaction_policy.stable_prefix_enabled { self.stable_prefix_len } else { 0 };
+
+        if prefix_end >= self.entries.len() {
+            return CompactionResult {
+                tokens_before,
+                tokens_after: tokens_before,
+                entries_compacted: 0,
+                compacted_range: (0, 0),
+            };
+        }
+
+        // 收集需要摘要的内容
+        let mut content_parts = Vec::new();
+        for entry in &self.entries[prefix_end..] {
+            match entry {
+                WorkingEntry::Hot { content, .. } => content_parts.push(content.clone()),
+                WorkingEntry::Warm { summary, .. } => content_parts.push(summary.clone()),
+                WorkingEntry::Cold { placeholder, .. } => content_parts.push(placeholder.clone()),
+            }
+        }
+
+        if content_parts.is_empty() {
+            return CompactionResult {
+                tokens_before,
+                tokens_after: tokens_before,
+                entries_compacted: 0,
+                compacted_range: (0, 0),
+            };
+        }
+
+        let full_content = content_parts.join("\n---\n");
+        let summary_prompt = concat!(
+            "请将以下对话历史压缩为简洁摘要。保留：关键决策、文件路径、错误修复、",
+            "用户意图、未完成任务。丢弃：闲聊、重复内容、原始工具输出。\n\n"
+        );
+
+        let summary = match self.summarize_content(&format!("{}\n{}", summary_prompt, full_content)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("ReactiveCompact LLM 摘要失败: {}，回退到 AutoCompact", e);
+                let policy = self.compaction_policy.clone();
+                return self.compact_with_policy(&policy);
+            }
+        };
+
+        // 计算摘要 token 数
+        let summary_tokens = (summary.len() as f32 / 4.0) as u32;
+
+        // 移除 prefix_end 之后的所有条目，替换为摘要
+        let removed_count = self.entries.len() - prefix_end;
+        self.entries.truncate(prefix_end);
+        self.entries.push(WorkingEntry::Hot {
+            role: MessageRole::System,
+            content: format!("<conversation_summary>\n{}\n</conversation_summary>", summary),
+            token_count: summary_tokens,
+            tool_name: None,
+            created_at: std::time::Instant::now(),
+        });
+
+        // 重新计算 token 使用量
+        self.recalculate_tokens();
+
+        let tokens_after = self.used_tokens_cached;
+        tracing::info!(
+            tokens_before,
+            tokens_after,
+            entries_removed = removed_count,
+            "ReactiveCompact: LLM 摘要替换完成"
+        );
+
+        CompactionResult {
+            tokens_before,
+            tokens_after,
+            entries_compacted: removed_count,
+            compacted_range: (prefix_end, prefix_end + removed_count),
+        }
+    }
+
+    /// 重新计算 token 使用量（遍历所有条目）
+    fn recalculate_tokens(&mut self) {
+        self.used_tokens_cached = self.entries.iter().map(|e| e.token_count()).sum::<u32>();
+    }
+
     /// 当前已用 token 数（O(1)，增量计数器）
     pub fn used_tokens(&self) -> u32 {
         self.used_tokens_cached
@@ -429,15 +586,27 @@ impl WorkingMemory {
         self.max_tokens
     }
 
-    /// 添加热消息（显式角色）
-    pub fn push_hot(&mut self, role: MessageRole, content: String, token_count: u32) {
+    /// 添加工具结果消息（显式角色 + 工具名）
+    pub fn push_hot_with_tool(
+        &mut self,
+        role: MessageRole,
+        content: String,
+        token_count: u32,
+        tool_name: Option<String>,
+    ) {
         self.used_tokens_cached += token_count;
         self.entries.push(WorkingEntry::Hot {
             role,
             content,
             token_count,
+            tool_name,
             created_at: std::time::Instant::now(),
         });
+    }
+
+    /// 添加热消息（显式角色）
+    pub fn push_hot(&mut self, role: MessageRole, content: String, token_count: u32) {
+        self.push_hot_with_tool(role, content, token_count, None);
     }
 
     /// 添加系统消息（便捷方法）
@@ -520,18 +689,34 @@ impl WorkingMemory {
         self.compaction_policy = policy;
     }
 
-    /// 判断是否需要压缩
+    /// 判断是否需要压缩（含断路器：连续失败超过阈值后停止自动压缩）
     pub fn should_compact(&self) -> bool {
         if self.max_tokens == 0 {
+            return false;
+        }
+        // 断路器：连续压缩失败次数超过阈值则停止自动压缩
+        if self.consecutive_compact_failures >= self.compaction_policy.max_consecutive_compact_failures {
             return false;
         }
         let usage_percent = (self.used_tokens_cached as u64 * 100) / self.max_tokens as u64;
         usage_percent >= self.compaction_policy.auto_compact_threshold_percent as u64
     }
 
-    /// 使用当前策略执行压缩
+    /// 使用当前策略执行压缩（含断路器计数）
     pub fn compact(&mut self) -> CompactionResult {
-        self.compact_with_policy(&self.compaction_policy.clone())
+        let result = self.compact_with_policy(&self.compaction_policy.clone());
+        // 断路器：压缩后 token 未减少则视为失败，超过阈值后停止自动压缩
+        if result.tokens_after >= result.tokens_before {
+            self.consecutive_compact_failures += 1;
+            tracing::warn!(
+                consecutive_failures = self.consecutive_compact_failures,
+                max_failures = self.compaction_policy.max_consecutive_compact_failures,
+                "compact: no tokens saved, incrementing failure counter"
+            );
+        } else {
+            self.consecutive_compact_failures = 0;
+        }
+        result
     }
 
     /// 使用指定策略执行压缩（同步版本，4 级策略 + stable prefix 保护）
@@ -547,7 +732,6 @@ impl WorkingMemory {
     /// - 这些条目（system prompt + 工具定义）保持不变，最大化 Prompt Cache 命中率
     pub fn compact_with_policy(&mut self, policy: &CompactionPolicy) -> CompactionResult {
         let tokens_before = self.used_tokens_cached;
-        let _total = self.entries.len();
 
         // 根据使用率选择压缩级别
         let usage_ratio = if self.max_tokens > 0 {
@@ -619,6 +803,7 @@ impl WorkingMemory {
                 role: MessageRole::User,
                 content,
                 token_count,
+                tool_name,
                 created_at,
             } = &entry
             {
@@ -633,11 +818,15 @@ impl WorkingMemory {
                     } else {
                         content.clone()
                     };
-                    let snipped_tokens = (token_count / 3).max(1);
+                    // 截断后按实际保留内容重新估算，而不是按原 token_count/3 猜。
+                    // 猜算法在保留 1000 字符时与实际不符，且这些值汇总进
+                    // used_tokens_cached 决定后续压缩级别选择，口径必须真实。
+                    let snipped_tokens = estimate_tokens_u32(&snipped).max(1);
                     self.entries[i] = WorkingEntry::Hot {
                         role: MessageRole::User,
                         content: snipped,
                         token_count: snipped_tokens,
+                        tool_name: tool_name.clone(),
                         created_at: *created_at,
                     };
                     entries_compacted += 1;
@@ -663,9 +852,9 @@ impl WorkingMemory {
     /// 委托给 `ccode_compaction::micro_compact_messages`：对前缀之后的条目，
     /// 超过 `max_age` 的可压缩工具结果会被替换为清除标记或截断摘要。
     /// 相比原先的首尾截断，此实现按时间年龄清除，更贴近 Claude Code 的微压缩语义。
-    fn compact_micro(&mut self, _policy: &CompactionPolicy, prefix_end: usize) -> CompactionResult {
+    fn compact_micro(&mut self, policy: &CompactionPolicy, prefix_end: usize) -> CompactionResult {
         let tokens_before = self.used_tokens_cached;
-        let config = MicroCompactConfig::default();
+        let config = MicroCompactConfig::from(policy);
         let now = std::time::Instant::now();
 
         let prefix_len = prefix_end.min(self.entries.len());
@@ -677,15 +866,22 @@ impl WorkingMemory {
         let old_contents: Vec<String> =
             rest.iter().map(|e| e.content().to_string()).collect();
 
-        let compacted_rest = micro_compact_messages::<WorkingEntry>(&rest, &config, now);
+        // 使用 cache-aware 微压缩：跳过已压缩内容的指纹匹配
+        let result = cached_micro_compact::<WorkingEntry>(
+            &rest,
+            &config,
+            now,
+            &mut self.cache_state,
+            default_fingerprint::<WorkingEntry>,
+        );
 
         let entries_compacted = old_contents
             .iter()
-            .zip(compacted_rest.iter())
+            .zip(result.items.iter())
             .filter(|(old, new)| old.as_str() != new.content())
             .count();
 
-        all_entries.extend(compacted_rest);
+        all_entries.extend(result.items);
         self.entries = all_entries;
 
         self.recalc_used_tokens();
@@ -787,9 +983,10 @@ impl WorkingMemory {
         let mut summary = String::new();
         for entry in &self.entries {
             if let WorkingEntry::Hot { role, content, .. } = entry {
-                // 每个条目最多取前 100 字符
+                // 每个条目最多取前 100 字符（按字符边界切，中文内容按字节切会 panic）
                 let preview = if content.len() > 100 {
-                    format!("{}...", &content[..100])
+                    let bound = content.floor_char_boundary(100);
+                    format!("{}...", &content[..bound])
                 } else {
                     content.clone()
                 };
@@ -797,51 +994,6 @@ impl WorkingMemory {
             }
         }
         summary.trim_end().to_string()
-    }
-
-    /// 使用 LLM 生成智能摘要（而非简单截断）
-    ///
-    /// 压缩对话历史（保留工具调用配对）
-    ///
-    /// 借鉴 Claude Code compaction.rs 的逻辑：
-    /// 1. 保留最近 N 轮完整对话（用户+助手+工具调用+结果）
-    /// 2. 较早的对话用摘要替换
-    /// 3. 工具调用和结果必须配对保留，不可拆开
-    pub fn compact_conversation(&mut self, keep_recent_turns: usize) -> Vec<WorkingEntry> {
-        let turns = self.group_by_turns();
-        let total = turns.len();
-
-        if total <= keep_recent_turns {
-            return Vec::new(); // 不需要压缩
-        }
-
-        let mut removed = Vec::new();
-        let keep_from = total - keep_recent_turns;
-
-        // 收集需要压缩的轮次索引
-        let compact_indices: Vec<usize> = (0..keep_from).collect();
-
-        // 从后往前替换，避免索引偏移
-        for &turn_start in compact_indices.iter().rev() {
-            let turn_end = turns.get(turn_start + 1).copied().unwrap_or(self.entries.len());
-            // 将该轮次的条目替换为摘要
-            let turn_entries: Vec<&WorkingEntry> = self.entries[turn_start..turn_end].iter().collect();
-            let summary = self.summarize_turn(&turn_entries);
-
-            // 移除原条目
-            let drained: Vec<WorkingEntry> = self.entries.drain(turn_start..turn_end).collect();
-            removed.extend(drained);
-
-            // 插入摘要条目
-            let summary_tokens = (summary.len() as u32 / 4).max(1);
-            self.entries.insert(turn_start, WorkingEntry::Warm {
-                summary,
-                token_count: summary_tokens,
-                source_range: (turn_start, turn_start),
-            });
-        }
-
-        removed
     }
 
     /// 按轮次分组消息
@@ -933,11 +1085,14 @@ impl WorkingMemory {
             compacted_end = compacted_end.max(turn_end.min(self.entries.len() + drained.len()));
 
             // 插入摘要条目
-            let summary_tokens = (summary.len() as u32 / 4).max(1);
+            let summary_tokens = estimate_tokens_u32(&summary).max(1);
             self.entries.insert(turn_start, WorkingEntry::Warm {
                 summary,
                 token_count: summary_tokens,
-                source_range: (turn_start, turn_start),
+                // 记录真实跨度而非 (turn_start, turn_start)：该字段会被
+                // window.rs 渲染成用户可见的 `[冷记忆: 第X-Y轮]`，
+                // 记成同一轮会让用户看到 "第5-5轮" 这种错误提示
+                source_range: (turn_start, turn_end),
             });
         }
 
@@ -1060,7 +1215,7 @@ mod tests {
         // 搜索与 [1, 0, 0] 最相似的
         // 注意：search 过滤 score <= 0.0，正交向量相似度为 0 被过滤，
         // 仅返回 entry-1（与 query 完全匹配）
-        let results = index.search_with_metadata(&vec![1.0, 0.0, 0.0], 2);
+        let results = index.search_with_metadata(&[1.0, 0.0, 0.0], 2);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "entry-1"); // 应该是第一个，因为完全匹配
@@ -1091,7 +1246,7 @@ mod tests {
         });
 
         // 使用 MMR 搜索
-        let selected = mmr_select(&index, &vec![1.0, 0.0, 0.0], 2, 0.7);
+        let selected = mmr_select(&index, &[1.0, 0.0, 0.0], 2, 0.7);
 
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0], 0); // 第一个总是最相关的
@@ -1111,5 +1266,176 @@ mod tests {
 
         // 验证消息数量
         assert_eq!(memory.entries().len(), 3);
+    }
+
+    /// 压缩相关的 token 估算必须与全局统一口径一致。
+    ///
+    /// 这些值汇总进 `used_tokens_cached`，决定压缩触发时机与级别选择。
+    /// 此前并存 `len()/4`（3 处）与 `len()/3`（1 处）两种按字节除法，
+    /// 口径分叉且都低估中文——低估是危险方向（记账以为有余量，实际已溢出）。
+    #[test]
+    fn estimate_tokens_matches_global_estimator() {
+        for s in ["", "a", "中", "调用 read_file 失败", "pub fn main() {}"] {
+            assert_eq!(
+                estimate_tokens_u32(s) as usize,
+                crate::sampler::token_budget::TokenBudgetManager::estimate_tokens(s),
+                "working.rs 的估算应与 TokenBudgetManager 一致（输入：{s:?}）"
+            );
+        }
+    }
+
+    /// 中文内容不得触发字节切片 panic。
+    #[test]
+    fn hot_entries_summary_handles_cjk_without_panic() {
+        let mut memory = WorkingMemory::new(10000);
+        // 超过 100 字节的纯中文（每字 3 字节，40 字 = 120 字节）
+        let long_cjk = "检测到工具重复调用请换一种方法避免重复相同的操作以免陷入循环浪费预算".repeat(2);
+        assert!(long_cjk.len() > 100, "测试内容需超过 100 字节");
+
+        let tokens = estimate_tokens_u32(&long_cjk);
+        memory.push_user(long_cjk, tokens);
+
+        // 不 panic 即通过；同时确认确实做了截断
+        let summary = memory.hot_entries_summary();
+        assert!(summary.contains("..."), "超长内容应被截断");
+    }
+
+    /// 压缩后的 Warm/Cold 条目序列化为 system 角色——这是 provider 侧
+    /// `extract_system_messages` 能正确提取的前提。若改成 user/assistant，
+    /// 摘要就会混进 messages 参与角色交替，需同步调整 provider 逻辑。
+    #[test]
+    fn compacted_entries_serialize_as_system_role() {
+        let mut memory = WorkingMemory::new(10000);
+        memory.push_user("问题", 10);
+        memory.replace_entries(vec![
+            WorkingEntry::Warm {
+                summary: "早期对话摘要".into(),
+                token_count: 5,
+                source_range: (0, 2),
+            },
+            WorkingEntry::Cold {
+                placeholder: "[冷记忆]".into(),
+                token_count: 3,
+                source_range: (2, 4),
+            },
+        ]);
+
+        let msgs = memory.to_chat_messages();
+        assert_eq!(msgs.len(), 2);
+        for (role, _) in &msgs {
+            assert_eq!(
+                role, "system",
+                "Warm/Cold 必须序列化为 system，否则 provider 侧提取逻辑失效"
+            );
+        }
+    }
+
+    /// 压缩后仍须能构成合法的 Anthropic 请求。
+    ///
+    /// `compact_auto` 按**条目数**保留最近 4 条，而一个 turn
+    /// （user + assistant + N 个工具结果）轻易超过 4 条，故可能把 assistant
+    /// 与其工具结果拆开。本测试实测拆开后经 provider 侧处理是否仍然合法。
+    #[test]
+    fn compaction_preserves_valid_conversation_shape() {
+        use crate::sampler::claude_compat::ClaudeCompatProvider;
+
+        let mut memory = WorkingMemory::new(200);
+        // 两个完整 turn 共 10 条，远超 keep_hot_recent=4
+        for turn in 0..2 {
+            memory.push_user(format!("问题{turn}"), 30);
+            memory.push_assistant(format!("[调用工具：read_file, grep]{turn}"), 30);
+            memory.push_user(format!("工具结果A{turn}"), 30);
+            memory.push_user(format!("工具结果B{turn}"), 30);
+            memory.push_user(format!("工具结果C{turn}"), 30);
+        }
+
+        let result = memory.compact();
+        assert!(
+            result.tokens_after < result.tokens_before,
+            "压缩应减少 token：{} → {}",
+            result.tokens_before,
+            result.tokens_after
+        );
+
+        // 压缩产物经 provider 处理后必须严格交替
+        let msgs = memory.to_chat_messages_direct(|role, content| {
+            crate::sampler::provider::ChatMessage { role, content, cache_control: None }
+        });
+        let (_system, rest) = ClaudeCompatProvider::extract_system_messages(&msgs);
+        let merged = ClaudeCompatProvider::merge_consecutive_roles(&rest);
+
+        for pair in merged.windows(2) {
+            assert_ne!(
+                pair[0].role, pair[1].role,
+                "压缩后经 provider 处理仍须严格交替，实际：{:?}",
+                merged.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// 按轮次压缩保留最近 N 轮完整，且真实减少 token。
+    ///
+    /// 该函数此前零调用（注释宣称「工具调用与结果配对保留」但从未执行），
+    /// 现已接入 `run_compaction_pipeline` 作为 L3 最终兜底。
+    #[test]
+    fn partial_compact_keeps_recent_turns_and_saves_tokens() {
+        let mut memory = WorkingMemory::new(10_000);
+        // 4 个轮次，每轮 3 条
+        for turn in 0..4 {
+            memory.push_user(format!("问题{turn}"), 50);
+            memory.push_assistant(format!("回答{turn}"), 50);
+            memory.push_user(format!("工具结果{turn}"), 50);
+        }
+        let before = memory.used_tokens();
+
+        let result = memory.partial_compact(2);
+
+        assert!(
+            result.tokens_after < before,
+            "按轮次压缩应减少 token：{before} → {}",
+            result.tokens_after
+        );
+        assert!(result.entries_compacted > 0, "应有条目被压缩");
+
+        // 最近 2 轮的内容应仍以 Hot 形式存在
+        let msgs = memory.to_chat_messages();
+        let joined = msgs
+            .iter()
+            .map(|(_, c)| c.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(joined.contains("问题3"), "最近轮次应保留完整");
+        assert!(joined.contains("问题2"), "最近 2 轮都应保留");
+    }
+
+    /// `source_range` 必须记录真实跨度——该字段被 window.rs 渲染成
+    /// 用户可见的 `[冷记忆: 第X-Y轮]`，记成 (start, start) 会显示 "第5-5轮"。
+    #[test]
+    fn partial_compact_records_real_source_range() {
+        let mut memory = WorkingMemory::new(10_000);
+        for turn in 0..4 {
+            memory.push_user(format!("问题{turn}"), 50);
+            memory.push_assistant(format!("回答{turn}"), 50);
+            memory.push_user(format!("工具结果{turn}"), 50);
+        }
+
+        memory.partial_compact(2);
+
+        let warm_ranges: Vec<(usize, usize)> = memory
+            .entries()
+            .iter()
+            .filter_map(|e| match e {
+                WorkingEntry::Warm { source_range, .. } => Some(*source_range),
+                _ => None,
+            })
+            .collect();
+
+        assert!(!warm_ranges.is_empty(), "应产生 Warm 摘要条目");
+        for (start, end) in warm_ranges {
+            assert!(
+                end > start,
+                "source_range 应记录真实跨度，实得 ({start}, {end})"
+            );
+        }
     }
 }

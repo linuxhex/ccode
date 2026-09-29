@@ -130,7 +130,9 @@ impl SamplerNode {
                     let cancel_event = SamplerEvent::Cancelled {
                         request_id: request_id.to_string(),
                     };
-                    let _ = self.emit_event(&cancel_event, transport).await;
+                    if let Err(e) = self.emit_event(&cancel_event, transport).await {
+                        tracing::warn!(target: "ccore::sampler", "emit cancel event failed: {e}");
+                    }
                     tracing::info!("采样已取消：request_id={}", request_id);
                     break;
                 }
@@ -160,14 +162,8 @@ impl SamplerNode {
                         self.id.as_str(),
                         &chunk,
                     )?;
-                    // 优先数据面 PUB，回退控制面
-                    if let Err(_) = transport.publish_data(&chunk_msg).await {
-                        transport.send_message(&FrameCodec::new_message(
-                            Topic::sampler_stream(&chunk.request_id),
-                            self.id.as_str(),
-                            &chunk,
-                        )?).await?;
-                    }
+                    // 使用控制面（Kernel ROUTER）确保可靠投递，数据面 PUB 在无 SUB 连接时会静默丢消息
+                    transport.send_message(&chunk_msg).await?;
                 }
                 Err(e) => {
                     tracing::warn!("Stream chunk 错误：{}", e);
@@ -178,7 +174,9 @@ impl SamplerNode {
                         request_id: request_id.to_string(),
                         error: format!("{}", e),
                     };
-                    let _ = self.emit_event(&error_event, transport).await;
+                    if let Err(e) = self.emit_event(&error_event, transport).await {
+                        tracing::warn!(target: "ccore::sampler", "emit error event failed: {e}");
+                    }
 
                     let err_msg = FrameCodec::new_message(
                         Topic::sampler_stream(request_id),
@@ -188,9 +186,8 @@ impl SamplerNode {
                             "request_id": request_id,
                         }),
                     )?;
-                    if let Err(_) = transport.publish_data(&err_msg).await {
-                        transport.send_message(&err_msg).await?;
-                    }
+                    // 使用控制面确保可靠投递
+                    transport.send_message(&err_msg).await?;
                     break;
                 }
             }
@@ -211,9 +208,8 @@ impl SamplerNode {
                 "finish_reason": "stop",
             }),
         )?;
-        if let Err(_) = transport.publish_data(&done_msg).await {
-            transport.send_message(&done_msg).await?;
-        }
+        // 使用控制面确保可靠投递
+        transport.send_message(&done_msg).await?;
 
         // 发射完成事件
         let completed_event = SamplerEvent::Completed {
@@ -221,7 +217,9 @@ impl SamplerNode {
             usage: accumulated_usage.clone(),
             finish_reason: "stop".to_string(),
         };
-        let _ = self.emit_event(&completed_event, transport).await;
+        if let Err(e) = self.emit_event(&completed_event, transport).await {
+            tracing::warn!(target: "ccore::sampler", "emit completed event failed: {e}");
+        }
 
         // 清理取消句柄
         self.cancel_handles.remove(request_id);
@@ -253,9 +251,7 @@ impl SamplerNode {
             self.id.as_str(),
             event,
         )?;
-        if let Err(_) = transport.publish_data(&event_msg).await {
-            transport.send_message(&event_msg).await?;
-        }
+        transport.send_message(&event_msg).await?;
         Ok(())
     }
 
@@ -281,16 +277,15 @@ impl SamplerNode {
                     "request_id": request_id,
                 }),
             )?;
-            if let Err(e) = transport.publish_data(&cancelled_msg).await {
-                tracing::warn!("data-plane publish failed: {}, falling back", e);
-                transport.send_message(&cancelled_msg).await?;
-            }
+            transport.send_message(&cancelled_msg).await?;
 
             // 发射取消事件
             let cancel_event = SamplerEvent::Cancelled {
                 request_id: request_id.to_string(),
             };
-            let _ = self.emit_event(&cancel_event, transport).await;
+            if let Err(e) = self.emit_event(&cancel_event, transport).await {
+                tracing::warn!(target: "ccore::sampler", "emit cancel event failed: {e}");
+            }
 
             // 清理取消句柄
             self.cancel_handles.remove(request_id);
@@ -327,11 +322,50 @@ impl SamplerNode {
             self.id.as_str(),
             &result_json,
         ) {
-            if let Err(e) = transport.publish_data(&result_msg).await {
-                tracing::debug!("数据面 PUB 发送 goal_verify_result 失败，回退控制面：{}", e);
-                if let Err(e) = transport.send_message(&result_msg).await {
-                    tracing::warn!("发送 GoalLoop 验证结果失败：{}", e);
-                }
+            if let Err(e) = transport.send_message(&result_msg).await {
+                tracing::warn!("发送 GoalLoop 验证结果失败：{}", e);
+            }
+        }
+    }
+
+    /// 将压缩摘要结果发送到 cortex/summary_result
+    ///
+    /// 压缩管道 L4 用：ThinkerNode 发起带 `summarize: true` 的采样请求，
+    /// SamplerNode 收集完整响应后经本方法回传，由 ThinkerNode 替换工作记忆。
+    ///
+    /// 与 goal_verify 的区别：摘要结果是自由文本，无需 JSON 解析。
+    async fn send_summary_result(
+        &self,
+        request_id: &str,
+        text: &str,
+        transport: &NodeTransportHandle,
+    ) {
+        let summary = text.trim();
+        if summary.is_empty() {
+            tracing::warn!(
+                target: "ccore::compaction",
+                request_id,
+                "LLM 摘要返回空文本，不回传（ThinkerNode 将保留原上下文）"
+            );
+            return;
+        }
+
+        tracing::info!(
+            target: "ccore::compaction",
+            request_id,
+            summary_len = summary.len(),
+            "LLM 摘要完成，结果发往 cortex/summary_result"
+        );
+        if let Ok(result_msg) = FrameCodec::new_message(
+            Topic::new("cortex/summary_result"),
+            self.id.as_str(),
+            &serde_json::json!({
+                "request_id": request_id,
+                "summary": summary,
+            }),
+        ) {
+            if let Err(e) = transport.send_message(&result_msg).await {
+                tracing::warn!("发送压缩摘要结果失败：{}", e);
             }
         }
     }
@@ -388,7 +422,9 @@ impl SamplerNode {
             request_id: request_id.clone(),
             model: model.clone(),
         };
-        let _ = self.emit_event(&started_event, transport).await;
+        if let Err(e) = self.emit_event(&started_event, transport).await {
+            tracing::warn!(target: "ccore::sampler", "emit started event failed: {e}");
+        }
 
         let mut retry_count: u32 = 0;
 
@@ -397,7 +433,14 @@ impl SamplerNode {
                 Ok((stream, provider_name)) => {
                     tracing::info!("采样开始：model={}, provider={}", model, provider_name);
                     let result = self
-                        .stream_to_bus(&request_id, &model, stream, transport, request.goal_verify)
+                        .stream_to_bus(
+                            &request_id,
+                            &model,
+                            stream,
+                            transport,
+                            // 验证与摘要都需要完整文本，且都不应把中间内容流式展示给用户
+                            request.goal_verify || request.summarize,
+                        )
                         .await;
                     // 采样完成，记录推理延迟（从请求到响应的耗时）
                     AgentMetrics::global()
@@ -406,6 +449,12 @@ impl SamplerNode {
                     if request.goal_verify {
                         if let Ok((_, text)) = &result {
                             self.send_goal_verify_result(&request_id, text, transport).await;
+                        }
+                    }
+                    // 压缩摘要闭环：完整摘要文本发到 cortex/summary_result
+                    if request.summarize {
+                        if let Ok((_, text)) = &result {
+                            self.send_summary_result(&request_id, text, transport).await;
                         }
                     }
                     return result.map(|_| ());
@@ -456,7 +505,9 @@ impl SamplerNode {
                                 request_id: request_id.clone(),
                                 error: reason.clone(),
                             };
-                            let _ = self.emit_event(&error_event, transport).await;
+                            if let Err(e) = self.emit_event(&error_event, transport).await {
+                                tracing::warn!(target: "ccore::sampler", "emit error event failed: {e}");
+                            }
 
                             let err_msg = FrameCodec::new_message(
                                 Topic::sampler_stream(&request_id),
@@ -486,8 +537,8 @@ fn extract_status_code(error_message: &str) -> Option<u16> {
     for prefix in &["http ", "status "] {
         if let Some(pos) = msg.find(prefix) {
             let after = &msg[pos + prefix.len()..];
-            if let Some(code) = after.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u16>().ok() {
-                if code >= 400 && code < 600 {
+            if let Ok(code) = after.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u16>() {
+                if (400..600).contains(&code) {
                     return Some(code);
                 }
             }
@@ -513,13 +564,17 @@ impl Node for SamplerNode {
             self.router.provider_count(),
             self.router.available_models(),
         );
+        // 预热所有 Provider 的 HTTP 连接，避免首次请求的 DNS/TLS 冷启动延迟
+        self.router.warm_up_all().await;
         Ok(())
     }
 
     async fn handle_message(&mut self, msg: Message, transport: &NodeTransportHandle) -> anyhow::Result<()> {
         let topic = msg.topic.as_str();
+        tracing::info!("Sampler handle_message: topic={}", topic);
         if topic == "sampler/request" {
             let request: SampleRequest = FrameCodec::decode_payload(&msg)?;
+            tracing::info!("Sampler 收到采样请求：model={}", request.model);
             self.handle_sample_request(request, transport).await?;
         } else if topic.starts_with("sampler/") && topic.ends_with("/cancel") {
             // 提取 request_id：sampler/{req_id}/cancel → req_id
@@ -541,7 +596,12 @@ impl Node for SamplerNode {
 
     /// Sampler 发布的 topic（数据面 PUB）
     fn published_topics(&self) -> Vec<String> {
-        vec!["sampler/*/stream".into()]
+        // 须与实际发布行为一致：此前只声明了 stream，漏了两个闭环回传 topic
+        vec![
+            "sampler/*/stream".into(),
+            "cortex/goal_verify_result".into(), // GoalLoop 验证闭环回传
+            "cortex/summary_result".into(),     // 压缩摘要闭环回传
+        ]
     }
 
     async fn stop(&mut self) -> anyhow::Result<()> {

@@ -43,9 +43,19 @@ pub struct SampleRequest {
     /// 流式收集完整响应并解析 JSON，结果发到 cortex/goal_verify_result）
     #[serde(default)]
     pub goal_verify: bool,
+    /// 是否为上下文摘要请求（压缩管道 L4 用）
+    ///
+    /// SamplerNode 识别后收集完整响应，结果发到 `cortex/summary_result`，
+    /// 不走常规的流式转发（摘要过程不应显示给用户）。
+    #[serde(default)]
+    pub summarize: bool,
     /// 额外的 HTTP 请求头（如 x-api-key、anthropic-version 等）
     #[serde(default)]
     pub extra_headers: std::collections::HashMap<String, String>,
+    /// 流空闲超时（秒），超过此时间无新 chunk 则返回超时错误。
+    /// None 时使用 DEFAULT_IDLE_TIMEOUT_SECS（300s）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 /// 思维链/推理模式配置
@@ -98,7 +108,7 @@ pub struct ChatMessage {
     /// API 侧 prompt cache 断点标记（类似 Claude Code cache_edits）
     /// 插入在 system prompt 末尾和最近 N 轮对话之前，
     /// 让 API 复用已计算的前缀 KV cache
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cache_control: Option<CacheControl>,
 }
 
@@ -175,6 +185,11 @@ pub trait Provider: Send + Sync {
 
     /// Provider 名称
     fn name(&self) -> &str;
+
+    /// 预热连接（默认空实现，各 Provider 可覆盖以预建 HTTP 连接）
+    async fn warm_up(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// 工具选择策略

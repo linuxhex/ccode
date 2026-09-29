@@ -18,16 +18,12 @@ use crate::node::NodeId;
 pub struct SequenceManager {
     /// 当前发送序列号
     send_seq: AtomicU64,
-    /// Node ID（用于日志）
-    #[allow(dead_code)]
-    node_id: NodeId,
 }
 
 impl SequenceManager {
-    pub fn new(node_id: NodeId) -> Self {
+    pub fn new(_node_id: NodeId) -> Self {
         Self {
             send_seq: AtomicU64::new(0),
-            node_id,
         }
     }
 

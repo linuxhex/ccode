@@ -921,6 +921,41 @@ pub fn discover_skills_for_paths(
     skills
 }
 
+/// Filter skills based on enabled/disabled configuration lists.
+///
+/// - If `enabled` is non-empty, only skills whose normalized name appears in
+///   the list are kept.
+/// - Skills whose normalized name appears in `disabled` are always removed.
+/// - `disabled` takes priority over `enabled`.
+pub fn filter_skills_by_config(
+    skills: Vec<SkillInfo>,
+    enabled: &[String],
+    disabled: &[String],
+) -> Vec<SkillInfo> {
+    let disabled_set: HashSet<String> = disabled
+        .iter()
+        .map(|s| normalize_skill_name(s))
+        .collect();
+    let enabled_set: HashSet<String> = enabled
+        .iter()
+        .map(|s| normalize_skill_name(s))
+        .collect();
+
+    skills
+        .into_iter()
+        .filter(|skill| {
+            let name = normalize_skill_name(&skill.name);
+            if disabled_set.contains(&name) {
+                return false;
+            }
+            if !enabled_set.is_empty() && !enabled_set.contains(&name) {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

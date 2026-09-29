@@ -75,7 +75,7 @@ use crate::memory::embedding::EmbeddingIndex;
 use crate::memory::intent_retriever::IntentRetriever;
 
 use crate::sampler::provider::{
-    SampleRequest, ChatMessage, CacheControl, StreamChunk, StreamChannel, ToolDefinition as SamplerToolDefinition,
+    SampleRequest, ChatMessage, StreamChunk, StreamChannel, ToolDefinition as SamplerToolDefinition,
 };
 use crate::retry::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::tools::read_tracker::ReadTracker;
@@ -122,14 +122,16 @@ pub struct ThinkerNode {
     memory_bridge: Box<dyn MemoryBridge>,
     /// 等待中的工具调用（tool_call_id → PendingToolCall）
     pending_tool_calls: HashMap<String, PendingToolCall>,
-    /// 正在执行中的工具调用（tool_call_id → tool_name，等待结果返回）
-    pending_tool_results: HashMap<String, String>,
+    /// 正在执行中的工具调用（tool_call_id → (tool_name, started_at)，等待结果返回）
+    pending_tool_results: HashMap<String, (String, std::time::Instant)>,
     /// 当前 LLM 采样请求 ID
     current_sample_request_id: Option<String>,
     /// 当前推理周期的开始时间
     inference_start: Option<std::time::Instant>,
     /// 已执行轮次
     turns_executed: u32,
+    /// 连续工具调用轮次（用于 Reminder 注入，防止长对话指令漂移，借鉴 Claude Code）
+    consecutive_tool_rounds: u32,
     /// 感官信号缓冲（最近 20 条，内置处理）
     sensory_buffer: Vec<SensorySignal>,
     /// 取消请求标志（收到 agent/{id}/cancel 后设置）
@@ -158,6 +160,19 @@ pub struct ThinkerNode {
     budget_denied: bool,
     /// 强制结束 turn 标志（LoopStateMachine 判定 EndTurn 后设置，阻止继续采样）
     force_end_turn: bool,
+    /// 稳定前缀是否已锁定（首次 build_sample_request 时锁定，保护 system prompt + tools 不被压缩）
+    stable_prefix_locked: bool,
+    /// 本轮 assistant 流式文本累积
+    ///
+    /// 流式 text chunk 除转发 TUI 外，还需累积起来在 done 时写入工作记忆。
+    /// 否则 LLM 看不到自己上一轮说过什么，且对话历史里没有 assistant 角色——
+    /// Anthropic Messages API 拒绝连续 user 消息，会直接失败。
+    current_assistant_text: String,
+    /// 在途的 L4 摘要请求 id
+    ///
+    /// 摘要走异步往返（发请求 → cortex/summary_result 回传），需防重入：
+    /// 压缩管道每轮都跑，若不去重会在摘要返回前反复发起请求。
+    pending_summary_request: Option<String>,
     /// 状态持久化器（运行时注入，turn 结束时保存快照，None 表示禁用持久化）
     state_persister: Option<StatePersister>,
 
@@ -179,6 +194,8 @@ pub struct ThinkerNode {
     current_turn_token_usage: (usize, usize),
     /// 本轮使用的工具名列表，供 EpisodicMemory 编码
     current_turn_tools: Vec<String>,
+    /// 工具 schema 稳定性追踪（检测跨轮次变化，诊断 prompt cache miss）
+    tool_stability_tracker: crate::sampler::tool_stability::ToolStabilityTracker,
 }
 
 impl ThinkerNode {
@@ -223,6 +240,7 @@ impl ThinkerNode {
             current_sample_request_id: None,
             inference_start: None,
             turns_executed: 0,
+            consecutive_tool_rounds: 0,
             sensory_buffer: Vec::with_capacity(sensory::SENSORY_BUFFER_CAPACITY),
             cancel_requested: false,
             turn_had_tool_failure: false,
@@ -237,6 +255,9 @@ impl ThinkerNode {
             project_context: crate::tools::project_context::ProjectContext::default(),
             budget_denied: false,
             force_end_turn: false,
+            stable_prefix_locked: false,
+            current_assistant_text: String::new(),
+            pending_summary_request: None,
             state_persister: None,
             // ccore 高级特性初始化（融合自 SessionActor）
             circuit_breaker: CircuitBreaker::new(CircuitBreakerConfig::default()),
@@ -247,6 +268,7 @@ impl ThinkerNode {
             hook_registry: None,
             current_turn_token_usage: (0, 0),
             current_turn_tools: Vec::new(),
+            tool_stability_tracker: crate::sampler::tool_stability::ToolStabilityTracker::new(),
         }
     }
 
@@ -358,35 +380,95 @@ impl ThinkerNode {
         }
     }
 
+    /// 用恢复出来的会话记录回灌工作记忆
+    ///
+    /// 只恢复 `StateNode` 的短期记忆是不够的 —— 那是持久化侧的账本，
+    /// 真正决定模型看得见什么的是 `ThinkerNode::working_memory`。
+    /// 两边都灌，才是「会话恢复」而不是「日志读回来了」。
+    ///
+    /// 角色映射与在线路径保持一致：工具输出在线上是以 `user` 消息进工作记忆的
+    /// （见 `handle_tool_result`），恢复时也必须一样，否则同一段历史在恢复前后
+    /// 对模型呈现的形状不同。
+    pub fn restore_working_memory(
+        &mut self,
+        messages: &[crate::node::session_index::RestoredMessage],
+    ) {
+        if messages.is_empty() {
+            return;
+        }
+
+        let banner = format!(
+            "[会话已恢复] 以下 {} 条是上次会话的历史记录，继续在此基础上工作。",
+            messages.len()
+        );
+        let tokens = Self::estimate_tokens(&banner);
+        self.working_memory.push_system(banner, tokens);
+
+        for m in messages {
+            let tokens = if m.token_count > 0 {
+                m.token_count
+            } else {
+                Self::estimate_tokens(&m.content)
+            };
+            if m.is_tool_call {
+                self.working_memory.push_user(m.content.clone(), tokens);
+                continue;
+            }
+            match m.role.as_str() {
+                "assistant" => self.working_memory.push_assistant(m.content.clone(), tokens),
+                "system" => self.working_memory.push_system(m.content.clone(), tokens),
+                // 未知角色按 user 处理：宁可多一条上下文，也不要静默丢历史
+                _ => self.working_memory.push_user(m.content.clone(), tokens),
+            }
+        }
+
+        tracing::info!(
+            target: "ccore::session",
+            messages = messages.len(),
+            "工作记忆已回灌恢复的会话历史"
+        );
+    }
+
     // ── 核心推理循环 ──
 
     /// 构建采样请求，发送到 Sampler Node
     fn build_sample_request(&mut self) -> SampleRequest {
+        // 优化：直接构建 ChatMessage，避免中间 Vec<(String, String)> 分配
         let mut messages: Vec<ChatMessage> = self.working_memory
-            .to_chat_messages()
-            .into_iter()
-            .map(|(role, content)| ChatMessage { role, content, cache_control: None })
-            .collect();
+            .to_chat_messages_direct(|role, content| ChatMessage {
+                role,
+                content,
+                cache_control: None,
+            });
 
-        // Prompt cache 断点（借鉴 Claude Code cache_edits）
-        // 在 system prompt 末尾和工具定义之前插入 ephemeral 断点，
-        // 让 API 侧复用前缀 KV cache，减少重复计费
-        if !messages.is_empty() {
-            // 断点 1：system prompt 末尾（最稳定的部分，几乎不变）
-            if let Some(first) = messages.first_mut() {
-                if first.role == "system" {
-                    first.cache_control = Some(CacheControl::ephemeral());
-                }
-            }
-            // 断点 2：最近 2 轮对话之前（较长上下文的中间断点）
-            // 找到倒数第 5 条消息（2 轮 = user + assistant × 2）
-            let mid_idx = messages.len().saturating_sub(5);
-            if mid_idx > 0 {
-                if let Some(msg) = messages.get_mut(mid_idx) {
-                    msg.cache_control = Some(CacheControl::ephemeral());
-                }
+        // ── Reminder 注入（借鉴 Claude Code，防止长对话指令漂移）──
+        // 连续工具调用超过阈值时，在最后一条 user 消息中追加 system-reminder，
+        // 提醒模型当前任务目标，避免在长工具链中偏离原始意图。
+        const REMINDER_THRESHOLD: u32 = 5;
+        if self.consecutive_tool_rounds >= REMINDER_THRESHOLD {
+            if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
+                let task_hint = self.loop_state_machine.task_description()
+                    .unwrap_or("当前任务");
+                let reminder = format!(
+                    "\n\n<system-reminder>\n\
+                     你已经执行了 {} 轮工具调用。请回顾原始任务：「{}」。\n\
+                     确认当前工作是否仍然围绕这个目标，如果已完成请停止调用工具并总结结果。\n\
+                     </system-reminder>",
+                    self.consecutive_tool_rounds,
+                    task_hint.chars().take(200).collect::<String>(),
+                );
+                last_user.content.push_str(&reminder);
+                tracing::debug!(
+                    target: "ccore::loop",
+                    rounds = self.consecutive_tool_rounds,
+                    "Reminder 注入：连续 {} 轮工具调用，已追加防漂移提醒",
+                    self.consecutive_tool_rounds,
+                );
             }
         }
+
+        // Prompt cache 断点：4-breakpoint 策略（借鉴 Claude Code cache_edits）
+        super::super::sampler::cache_placement::place_breakpoints(&mut messages);
 
         // Doom Loop 逃脱：若上一轮检测到循环，本轮过滤掉被禁用的工具
         let mut tools = self.config.tools.clone();
@@ -395,26 +477,96 @@ impl ThinkerNode {
             tracing::warn!("Doom Loop 逃脱：本轮采样已过滤工具 {}", tool_name);
         }
 
+        // 工具延迟加载：核心工具保持完整 schema，其他工具只发摘要
+        // 借鉴 Claude Code 延迟工具加载 + Codex 最小工具集设计
+        // 模型可通过 tool_search 工具按需获取完整参数定义
+        const CORE_TOOLS: &[&str] = &[
+            "bash", "read_file", "write_file", "search_replace",
+            "grep", "glob", "list_dir", "tool_search", "task",
+        ];
+        for tool in tools.iter_mut() {
+            if !CORE_TOOLS.contains(&tool.name.as_str()) && tool.name != "tool_search" {
+                // 非核心工具：截断描述为一句话，清空参数 schema
+                let summary = tool.description.lines().next().unwrap_or(&tool.description);
+                // 按字符边界截断：工具描述含中文，直接按字节切会 panic
+                let summary = if summary.len() > 80 {
+                    format!("{}...（调用 tool_search 获取完整定义）", &summary[..summary.floor_char_boundary(77)])
+                } else {
+                    format!("{}（调用 tool_search 获取完整定义）", summary)
+                };
+                tool.description = summary;
+                tool.parameters = serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "description": "参数定义未加载，请先调用 tool_search 获取完整参数"
+                });
+            }
+        }
+
+        // 优化：减少 String 分配，复用 agent_id
         let request_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = self.id.to_string();
         self.current_sample_request_id = Some(request_id.clone());
+
+        // 推理力度分级：doom loop 被动降级优先，否则按任务难度主动调节
+        // 借鉴 DeepSeek Harness off/high/max 分级 + ccode MetaCognitiveController
+        let reasoning_effort = self.doom_loop_detector.current_reasoning_effort().or_else(|| {
+            let task = self.loop_state_machine.task_description().unwrap_or_default();
+            if task.is_empty() {
+                return Some(0.5); // 默认中等力度
+            }
+            let difficulty = self.meta_cognitive.assess_difficulty(task, &std::collections::HashMap::new());
+            difficulty.to_reasoning_effort()
+        });
+
+        // ── TokenBudgetReminder 注入（借鉴 Codex TokenBudgetRemainingContext）──
+        // 上下文使用超过 70% 时，在最后一条 user 消息中注入剩余预算提醒，
+        // 让模型感知上下文压力，主动精简输出。
+        {
+            let max_tokens = self.working_memory.max_tokens();
+            let used_tokens = self.working_memory.used_tokens();
+            let usage_pct = if max_tokens > 0 { (used_tokens as u64 * 100) / max_tokens as u64 } else { 0 };
+            if usage_pct >= 70 {
+                let available = max_tokens.saturating_sub(used_tokens);
+                let reminder = format!(
+                    "\n<system-reminder>Context budget: {}% used ({}/{} tokens). \
+                     {} tokens remaining. Be concise — avoid unnecessary output.</system-reminder>",
+                    usage_pct, used_tokens, max_tokens, available
+                );
+                if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
+                    last_user.content.push_str(&reminder);
+                }
+            }
+        }
+
+        // 稳定前缀锁：首次构建请求时锁定 system prompt + 工具定义，防止压缩破坏 prompt cache
+        if !self.stable_prefix_locked {
+            self.working_memory.lock_stable_prefix();
+            self.stable_prefix_locked = true;
+        }
+
+        // 工具 schema 稳定性追踪（诊断 prompt cache miss）
+        self.tool_stability_tracker.record(&tools);
 
         SampleRequest {
             request_id,
-            agent_id: self.id.to_string(),
+            agent_id: agent_id.clone(),
             model: self.config.model.clone(),
             messages,
             tools,
             stream: true,
-            reasoning_effort: self.doom_loop_detector.current_reasoning_effort(),
+            reasoning_effort,
             max_tokens: None,
             temperature: None,
             top_p: None,
             thinking: None,
             system_prompt: None,
             tool_choice: None,
-            prompt_cache_key: Some(self.id.to_string()),  // 同一 agent 的请求共享 cache
+            prompt_cache_key: Some(agent_id),  // 复用 agent_id，减少一次 to_string
             goal_verify: false,
+            summarize: false,
             extra_headers: std::collections::HashMap::new(),
+            idle_timeout_secs: None,
         }
     }
 
@@ -426,21 +578,27 @@ impl ThinkerNode {
     ) -> anyhow::Result<()> {
         match chunk.channel {
             StreamChannel::Text => {
-                self.state = AgentState::Outputting;
-                // 文本内容流式转发到 agent/{id}/output（TUINode 渲染）
-                let output_msg = FrameCodec::new_message(
-                    Topic::agent_output(self.id.as_str()),
-                    self.id.as_str(),
-                    &serde_json::json!({
-                        "channel": "text",
-                        "content": chunk.content,
-                    }),
-                )?;
-                if let Err(e) = transport.publish_data(&output_msg).await {
-                    tracing::debug!("数据面 PUB 发送 output 失败，回退到控制面：{}", e);
+                // 跳过空内容（usage-only 的 message_start/message_delta chunk）
+                if !chunk.content.is_empty() {
+                    self.state = AgentState::Outputting;
+                    // 累积 assistant 文本：done 时写入工作记忆，让 LLM 看到自己说过什么，
+                    // 同时保证对话历史里有 assistant 角色（Anthropic 要求角色交替）
+                    self.current_assistant_text.push_str(&chunk.content);
+                    // 文本内容流式转发到 agent/{id}/output（TUINode 渲染）
+                    // 使用 serde_json::json! 确保序列化为 map 而非 array
+                    let output_msg = FrameCodec::new_message(
+                        Topic::agent_output(self.id.as_str()),
+                        self.id.as_str(),
+                        &serde_json::json!({
+                            "channel": "text",
+                            "content": &chunk.content,
+                        }),
+                    )?;
+                    // 使用控制面（Kernel ROUTER）确保可靠投递到 TUI
                     transport.send_message(&output_msg).await?;
+                    tracing::trace!(agent = %self.id, "output 通过控制面发送");
+                    self.loop_state_machine.record_step("text", &chunk.content);
                 }
-                self.loop_state_machine.record_step("text", &chunk.content);
             }
             StreamChannel::Reasoning => {
                 // 推理链内容，可选展示给用户
@@ -462,6 +620,11 @@ impl ThinkerNode {
                             arguments: serde_json::Value::Null,
                         })
                 };
+
+                tracing::info!(
+                    "Thinker 收到 tool_call chunk：tool_call_id={}, tool_name={}",
+                    tool_call.tool_call_id, tool_call.tool_name
+                );
 
                 let args_hash = Self::hash_tool_args(&tool_call.arguments);
                 self.doom_loop_detector.record(tool_call.tool_name.clone(), args_hash);
@@ -487,7 +650,7 @@ impl ThinkerNode {
         if matches!(tool_name, "read" | "read_file") {
             // 从 output 解析文件路径（简化：取 output 中的文件路径）
             if let Some(path) = self.extract_read_path(tool_name, output) {
-                self.read_tracker.lock().expect("read_tracker lock poisoned").mark_read(&path);
+                self.read_tracker.lock().expect("read_tracker lock poisoned").mark_read_simple(std::path::Path::new(&path));
             }
         }
 
@@ -506,7 +669,7 @@ impl ThinkerNode {
             true,
         );
         // 将工具返回注入工作记忆（作为 user 消息，LLM 需要看到执行结果）
-        let token_count = Self::estimate_tokens(&output);
+        let token_count = Self::estimate_tokens(output);
         self.working_memory.push_user(output.to_string(), token_count);
 
         if self.pending_tool_results.is_empty() {
@@ -530,7 +693,8 @@ impl ThinkerNode {
                     self.force_end_turn = true;
                 }
                 LoopAction::CallLLM => {
-                    // 继续调用 LLM（已在后续 send_sample_request 中处理）
+                    // 连续工具调用轮次递增（用于 Reminder 注入防漂移）
+                    self.consecutive_tool_rounds += 1;
                 }
                 _ => {}
             }
@@ -573,9 +737,15 @@ impl ThinkerNode {
         self.doom_loop_detector.detect()
     }
 
-    /// 估算文本的 token 数（粗略：1 token ≈ 4 字符）
+    /// 估算文本的 token 数
+    ///
+    /// 委托给 `sampler::token_budget::TokenBudgetManager::estimate_tokens`——该实现已按
+    /// CJK / ASCII 分权重估算。此前这里用 `len() / 4`，对中文按 UTF-8 字节数计算，
+    /// 实测低估约 16%；低估是危险方向，会让压缩触发偏晚、上下文有溢出风险。
+    ///
+    /// 复用而非另写一份，避免 thinker 侧与 sampler 侧的预算口径分叉。
     fn estimate_tokens(text: &str) -> u32 {
-        (text.len() as f32 / 4.0).ceil() as u32
+        crate::sampler::token_budget::TokenBudgetManager::estimate_tokens(text) as u32
     }
 
     /// 计算工具参数的哈希值
@@ -671,7 +841,9 @@ impl ThinkerNode {
             self.id.as_str(),
             &persist_payload,
         ) {
-            let _ = transport.send_message(&msg).await;
+            if let Err(e) = transport.send_message(&msg).await {
+                tracing::warn!(target: "ccore::thinker", "failed to persist: {e}");
+            }
             tracing::debug!(
                 "Thinker {} turn 结束持久化：{} 条记录，{} tokens",
                 self.id, entries.len(), total_tokens
@@ -712,7 +884,9 @@ impl ThinkerNode {
                     &agent_id,
                     &serde_json::json!({}),
                 ) {
-                    let _ = transport_clone.send_message(&msg).await;
+                    if let Err(e) = transport_clone.send_message(&msg).await {
+                        tracing::warn!(target: "ccore::thinker", "failed to send/report stats: {e}");
+                    }
                 }
             }
         });
@@ -734,7 +908,9 @@ impl ThinkerNode {
                     &agent_id,
                     &serde_json::json!({}),
                 ) {
-                    let _ = transport_clone.send_message(&msg).await;
+                    if let Err(e) = transport_clone.send_message(&msg).await {
+                        tracing::warn!(target: "ccore::thinker", "failed to send/report flush: {e}");
+                    }
                 }
             }
         });
@@ -869,11 +1045,28 @@ impl ThinkerNode {
             self.id.as_str(),
             &request,
         )?;
-        if let Err(e) = transport.publish_data(&sample_msg).await {
-            tracing::debug!("数据面 PUB 发送采样请求失败，回退到控制面：{}", e);
-            transport.send_message(&sample_msg).await?;
-        }
+        // 使用控制面确保可靠投递到 Sampler
+        transport.send_message(&sample_msg).await?;
         Ok(())
+    }
+
+    /// 检查超时的工具调用（60秒无响应），返回超时的 (tool_call_id, tool_name) 列表
+    fn check_tool_timeouts(&mut self) -> Vec<(String, String)> {
+        const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        let now = std::time::Instant::now();
+        let timed_out: Vec<(String, String)> = self.pending_tool_results
+            .iter()
+            .filter(|(_, (_, started_at))| now.duration_since(*started_at) > TOOL_TIMEOUT)
+            .map(|(id, (name, _))| (id.clone(), name.clone()))
+            .collect();
+
+        for (id, name) in &timed_out {
+            tracing::warn!(
+                "工具调用超时（60s）：tool_call_id={}, tool_name={}",
+                id, name
+            );
+        }
+        timed_out
     }
 }
 
@@ -899,10 +1092,33 @@ impl Node for ThinkerNode {
 
     async fn handle_message(&mut self, msg: Message, transport: &NodeTransportHandle) -> anyhow::Result<()> {
         let topic = msg.topic.as_str();
+        tracing::debug!("Thinker handle_message: topic={}", topic);
+
+        // 检查超时的工具调用，避免永久挂起
+        // 但不要在用户输入消息时处理超时——先处理输入，让正常流程处理超时
+        let is_user_input = topic.starts_with("agent/") && topic.ends_with("/input");
+        if !is_user_input {
+            let timed_out = self.check_tool_timeouts();
+            for (tool_call_id, tool_name) in timed_out {
+                self.pending_tool_results.remove(&tool_call_id);
+                let error_msg = format!("工具 {} 执行超时（60秒无响应）", tool_name);
+                self.turn_had_tool_failure = true;
+                let token_count = Self::estimate_tokens(&error_msg);
+                self.working_memory.push_user(error_msg.clone(), token_count);
+
+                if self.pending_tool_results.is_empty() {
+                    // 所有工具完成（包括超时的），重新采样
+                    tracing::warn!("所有工具调用完成（含超时），准备重新采样");
+                    self.send_sample_request(transport).await?;
+                    return Ok(());
+                }
+            }
+        }
 
         match topic {
             // agent/{agent_id}/input — 收到用户输入或父 Agent 指令（兼容 AgentNode 路径）
             t if t.starts_with("agent/") && t.ends_with("/input") => {
+                tracing::info!("Thinker 收到 input 消息：topic={}", topic);
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
                 let content = payload["content"].as_str().unwrap_or("");
                 let role = payload["role"].as_str().unwrap_or("user");
@@ -911,13 +1127,20 @@ impl Node for ThinkerNode {
                 self.budget_denied = false;
                 self.force_end_turn = false;
                 self.turn_had_tool_failure = false;
+                self.consecutive_tool_rounds = 0;
                 // 重置循环状态机并记录任务描述（供 ERL trajectory 提取）
                 self.loop_state_machine.reset();
                 if !content.is_empty() {
                     self.loop_state_machine.set_task_description(content.to_string());
                 }
 
-                self.listen(content, role); // 内置听觉
+                self.listen_sync(content, role); // 内置听觉（快速同步部分）
+                // 首次输入后锁定稳定前缀，保护已有条目不被压缩
+                // 确保跨轮次 API 请求前缀字节不变，提升 prompt cache 命中率
+                if self.working_memory.stable_prefix_len() == 0 {
+                    self.working_memory.lock_stable_prefix();
+                }
+                tracing::info!("Thinker listen_sync 完成，开始后续处理");
 
                 // ERL 闭环：检索与当前任务相关的历史启发式，注入工作记忆
                 if !content.is_empty() {
@@ -944,15 +1167,9 @@ impl Node for ThinkerNode {
                 if content.starts_with("/goal ") {
                     let goal_description = content.strip_prefix("/goal ").unwrap_or("").to_string();
                     if !goal_description.is_empty() {
-                        self.start_goal(goal_description);
-                        // 规划阶段：注入提示让 LLM 生成子任务列表
-                        if let Some(ref gl) = self.goal_loop {
-                            let desc = gl.description().to_string();
-                            self.working_memory.push_user(
-                                format!("请将以下目标拆解为可执行的子任务列表（JSON 数组格式，每项包含 description 和 verification 字段）：\n{}", desc),
-                                Self::estimate_tokens(&desc),
-                            );
-                        }
+                        // 与 cortex/goal_start 共用入口，避免两处逻辑分叉。
+                        // 注入后继续流到本 handler 末尾的统一采样出口驱动 LLM。
+                        self.start_goal_with_planning(goal_description);
                     }
                 }
 
@@ -1003,19 +1220,40 @@ impl Node for ThinkerNode {
                 self.agentic_session_active = true;
                 AgentMetrics::global().record_loop_count(1);
                 self.inference_start = Some(std::time::Instant::now());
+                tracing::info!("Thinker 开始 agentic session，准备发送采样请求");
 
-                // 请求预算和熔断器检查（fire-and-forget，拒绝通过 cortex/budget_deny 异步通知）
-                self.check_budget_and_circuit(transport).await;
+                // 请求预算和熔断器检查
+                if !self.check_budget_and_circuit(transport).await {
+                    tracing::warn!("Thinker 预算或熔断器拒绝，跳过本次 LLM 调用");
+                    self.agentic_session_active = false;
+                    self.state = AgentState::Idle;
+                    // 通知 TUI 恢复输入状态
+                    let idle_event = FrameCodec::new_message(
+                        Topic::agent_event(self.id.as_str()),
+                        self.id.as_str(),
+                        &serde_json::json!({ "state": "idle" }),
+                    );
+                    if let Ok(msg) = idle_event {
+                        let _ = transport.send_message(&msg).await;
+                    }
+                    return Ok(());
+                }
+                tracing::info!("Thinker 预算检查通过，构建采样请求");
 
                 let request = self.build_sample_request();
+                tracing::info!("Thinker 采样请求构建完成，通过控制面发送");
                 let sample_msg = FrameCodec::new_message(
                     Topic::sampler_request(),
                     self.id.as_str(),
                     &request,
                 )?;
-                if let Err(e) = transport.publish_data(&sample_msg).await {
-                    tracing::debug!("数据面 PUB 发送失败，回退到控制面：{}", e);
-                    transport.send_message(&sample_msg).await?;
+                transport.send_message(&sample_msg).await?;
+                tracing::info!("采样请求通过控制面发送成功");
+
+                // 慢路径：长期记忆搜索 + 意图扩展，结果注入工作记忆供后续轮次使用
+                // 放在 sampler 请求发送之后，不阻塞首次 LLM 请求
+                if !content.is_empty() {
+                    self.listen_enrichment(content);
                 }
             }
 
@@ -1027,6 +1265,12 @@ impl Node for ThinkerNode {
                 if raw_value.get("type").and_then(|v| v.as_str()) == Some("done") {
                     if let Some(req_id) = raw_value.get("request_id").and_then(|v| v.as_str()) {
                         if Some(req_id) != self.current_sample_request_id.as_deref() {
+                            tracing::warn!(
+                                "Thinker {} 丢弃过期 done 消息：req_id={}, current={:?}",
+                                self.id, req_id, self.current_sample_request_id
+                            );
+                            // 丢弃过期流的累积文本，否则会串入下一轮 assistant 消息
+                            self.current_assistant_text.clear();
                             return Ok(());
                         }
                     }
@@ -1062,6 +1306,30 @@ impl Node for ThinkerNode {
                         .unwrap_or(0);
                     let has_tool_calls = !self.pending_tool_calls.is_empty();
                     let llm_stop_reason = if has_tool_calls { "tool_use" } else { "end_turn" };
+
+                    // ── assistant 回复入工作记忆 ──
+                    // 必须在两个分支（tool_use / end_turn）之前统一处理：
+                    // LLM 需要看到自己上一轮说过什么，且 Anthropic Messages API
+                    // 拒绝连续 user 消息，缺 assistant 角色会直接失败。
+                    //
+                    // 有工具调用时也要入栈：此时 assistant 消息代表"我决定调用工具"，
+                    // 后续工具结果作为 user 消息跟在其后，才构成合法的角色交替。
+                    let assistant_text = std::mem::take(&mut self.current_assistant_text);
+                    if !assistant_text.trim().is_empty() {
+                        let token_count = Self::estimate_tokens(&assistant_text);
+                        self.working_memory.push_assistant(assistant_text, token_count);
+                    } else if has_tool_calls {
+                        // 纯工具调用无伴随文本：仍需一条 assistant 占位，否则
+                        // user(prompt) 之后直接跟 user(工具结果)，角色不交替。
+                        let tool_names: Vec<&str> = self
+                            .pending_tool_calls
+                            .values()
+                            .map(|tc| tc.tool_name.as_str())
+                            .collect();
+                        let placeholder = format!("[调用工具：{}]", tool_names.join(", "));
+                        let token_count = Self::estimate_tokens(&placeholder);
+                        self.working_memory.push_assistant(placeholder, token_count);
+                    }
                     // 收集本轮工具调用列表（id, name, input）供状态机记录
                     let llm_tool_calls: Vec<(String, String, serde_json::Value)> = self
                         .pending_tool_calls
@@ -1084,9 +1352,21 @@ impl Node for ThinkerNode {
                         self.state = AgentState::ToolCalling;
                         let tool_calls: Vec<(String, PendingToolCall)> =
                             self.pending_tool_calls.drain().collect();
+                        tracing::info!(
+                            "Thinker 开始分发 {} 个工具调用",
+                            tool_calls.len()
+                        );
                         for (tool_call_id, pending) in tool_calls {
+                            tracing::info!(
+                                "Thinker 分派工具调用：tool_call_id={}, tool_name={}",
+                                tool_call_id, pending.tool_name
+                            );
                             self.pending_tool_results
-                                .insert(tool_call_id.clone(), pending.tool_name.clone());
+                                .insert(tool_call_id.clone(), (pending.tool_name.clone(), std::time::Instant::now()));
+                            tracing::info!(
+                                "Thinker 已插入 pending_tool_results：tool_call_id={}, pending_count={}",
+                                tool_call_id, self.pending_tool_results.len()
+                            );
 
                             // 发送到 agent/{id}/tool_call（ToolNode 标准路径）
                             let tool_call_msg = FrameCodec::new_message(
@@ -1096,13 +1376,16 @@ impl Node for ThinkerNode {
                                     "tool_call_id": tool_call_id,
                                     "tool_name": pending.tool_name,
                                     "arguments": pending.arguments,
-                                    "agent_id": self.id.to_string(),
+                                    "agent_id": self.id.as_str(),
                                 }),
                             )?;
-                            if let Err(e) = transport.publish_data(&tool_call_msg).await {
-                                tracing::debug!("数据面 PUB 发送 tool_call 失败，回退到控制面：{}", e);
-                                transport.send_message(&tool_call_msg).await?;
-                            }
+                            // 使用控制面确保可靠投递到 Tool Node
+                            transport.send_message(&tool_call_msg).await?;
+                            tracing::trace!(
+                                agent = %self.id,
+                                tool = %pending.tool_name,
+                                "tool_call 通过控制面发送"
+                            );
 
                             tracing::debug!(
                                 "Thinker {} 发送工具调用：{} ({})",
@@ -1252,7 +1535,7 @@ impl Node for ThinkerNode {
                                     // 从工作记忆中提取最近的 assistant 消息
                                     let last_assistant = self.working_memory.entries().iter().rev()
                                         .find_map(|e| match e {
-                                            WorkingEntry::Hot { role, content, .. } if matches!(role, MessageRole::Assistant) => Some(content.clone()),
+                                            WorkingEntry::Hot { role: MessageRole::Assistant, content, .. } => Some(content.clone()),
                                             _ => None,
                                         });
                                     if let Some(text) = last_assistant {
@@ -1319,10 +1602,19 @@ impl Node for ThinkerNode {
                         if self.loop_state_machine.state() == AgentState::Done {
                             let trajectory = self.loop_state_machine.extract_trajectory();
                             if !trajectory.steps.is_empty() {
-                                let traj_payload = serde_json::json!({
-                                    "agent_id": self.id.to_string(),
-                                    "trajectory": trajectory,
-                                });
+                                // 手动构造 JSON payload（避免 ccore-advanced 的 serde 跨 crate 兼容性问题）
+                            let traj_payload = serde_json::json!({
+                                "agent_id": self.id.to_string(),
+                                "trajectory": {
+                                    "task": trajectory.task,
+                                    "steps": trajectory.steps.iter().map(|s| serde_json::json!({
+                                        "step_type": s.step_type,
+                                        "content": s.content,
+                                    })).collect::<Vec<serde_json::Value>>(),
+                                    "success": trajectory.success,
+                                    "failure_reason": trajectory.failure_reason,
+                                },
+                            });
                                 if let Ok(traj_msg) = FrameCodec::new_message(
                                     Topic::new("cortex/erl_trajectory"),
                                     self.id.as_str(),
@@ -1349,6 +1641,18 @@ impl Node for ThinkerNode {
                         self.persist_to_state(transport).await;
 
                         tracing::debug!("Thinker {} agentic turn 完成", self.id);
+
+                        // 通知 TUI：turn 已结束，清除 spinner
+                        let idle_event = FrameCodec::new_message(
+                            Topic::agent_event(self.id.as_str()),
+                            self.id.as_str(),
+                            &serde_json::json!({ "state": "idle" }),
+                        );
+                        if let Ok(msg) = idle_event {
+                            if let Err(e) = transport.send_message(&msg).await {
+                                tracing::debug!("发送 idle 事件失败：{}", e);
+                            }
+                        }
                     }
                     return Ok(());
                 }
@@ -1371,6 +1675,10 @@ impl Node for ThinkerNode {
                 // 正常 StreamChunk
                 let chunk: StreamChunk = FrameCodec::decode_payload(&msg)?;
                 if Some(&chunk.request_id) != self.current_sample_request_id.as_ref() {
+                    tracing::warn!(
+                        "Thinker {} 丢弃过期 stream chunk：chunk_req_id={}, current={:?}",
+                        self.id, chunk.request_id, self.current_sample_request_id
+                    );
                     return Ok(());
                 }
                 self.handle_stream_chunk(&chunk, transport).await?;
@@ -1378,13 +1686,21 @@ impl Node for ThinkerNode {
 
             // agent/{agent_id}/tool_result — 工具执行结果（ToolNode 标准路径）
             t if t.starts_with("agent/") && t.ends_with("/tool_result") => {
+                tracing::info!(
+                    "Thinker {} 收到 tool_result 原始消息：payload_len={}, payload_bytes={:?}",
+                    self.id, msg.payload.len(), &msg.payload[..std::cmp::min(100, msg.payload.len())]
+                );
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                tracing::info!(
+                    "Thinker {} 收到 tool_result：payload={:?}, pending_keys={:?}",
+                    self.id, payload, self.pending_tool_results.keys().collect::<Vec<_>>()
+                );
                 let tool_call_id = payload["tool_call_id"].as_str().unwrap_or("");
                 let output = payload["output"].as_str().unwrap_or("");
                 let success = payload["success"].as_bool().unwrap_or(true);
                 let duration_ms = payload["duration_ms"].as_u64().unwrap_or(0);
 
-                if let Some(tool_name) = self.pending_tool_results.get(tool_call_id).cloned() {
+                if let Some((tool_name, _started_at)) = self.pending_tool_results.get(tool_call_id).cloned() {
                     AgentMetrics::global()
                         .record_tool_execution_time(&tool_name, duration_ms as f64);
                     if !success {
@@ -1431,10 +1747,7 @@ impl Node for ThinkerNode {
                                                 "content": format!("Agent 循环终止：{:?}", reason),
                                             }),
                                         )?;
-                                        if let Err(e) = transport.publish_data(&notice_msg).await {
-                                            tracing::debug!("数据面 PUB 发送循环终止通知失败：{}", e);
-                                            transport.send_message(&notice_msg).await?;
-                                        }
+                                        transport.send_message(&notice_msg).await?;
                                         return Ok(());
                                     }
                                 }
@@ -1480,27 +1793,64 @@ impl Node for ThinkerNode {
                                     ),
                                 }),
                             )?;
-                            if let Err(e) = transport.publish_data(&notice_msg).await {
-                                tracing::debug!("数据面 PUB 发送 doom loop 通知失败，回退到控制面：{}", e);
-                                transport.send_message(&notice_msg).await?;
-                            }
+                            transport.send_message(&notice_msg).await?;
 
                             // 不结束 turn，继续调用 LLM 给 Agent 逃脱循环的机会
-                            self.run_compaction_pipeline();
+                            self.run_compaction_pipeline_with_llm(transport).await;
                             self.send_sample_request(transport).await?;
                         } else {
-                            // 未检测到 Doom Loop，说明已成功跳出循环：
-                            // 重置逃脱尝试计数和模型降级等级（恢复原级推理强度）
-                            self.doom_loop_escape_attempts = 0;
-                            self.doom_loop_detector.reset_degrade_level();
+                            // 未检测到 Doom Loop。
+                            //
+                            // 注意：本分支每轮工具执行后都会走到，不是只在"刚逃脱成功"时走，
+                            // 因此清理动作必须以 escape_attempts > 0 为条件——否则会无条件
+                            // 清空签名历史，检测器永远攒不满阈值，doom loop 检测彻底失效。
+                            if self.doom_loop_escape_attempts > 0 {
+                                tracing::info!(
+                                    "Doom Loop 已跳出（此前尝试 {} 次），重置检测器状态",
+                                    self.doom_loop_escape_attempts
+                                );
+                                self.doom_loop_escape_attempts = 0;
+                                // 恢复原级推理强度
+                                self.doom_loop_detector.reset_degrade_level();
+                                // 清空签名历史：触发判定的那批旧签名若留在窗口内，
+                                // 下一轮只要再调一次同名工具就会立刻被重新判定为循环，
+                                // 且每次判定都递增降级等级，把推理强度一路压到最低（误报自我强化）
+                                self.doom_loop_detector.reset();
+                                // 还原检测阈值：反射弧 motor 的 slow_down 会收紧阈值，
+                                // 不还原则灵敏度永久停留在收紧状态（单向棘轮），
+                                // 正常操作也会被判定为循环
+                                self.doom_loop_detector.restore_repeat_threshold();
+                            }
 
                             // 回到 sampler 前先跑压缩管道
-                            self.run_compaction_pipeline();
+                            self.run_compaction_pipeline_with_llm(transport).await;
                             self.send_sample_request(transport).await?;
                         }
                     }
                 } else {
-                    tracing::warn!("Thinker {} 收到未知 tool_call_id 的结果：{}", self.id, tool_call_id);
+                    // tool_call_id 为空或未知 — 可能是序列化问题或重复消息
+                    // 尝试匹配任意待处理的工具调用，避免 Thinker 卡在 ToolCalling 状态
+                    tracing::warn!(
+                        "Thinker {} 收到未知 tool_call_id 的结果：tool_call_id='{}', payload={:?}, pending_keys={:?}",
+                        self.id, tool_call_id, payload, self.pending_tool_results.keys().collect::<Vec<_>>()
+                    );
+
+                    if !self.pending_tool_results.is_empty() {
+                        // 取出第一个待工具调用，尝试匹配
+                        let (pending_id, (tool_name, _started_at)) = self.pending_tool_results.iter().next()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .unwrap();
+                        tracing::warn!(
+                            "Thinker {} 尝试匹配未知结果到待处理工具：pending_id={}, tool_name={}",
+                            self.id, pending_id, tool_name
+                        );
+                        self.pending_tool_results.remove(&pending_id);
+                        let all_done = self.handle_tool_result(&pending_id, &tool_name, output, success, transport).await;
+                        if all_done {
+                            self.run_compaction_pipeline_with_llm(transport).await;
+                            self.send_sample_request(transport).await?;
+                        }
+                    }
                 }
             }
 
@@ -1519,11 +1869,43 @@ impl Node for ThinkerNode {
                             "agent_id": self.id.to_string(),
                         }),
                     )?;
-                    if let Err(e) = transport.publish_data(&cancel_msg).await {
-                        tracing::debug!("数据面 PUB 发送采样取消失败，回退到控制面：{}", e);
-                        transport.send_message(&cancel_msg).await?;
-                    }
+                    transport.send_message(&cancel_msg).await?;
                     tracing::info!("Thinker {} 已转发取消到 sampler: {}", self.id, req_id);
+                }
+
+                // ── Tombstone 模式（借鉴 Claude Code）──
+                // 为每个待处理的工具调用注入合成"已取消"结果，保持对话历史一致性。
+                // 避免恢复会话时 LLM 看到"有调用无结果"的断裂上下文。
+                let cancelled_tools: Vec<(String, String)> = self.pending_tool_calls.iter()
+                    .map(|(id, tc)| (id.clone(), tc.tool_name.clone()))
+                    .collect();
+
+                // tombstone 以 user 角色入栈，前面必须先有 assistant 消息，
+                // 否则 user(prompt) 后直接跟 user(tombstone)，角色不交替 → Anthropic 拒绝。
+                let assistant_text = std::mem::take(&mut self.current_assistant_text);
+                if !assistant_text.trim().is_empty() {
+                    let token_count = Self::estimate_tokens(&assistant_text);
+                    self.working_memory.push_assistant(assistant_text, token_count);
+                } else if !cancelled_tools.is_empty() {
+                    let tool_names: Vec<&str> =
+                        cancelled_tools.iter().map(|(_, name)| name.as_str()).collect();
+                    let placeholder = format!("[调用工具：{}]", tool_names.join(", "));
+                    let token_count = Self::estimate_tokens(&placeholder);
+                    self.working_memory.push_assistant(placeholder, token_count);
+                }
+
+                for (tool_call_id, tool_name) in &cancelled_tools {
+                    let tombstone = format!(
+                        "<tool_result>\n工具 {} 的执行已被用户取消，未产生结果。\n\
+                         如果用户发起了新任务，请专注于新任务。\n</tool_result>",
+                        tool_name
+                    );
+                    let token_count = Self::estimate_tokens(&tombstone);
+                    self.working_memory.push_user(tombstone, token_count);
+                    tracing::debug!(
+                        "Tombstone 注入：tool_call_id={}, tool_name={}",
+                        tool_call_id, tool_name
+                    );
                 }
 
                 // 清理待处理的工具调用
@@ -1556,9 +1938,7 @@ impl Node for ThinkerNode {
                     }),
                 );
                 if let Ok(notice_msg) = notice_msg {
-                    if let Err(e) = transport.publish_data(&notice_msg).await {
-                        tracing::debug!("发送预算拒绝通知失败：{}", e);
-                    }
+                    transport.send_message(&notice_msg).await?;
                 }
                 self.state = AgentState::Idle;
                 self.current_sample_request_id = None;
@@ -1570,7 +1950,9 @@ impl Node for ThinkerNode {
                 let signal_topic = payload["signal_topic"].as_str().unwrap_or("");
                 let action = payload["action"].as_str().unwrap_or("");
                 let summary = format!("[反射弧L1] 信号={} 动作={}", signal_topic, action);
-                self.working_memory.push_system(&summary, summary.len() as u32 / 3);
+                // 统一走 estimate_tokens：此处曾用 len()/3，与别处的 len()/4 口径分叉
+                let summary_tokens = Self::estimate_tokens(&summary);
+                self.working_memory.push_system(&summary, summary_tokens);
                 tracing::info!(signal_topic, action, "Thinker 收到 L1 本能反射通知");
             }
 
@@ -1686,41 +2068,78 @@ impl Node for ThinkerNode {
                         ).await;
                     }
 
-                    let token_count = Self::estimate_tokens(output);
-                    self.working_memory.push_user(output.to_string(), token_count);
+                    // 子 Agent 摘要返回：大输出压缩为摘要，保护父上下文 token 预算
+                    // 借鉴 Claude Code 子 agent 摘要返回设计
+                    let summary = if output.len() > 2000 {
+                        let paths: Vec<&str> = output
+                            .split_whitespace()
+                            .filter(|w| w.starts_with('/') && w.contains('.') && w.len() < 200)
+                            .take(10)
+                            .collect();
+                        let state_dir = ".ccode/state".to_string();
+                        let _ = std::fs::create_dir_all(&state_dir);
+                        let full_path = format!("{}/subagent-{}.md", state_dir, subagent_id);
+                        let _ = std::fs::write(&full_path, output);
+
+                        let head_end = output.floor_char_boundary(200);
+                        let tail_start = output.ceil_char_boundary(output.len().saturating_sub(200));
+                        let head = &output[..head_end];
+                        let tail = &output[tail_start..];
+                        let paths_str = if paths.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" 涉及文件：{}", paths.join(", "))
+                        };
+                        format!(
+                            "[子Agent 完成] 摘要：{}...{}。{}完整输出已保存至 {}，可用 read_file 查看",
+                            head, tail, paths_str, full_path
+                        )
+                    } else {
+                        output.to_string()
+                    };
+
+                    let summary_token_count = Self::estimate_tokens(&summary);
+                    self.working_memory.push_user(summary, summary_token_count);
                     let node_id: NodeId = subagent_id.to_string().into();
                     self.orchestrator.remove_subagent(&node_id);
                 }
             }
 
-            // cortex/goal_start — 启动目标驱动循环（来自用户 /goal 命令或外部触发）
+            // cortex/goal_start — 启动目标驱动循环（外部触发：Kernel / 其他 Node / IDE 插件）
             "cortex/goal_start" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
-                if let Some(description) = payload["description"].as_str() {
-                    self.start_goal(description.to_string());
-                    // 规划阶段：立即注入提示让 LLM 生成子任务列表
-                    if let Some(ref gl) = self.goal_loop {
-                        let desc = gl.description().to_string();
-                        self.working_memory.push_user(
-                            format!("请将以下目标拆解为可执行的子任务列表（JSON 数组格式，每项包含 description 和 verification 字段）：\n{}", desc),
-                            Self::estimate_tokens(&desc),
-                        );
-                    }
-                    // 开始 agentic session 来规划子任务
-                    self.agentic_session_active = true;
-                    self.inference_start = Some(std::time::Instant::now());
-                    self.check_budget_and_circuit(transport).await;
-                    let request = self.build_sample_request();
-                    let sample_msg = FrameCodec::new_message(
-                        Topic::sampler_request(),
-                        self.id.as_str(),
-                        &request,
-                    )?;
-                    if let Err(e) = transport.publish_data(&sample_msg).await {
-                        tracing::debug!("数据面 PUB 发送失败，回退到控制面：{}", e);
-                        transport.send_message(&sample_msg).await?;
-                    }
+                let Some(description) = payload["description"].as_str() else {
+                    tracing::warn!(
+                        target: "ccore::goal",
+                        "cortex/goal_start 缺少 description 字段，忽略"
+                    );
+                    return Ok(());
+                };
+                if description.trim().is_empty() {
+                    tracing::warn!(target: "ccore::goal", "cortex/goal_start 的 description 为空，忽略");
+                    return Ok(());
                 }
+
+                // 与 /goal 命令共用入口
+                self.start_goal_with_planning(description.to_string());
+
+                // 本路径不经 user_input handler 末尾的统一采样出口，需自行开启 session
+                self.agentic_session_active = true;
+                AgentMetrics::global().record_loop_count(1);
+                self.inference_start = Some(std::time::Instant::now());
+                if !self.check_budget_and_circuit(transport).await {
+                    tracing::warn!(target: "ccore::goal", "预算或熔断器拒绝，goal 规划未能启动");
+                    self.agentic_session_active = false;
+                    self.state = AgentState::Idle;
+                    return Ok(());
+                }
+                let request = self.build_sample_request();
+                let sample_msg = FrameCodec::new_message(
+                    Topic::sampler_request(),
+                    self.id.as_str(),
+                    &request,
+                )?;
+                transport.send_message(&sample_msg).await?;
             }
 
             // cortex/goal_verify_result — 目标验证结果回调（来自 Kernel 或外部验证器）
@@ -1728,6 +2147,20 @@ impl Node for ThinkerNode {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
                 let passed = payload["passed"].as_bool().unwrap_or(false);
                 self.on_goal_verification_result(passed, transport).await?;
+            }
+
+            // cortex/summary_result — 压缩管道 L4 的 LLM 摘要回传（来自 SamplerNode）
+            "cortex/summary_result" => {
+                let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
+                let Some(summary) = payload["summary"].as_str() else {
+                    tracing::warn!(
+                        target: "ccore::compaction",
+                        "cortex/summary_result 缺少 summary 字段，忽略"
+                    );
+                    return Ok(());
+                };
+                self.apply_llm_summary(summary);
+                self.pending_summary_request = None;
             }
 
             // cortex/schedule_tick — Schedule Loop 定时唤醒（来自 spawn 的 tick task）
@@ -1800,6 +2233,7 @@ impl Node for ThinkerNode {
             "cortex/erl_heuristic".into(),             // 经验反思学习结果
             "cortex/goal_start".into(),                // 目标驱动循环启动
             "cortex/goal_verify_result".into(),        // 目标验证结果
+            "cortex/summary_result".into(),            // 压缩管道 L4 的 LLM 摘要回传
             "cortex/schedule_tick".into(),             // Schedule Loop 定时唤醒
             "cortex/proactive_tick".into(),            // Proactive Loop 闲置扫描触发
             "sampler/*/stream".into(),
@@ -1817,9 +2251,21 @@ impl Node for ThinkerNode {
     }
 
     fn published_topics(&self) -> Vec<String> {
+        // 必须与实际发布行为一致：Kernel 用本列表建立数据面路由
+        // （`find_subscribers_for_publisher`）。此前只声明了 3 个 agent/* topic，
+        // 漏了 sampler/state/cortex 系列——因为这些走 `send_message`（控制面，
+        // 经 Kernel 路由）而非 `publish_data`（数据面 PUB），所以投递未受影响，
+        // 但声明与实际不符会误导后续排查（比对声明扫死代码时会误判为无发布方）。
         vec![
             format!("agent/{}/output", self.id),       // 文本输出（替代 cortex/{id}/speak）
             format!("agent/{}/tool_call", self.id),     // 工具调用（替代 hand/limb/*）
+            format!("agent/{}/event", self.id),         // 状态事件（idle/thinking/outputting）
+            "sampler/request".into(),                   // LLM 采样请求
+            "state/persist".into(),                     // 工作记忆持久化
+            "cortex/schedule_tick".into(),              // ScheduleLoop 定时唤醒（spawn task 内发布）
+            "cortex/proactive_tick".into(),             // ProactiveLoop 闲置扫描（spawn task 内发布）
+            "cortex/erl_retrieve_request".into(),       // ERL 经验检索请求
+            "cortex/erl_trajectory".into(),             // ERL 轨迹上报
         ]
     }
 
@@ -1900,6 +2346,103 @@ mod tests {
     }
 
     #[test]
+    fn tombstone_injects_cancel_results_into_working_memory() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+        thinker.working_memory.push_system("system".to_string(), 5);
+        thinker.working_memory.push_user("do something".to_string(), 5);
+
+        // 模拟两个待处理的工具调用
+        thinker.pending_tool_calls.insert("tc-1".into(), PendingToolCall {
+            tool_call_id: "tc-1".into(),
+            tool_name: "read_file".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        });
+        thinker.pending_tool_calls.insert("tc-2".into(), PendingToolCall {
+            tool_call_id: "tc-2".into(),
+            tool_name: "grep".into(),
+            arguments: serde_json::json!({"pattern": "fn main"}),
+        });
+
+        // 收集取消前的工具信息（与 cancel handler 逻辑一致）
+        let cancelled: Vec<(String, String)> = thinker.pending_tool_calls.iter()
+            .map(|(id, tc)| (id.clone(), tc.tool_name.clone()))
+            .collect();
+        assert_eq!(cancelled.len(), 2);
+
+        // 注入 tombstone 结果（与生产 cancel handler 逻辑一致：
+        // 先补 assistant 占位，再逐条注入 user tombstone）
+        let placeholder = format!(
+            "[调用工具：{}]",
+            cancelled.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>().join(", ")
+        );
+        let ph_tokens = ThinkerNode::estimate_tokens(&placeholder);
+        thinker.working_memory.push_assistant(placeholder, ph_tokens);
+
+        for (_tool_call_id, tool_name) in &cancelled {
+            let tombstone = format!(
+                "<tool_result>\n工具 {} 的执行已被用户取消，未产生结果。\n\
+                 如果用户发起了新任务，请专注于新任务。\n</tool_result>",
+                tool_name
+            );
+            let token_count = ThinkerNode::estimate_tokens(&tombstone);
+            thinker.working_memory.push_user(tombstone, token_count);
+        }
+
+        // 验证 working_memory 中有 tombstone 注入
+        let messages = thinker.working_memory.to_chat_messages();
+        let tombstone_msgs: Vec<_> = messages.iter()
+            .filter(|(role, content)| *role == "user" && content.contains("已被用户取消"))
+            .collect();
+        assert_eq!(tombstone_msgs.len(), 2, "应为每个被取消的工具注入一条 tombstone 消息");
+        assert!(tombstone_msgs.iter().any(|(_, c)| c.contains("read_file")));
+        assert!(tombstone_msgs.iter().any(|(_, c)| c.contains("grep")));
+
+        // tombstone 之前必须有 assistant 消息，否则 user(prompt) 直接跟
+        // user(tombstone)，角色不交替 → Anthropic 拒绝请求
+        assert!(
+            messages.iter().any(|(role, _)| role == "assistant"),
+            "取消路径也必须补 assistant 消息以维持角色交替"
+        );
+    }
+
+    /// 一个完整 turn 之后，对话历史必须能构成合法的 Anthropic 请求。
+    ///
+    /// 此前 assistant 回复从不入工作记忆（流式文本只转发 TUI），
+    /// 导致形状是 `user(prompt) → user(工具结果) → ...`，Anthropic 直接拒绝。
+    #[test]
+    fn conversation_alternates_after_full_turn() {
+        use crate::sampler::claude_compat::ClaudeCompatProvider;
+
+        let mut wm = WorkingMemory::new(8000);
+        // 模拟一个完整 turn：用户提问 → assistant 决定调工具 → 两个并行工具结果
+        wm.push_user("帮我看下代码".to_string(), 10);
+        wm.push_assistant("[调用工具：read_file, grep]".to_string(), 10);
+        wm.push_user("文件内容".to_string(), 10);
+        wm.push_user("搜索结果".to_string(), 10);
+
+        let msgs = wm.to_chat_messages_direct(|role, content| crate::sampler::provider::ChatMessage {
+            role,
+            content,
+            cache_control: None,
+        });
+        // 工作记忆里允许连续 user（N 个并行工具 = N 条结果），
+        // 但经 Anthropic provider 合并后必须严格交替
+        let merged = ClaudeCompatProvider::merge_consecutive_roles(&msgs);
+
+        assert!(
+            merged.iter().any(|m| m.role == "assistant"),
+            "完整 turn 后必须存在 assistant 消息"
+        );
+        for pair in merged.windows(2) {
+            assert_ne!(
+                pair[0].role, pair[1].role,
+                "合并后不应有连续同角色，实际：{:?}",
+                merged.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn test_prompt_cache_breakpoints() {
         let mut wm = WorkingMemory::new(8000);
         wm.push_system("You are a coding assistant.".to_string(), 20);
@@ -1931,11 +2474,173 @@ mod tests {
         let cc = request.messages[0].cache_control.as_ref().unwrap();
         assert_eq!(cc.cache_type, "ephemeral");
 
-        // 断点 2：倒数第 5 条消息应有 cache_control（messages.len()=6 > 5）
-        // 倒数第 5 条 = index 1
-        assert!(request.messages[1].cache_control.is_some(), "倒数第 5 条消息应有 cache_control 断点");
+        // 断点 2：倒数第 2 条消息（BP4）——只有最后一条不缓存。
+        //
+        // 注意：此断言原为 index 1（旧的 2-breakpoint 策略：首条 + 倒数第 5 条）。
+        // 现已改为 `sampler::cache_placement::place_breakpoints` 的 4-breakpoint
+        // 策略：len<3 只放 BP1；len<7 放 BP1+BP4；len>=7 才加 BP2/BP3。
+        // 本例 len=6，故断点在 [0, 4]。
+        let bp_indices: Vec<usize> = request
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.cache_control.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            bp_indices,
+            vec![0, request.messages.len() - 2],
+            "len=6 应只有 BP1(首条 system) + BP4(倒数第 2 条)"
+        );
 
         // prompt_cache_key 应设置
         assert!(request.prompt_cache_key.is_some());
+    }
+
+    #[test]
+    fn test_reminder_injection_after_consecutive_tool_rounds() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+        thinker.working_memory.push_system("You are a coding assistant.".to_string(), 20);
+        thinker.working_memory.push_user("帮我重构这个模块".to_string(), 10);
+        thinker.loop_state_machine.set_task_description("帮我重构这个模块".to_string());
+
+        // 低于阈值时不注入 reminder
+        thinker.consecutive_tool_rounds = 3;
+        let request = thinker.build_sample_request();
+        let last_user = request.messages.iter().rev().find(|m| m.role == "user").unwrap();
+        assert!(!last_user.content.contains("system-reminder"),
+            "低于阈值时不应注入 reminder");
+
+        // 达到阈值时注入 reminder
+        thinker.consecutive_tool_rounds = 5;
+        let request = thinker.build_sample_request();
+        let last_user = request.messages.iter().rev().find(|m| m.role == "user").unwrap();
+        assert!(last_user.content.contains("system-reminder"),
+            "达到阈值时应注入 reminder");
+        assert!(last_user.content.contains("帮我重构这个模块"),
+            "reminder 应包含原始任务描述");
+        assert!(last_user.content.contains("5"),
+            "reminder 应包含连续轮次数");
+    }
+
+    /// token 估算不得低于旧的 `len()/4` 口径——旧实现对中文按 UTF-8 字节数算，
+    /// 低估约 16%，会让压缩触发偏晚、上下文有溢出风险。
+    #[test]
+    fn estimate_tokens_beats_old_byte_based_estimate() {
+        let zh = "检测到工具重复调用，请换一种方法。";
+        let est = ThinkerNode::estimate_tokens(zh);
+        let old_est = (zh.len() as u32).div_ceil(4);
+        assert!(
+            est >= old_est,
+            "中文估算 {est} 不应低于旧 len()/4 口径 {old_est}"
+        );
+    }
+
+    /// thinker 侧与 sampler 侧必须共用同一套预算口径，不得各写一份导致分叉。
+    #[test]
+    fn estimate_tokens_delegates_to_token_budget() {
+        for s in ["", "a", "中", "调用 read_file 失败", "pub fn main() {}"] {
+            assert_eq!(
+                ThinkerNode::estimate_tokens(s) as usize,
+                crate::sampler::token_budget::TokenBudgetManager::estimate_tokens(s),
+                "thinker 的估算应与 TokenBudgetManager 完全一致（输入：{s:?}）"
+            );
+        }
+    }
+
+    #[test]
+    fn estimate_tokens_edge_cases() {
+        assert_eq!(ThinkerNode::estimate_tokens(""), 0, "空串应为 0");
+        assert!(ThinkerNode::estimate_tokens("a") >= 1, "非空串至少 1 token");
+        assert!(ThinkerNode::estimate_tokens("中") >= 1, "单个 CJK 字符至少 1 token");
+    }
+
+    /// `/goal` 与 `cortex/goal_start` 必须共用入口，不得各自复制逻辑。
+    #[test]
+    fn start_goal_with_planning_creates_loop_and_injects_prompt() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+        thinker.start_goal_with_planning("实现登录模块".into());
+
+        assert!(thinker.goal_loop.is_some(), "应创建 GoalLoop");
+        assert_eq!(
+            thinker.goal_loop.as_ref().unwrap().description(),
+            "实现登录模块"
+        );
+
+        // 应注入拆解提示，且提示中带目标描述
+        let msgs = thinker.working_memory.to_chat_messages();
+        let injected = msgs
+            .iter()
+            .find(|(role, c)| role == "user" && c.contains("拆解"))
+            .expect("应注入子任务拆解提示");
+        assert!(injected.1.contains("实现登录模块"), "提示应包含目标描述");
+        assert!(injected.1.contains("verification"), "提示应说明返回契约");
+    }
+
+    /// token 估算须按注入的提示全文计，而非只算目标描述——
+    /// 提示模板本身约 40 token，只算 desc 会低估实际注入量。
+    #[test]
+    fn start_goal_planning_counts_full_prompt_tokens() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+        let desc = "实现登录模块";
+        thinker.start_goal_with_planning(desc.into());
+
+        let used = thinker.working_memory.used_tokens();
+        let desc_only = ThinkerNode::estimate_tokens(desc);
+        assert!(
+            used > desc_only,
+            "记账 {used} 应大于仅目标描述的 {desc_only}（提示模板本身也占 token）"
+        );
+    }
+
+    /// 空描述不应创建 GoalLoop——`cortex/goal_start` 的 payload 校验依赖此前提。
+    #[test]
+    fn start_goal_with_planning_handles_empty_description() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+        // 调用方（/goal 与 cortex/goal_start）都会先过滤空串，
+        // 这里验证即使传入空串也不 panic
+        thinker.start_goal_with_planning(String::new());
+        assert!(thinker.goal_loop.is_some(), "start_goal 本身不做校验，由调用方过滤");
+    }
+
+    /// L4 只在 L1~L3 跑完仍超阈值时才触发——避免每轮都多调一次 LLM。
+    #[test]
+    fn needs_llm_summary_only_when_over_threshold() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+        assert!(!thinker.needs_llm_summary(), "空上下文不应触发 L4");
+
+        // 灌到超过 auto_compact_threshold_percent（默认 95%）
+        let max = thinker.working_memory.max_tokens();
+        thinker.working_memory.push_user("x".repeat(100), max);
+        assert!(thinker.needs_llm_summary(), "用量超阈值时应触发 L4");
+    }
+
+    /// LLM 摘要以 system 角色入栈——与 Warm/Cold 一致，会被 provider 侧
+    /// `extract_system_messages` 提到顶层，不参与角色交替。
+    #[test]
+    fn apply_llm_summary_injects_as_system_role() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+        thinker.apply_llm_summary("用户要求重构登录模块，已完成参数校验部分");
+
+        let msgs = thinker.working_memory.to_chat_messages();
+        let summary_msg = msgs
+            .iter()
+            .find(|(_, c)| c.contains("LLM 上下文摘要"))
+            .expect("应注入摘要条目");
+        assert_eq!(summary_msg.0, "system", "摘要须以 system 角色入栈");
+        assert!(summary_msg.1.contains("重构登录模块"), "应保留摘要内容");
+    }
+
+    /// 空摘要不应污染上下文。
+    #[test]
+    fn apply_llm_summary_ignores_blank() {
+        let mut thinker = ThinkerNode::new(NodeId::new(), test_config());
+        let before = thinker.working_memory.entries().len();
+        thinker.apply_llm_summary("   \n  ");
+        assert_eq!(
+            thinker.working_memory.entries().len(),
+            before,
+            "空白摘要不应写入工作记忆"
+        );
     }
 }

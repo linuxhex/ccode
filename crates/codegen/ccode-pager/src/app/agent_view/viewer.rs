@@ -895,6 +895,16 @@ impl AgentView {
             }
         }
 
+        // Handle diff layout toggle: flip the runtime flag and rebuild
+        if viewer.diff_layout_toggle_pending {
+            viewer.diff_layout_toggle_pending = false;
+            viewer.list_state.set_scroll_anchor();
+            crate::appearance::cache::toggle_diff_layout_side_by_side();
+            if let Some(entry) = self.scrollback.get_by_id(viewer.entry_id) {
+                viewer.rebuild_items(entry);
+            }
+        }
+
         // Process pending copy actions (logic lives in BlockViewerPane)
         let entry_id = viewer.entry_id;
         if let Some(entry) = self.scrollback.get_by_id(entry_id)

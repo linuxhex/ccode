@@ -444,7 +444,7 @@ impl GoalLoop {
     /// 处理子任务失败
     fn handle_subtask_failure(&mut self, reason: String) -> GoalAction {
         let subtask = self.spec.subtasks.get_mut(self.current_subtask_idx);
-        let will_retry = subtask.map_or(false, |s| {
+        let will_retry = subtask.is_some_and(|s| {
             s.attempts < s.max_retries
         });
 

@@ -374,8 +374,14 @@ impl ClientNotify {
         let session_id = &self.session_id;
         let cwd = &self.cwd;
 
-        let (index_res, build_elapsed_ms) =
-            crate::timed!({ FileIndex::from_walk_with_options(cwd, WalkOptions::default()) });
+        let cwd_clone = cwd.clone();
+        let start = std::time::Instant::now();
+        let index_res = tokio::task::spawn_blocking(move || {
+            FileIndex::from_walk_with_options(&cwd_clone, WalkOptions::default())
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        let build_elapsed_ms = start.elapsed().as_millis() as u64;
         let index = match index_res {
             Ok(idx) => idx,
             Err(e) => {

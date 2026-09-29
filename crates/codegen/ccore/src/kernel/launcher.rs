@@ -54,6 +54,8 @@ pub struct NodeLauncher {
     episodic_memory: std::sync::Arc<crate::memory::episodic::EpisodicMemoryStore>,
     /// HookDispatcher 桥接（可选，由产品层注入 ccode-hooks 适配器）
     hook_dispatcher: Option<Arc<dyn HookDispatcher>>,
+    /// Skills 数量（用于 Thinker 系统提示构建）
+    skills_count: usize,
     /// 已启动的 Node 描述
     launched_nodes: Vec<NodeDescriptor>,
     /// 已启动的 Node 任务 JoinHandle（用于优雅关闭）
@@ -71,6 +73,7 @@ impl NodeLauncher {
             runtime_config,
             episodic_memory,
             hook_dispatcher: None,
+            skills_count: 0,
             launched_nodes: Vec::new(),
             task_handles: Vec::new(),
         }
@@ -79,6 +82,63 @@ impl NodeLauncher {
     /// 设置 HookDispatcher（由产品层注入 ccode-hooks 适配器）
     pub fn set_hook_dispatcher(&mut self, dispatcher: Arc<dyn HookDispatcher>) {
         self.hook_dispatcher = Some(dispatcher);
+    }
+
+    /// 设置 Skills 数量（用于 Thinker 系统提示构建）
+    pub fn set_skills_count(&mut self, count: usize) {
+        self.skills_count = count;
+    }
+
+    /// 取出已启动的 Node 任务 JoinHandle（转移所有权）
+    pub fn take_task_handles(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut self.task_handles)
+    }
+
+    /// 解析 `--resume`/`--continue`，返回 (session_id, 已复原的消息)
+    ///
+    /// **恢复失败一律降级为新会话而不是中止启动**：用户敲 `--continue` 的意图是
+    /// 「接着干」，如果那个会话已经被 GC 掉或记录损坏，把 agent 直接打死比开个
+    /// 新会话糟糕得多。降级会 warn 出来说明原因。
+    fn resolve_resume(
+        &self,
+        sessions_root: &std::path::Path,
+    ) -> (String, Vec<crate::node::session_index::RestoredMessage>) {
+        use crate::node::session_index;
+
+        let fresh = || uuid::Uuid::new_v4().to_string();
+        let target = match &self.kernel_config.resume {
+            Some(t) => t,
+            None => return (fresh(), Vec::new()),
+        };
+
+        let id = match session_index::resolve(sessions_root, target, &self.kernel_config.working_dir) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(target: "ccore::session", error = %e, "无法定位要恢复的会话，将开启新会话");
+                return (fresh(), Vec::new());
+            }
+        };
+
+        match session_index::read_transcript(sessions_root, &id) {
+            Ok(msgs) => {
+                tracing::info!(
+                    target: "ccore::session",
+                    session = %id,
+                    messages = msgs.len(),
+                    "已恢复会话"
+                );
+                (id, msgs)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "ccore::session",
+                    session = %id,
+                    error = %e,
+                    "会话记录读取失败，将开启新会话"
+                );
+                (fresh(), Vec::new())
+            }
+        }
     }
 
     /// 获取 NodeContext（供各 Node 连接消息总线）
@@ -115,10 +175,30 @@ impl NodeLauncher {
         let sampler = SamplerNode::with_configs(sampler_id.clone(), &self.runtime_config.providers);
 
         // 2. State Node
+        //
+        // 会话恢复在这里落地：先把 `--resume`/`--continue` 解析成具体 session id
+        // 并读出 transcript，再用同一份数据同时灌 State Node（持久化账本，
+        // 后续 append 到同一个 jsonl）与 Thinker Node（模型真正看得见的工作记忆）。
+        // 只灌前者会得到「日志读回来了但模型什么都不记得」。
+        let sessions_root = crate::node::session_index::sessions_root();
+        let (session_id, restored) = self.resolve_resume(&sessions_root);
+
         let state_ctx = self.node_context();
         let state_id = NodeId::new();
         let state_id_clone = state_id.clone();
-        let state = StateNode::new(state_id.clone());
+        let mut state = StateNode::with_session_id(state_id.clone(), session_id.clone());
+        if !restored.is_empty() {
+            state.restore(&restored);
+        }
+
+        // 记录本会话的 cwd，供 `--continue` 按目录匹配；失败不阻塞启动
+        if let Err(e) =
+            crate::node::session_index::write_meta(&sessions_root, &session_id, &self.kernel_config.working_dir)
+        {
+            tracing::warn!(target: "ccore::session", error = %e, "写入会话元数据失败");
+        }
+        // 回收旧会话：此前无任何清理路径，重度使用会积起数千个 uuid 目录
+        crate::node::session_index::gc(&sessions_root, crate::node::session_index::DEFAULT_GC_KEEP);
 
         // 3. Tool Node
         let tool_ctx = self.node_context();
@@ -167,9 +247,14 @@ impl NodeLauncher {
         };
         let mut thinker = ThinkerNode::new(thinker_id.clone(), thinker_config);
 
-        // 加载项目上下文（CCODE.md / CLAUDE.md），注入到工作记忆
+        // 加载项目上下文（CCODE.md / CLAUDE.md / AGENTS.md），注入到工作记忆
         let project_dir = std::path::PathBuf::from(&self.kernel_config.working_dir);
         thinker.load_project_context(&project_dir);
+
+        // 回灌恢复的会话历史（在项目规范之后，保证规范仍在最前）
+        if !restored.is_empty() {
+            thinker.restore_working_memory(&restored);
+        }
 
         // 连接情景记忆桥接（ThinkerNode ↔ EpisodicMemoryStore，与 Kernel 共享同一实例）
         thinker.set_memory_bridge(Box::new(EpisodicMemoryBridge::new(self.episodic_memory.clone())));

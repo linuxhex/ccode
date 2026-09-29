@@ -153,6 +153,8 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         pending_skill_reminders: Mutex::new(Vec::new()),
         pending_compile_feedback: Mutex::new(None),
         current_turn_has_write_edit: std::sync::atomic::AtomicBool::new(false),
+        current_turn_edited_files: Mutex::new(Vec::new()),
+        speculative_tool_results: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
         idle_flush_timeout: None,
         dream_check_timeout: None,
         last_idle_flush_conversation_len: std::sync::atomic::AtomicUsize::new(0),
@@ -252,6 +254,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         workspace_ops: ccode_workspace::WorkspaceOps::for_test(),
         trace_config_template: std::cell::RefCell::new(None),
         ccore_state: std::sync::Arc::new(crate::session::ccore_integration::CcoreSessionState::new("test-session", "test-model")),
+        config_cache: std::cell::RefCell::new(None),
     };
     ReplaySendUpdateFixture {
         actor,

@@ -1697,7 +1697,7 @@ impl SessionSignalsActor {
                             Some(combined_digest.estimate_quantile(0.99) as u64);
 
                         // Also update max and mean with buffered data
-                        let turn_max = *self.turn_itl_intervals.iter().max().unwrap();
+                        let turn_max = *self.turn_itl_intervals.iter().max().expect("turn_itl_intervals should not be empty");
                         self.signals.itl_max_ms = Some(
                             self.signals
                                 .itl_max_ms

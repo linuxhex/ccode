@@ -214,7 +214,7 @@ impl RepoMap {
         queue.push_back((from.to_path_buf(), vec![from.to_path_buf()]));
 
         while let Some((current, path)) = queue.pop_front() {
-            if &current == to {
+            if current == to {
                 return Some(path);
             }
             if visited.contains(&current) {
@@ -494,8 +494,8 @@ impl ImportParser {
                         is_relative: trimmed[5..6].starts_with('.'),
                     });
                 }
-            } else if trimmed.starts_with("import ") {
-                let module = trimmed[7..].trim().trim_end_matches(';').to_string();
+            } else if let Some(rest) = trimmed.strip_prefix("import ") {
+                let module = rest.trim().trim_end_matches(';').to_string();
                 imports.push(ImportInfo {
                     module_path: module,
                     symbols: None,

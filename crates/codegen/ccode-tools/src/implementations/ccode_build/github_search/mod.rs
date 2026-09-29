@@ -79,9 +79,6 @@ struct GitHubApiItem {
     repository: GitHubApiRepo,
     /// 文件路径
     path: String,
-    /// 匹配的代码片段
-    #[serde(default)]
-    text_matches: Vec<GitHubApiTextMatch>,
     /// 文件的 HTML URL
     html_url: String,
 }
@@ -104,13 +101,6 @@ struct GitHubApiRepo {
 struct GitHubApiLicense {
     /// license 标识符（如 "mit", "apache-2.0"）
     spdx_id: Option<String>,
-}
-
-/// GitHub API 文本匹配片段
-#[derive(Debug, Clone, Deserialize)]
-struct GitHubApiTextMatch {
-    /// 匹配的代码片段
-    fragment: Option<String>,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -255,17 +245,10 @@ async fn search_via_github_api(
         .items
         .into_iter()
         .map(|item| {
-            // 提取代码片段：优先使用 text_matches，否则使用空字符串
-            let snippet = item
-                .text_matches
-                .first()
-                .and_then(|m| m.fragment.clone())
-                .unwrap_or_default();
-
             CodeResult {
                 repository: item.repository.full_name,
-                file_path: item.path,
-                snippet,
+                file_path: item.path.clone(),
+                snippet: format!("文件: {}", item.path),
                 stars: item.repository.stargazers_count,
                 license: item.repository.license.and_then(|l| l.spdx_id),
                 updated_at: item.repository.updated_at,
@@ -411,14 +394,13 @@ fn build_recommendation(items: &[CodeResult]) -> String {
     let mut reasons = Vec::new();
 
     // 按 stars 分析最高星标项目
-    if let Some(top) = items.iter().max_by_key(|i| i.stars.unwrap_or(0)) {
-        if let Some(stars) = top.stars {
+    if let Some(top) = items.iter().max_by_key(|i| i.stars.unwrap_or(0))
+        && let Some(stars) = top.stars {
             reasons.push(format!(
                 "最高星标项目 {repo}（{stars} ⭐）",
                 repo = top.repository,
             ));
         }
-    }
 
     // 检查是否有知名 license 的项目
     let with_license: Vec<&CodeResult> = items
@@ -444,7 +426,9 @@ fn build_recommendation(items: &[CodeResult]) -> String {
         ));
     }
 
-    let summary = if reasons.is_empty() {
+    
+
+    if reasons.is_empty() {
         format!("找到 {count} 个代码结果，建议查看详细代码片段以判断适用性。", count = items.len())
     } else {
         format!(
@@ -452,9 +436,7 @@ fn build_recommendation(items: &[CodeResult]) -> String {
             count = items.len(),
             reasons = reasons.join("，")
         )
-    };
-
-    summary
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

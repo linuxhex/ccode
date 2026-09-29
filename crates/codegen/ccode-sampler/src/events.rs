@@ -56,6 +56,19 @@ pub enum SamplingEvent {
         arguments_delta: Option<String>,
     },
 
+    /// A tool call's arguments have been fully streamed and the call is
+    /// ready for speculative dispatch. Fires at `ContentBlockStop` (or the
+    /// backend-equivalent completion signal) before the overall `Completed`
+    /// event. The shell may begin executing this tool call immediately
+    /// while the model continues generating further content.
+    ToolCallReady {
+        request_id: RequestId,
+        tool_index: u32,
+        id: String,
+        name: String,
+        arguments: String,
+    },
+
     /// Streaming completed successfully.
     Completed {
         request_id: RequestId,

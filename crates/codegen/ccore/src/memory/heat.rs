@@ -44,6 +44,8 @@ pub struct HeatInput {
     pub is_tool_result: bool,
     /// 工具结果权重系数（文件内容高，bash 输出中，纯对话低）
     pub tool_importance: f64,
+    /// 是否为用户纠正消息（纠正始终保热，防止 Agent 重复犯错）
+    pub is_correction: bool,
 }
 
 /// 计算冷热评分
@@ -64,10 +66,14 @@ pub fn compute_heat(input: &HeatInput, weights: &HeatWeights) -> f64 {
         0.3 // 纯对话的基础权重
     };
 
+    // 纠正加分：用户纠正过的内容始终保热，防止 Agent 重复犯错
+    let correction_bonus = if input.is_correction { 0.3 } else { 0.0 };
+
     weights.recency * recency_score
         + weights.relevance * relevance_score
         + weights.activity * activity_score
         + weights.tool_weight * tool_score
+        + correction_bonus
 }
 
 /// 冷热阈值

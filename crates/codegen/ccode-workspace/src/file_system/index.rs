@@ -627,42 +627,73 @@ impl FileIndex {
 
         let mut index = FileIndex::new();
 
-        for entry in builder.build() {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let path = entry.path();
-
-            // Skip the root itself
-            if path == root_canonical {
-                continue;
+        if options.parallel {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let root_for_closure = root_canonical.clone();
+            builder.build_parallel().run(|| {
+                let tx = tx.clone();
+                let root = root_for_closure.clone();
+                Box::new(move |entry| {
+                    let Ok(entry) = entry else {
+                        return ignore::WalkState::Continue;
+                    };
+                    let path = entry.path();
+                    if path == root {
+                        return ignore::WalkState::Continue;
+                    }
+                    let Some(ft) = entry.file_type() else {
+                        return ignore::WalkState::Continue;
+                    };
+                    if !ft.is_file() && !ft.is_dir() {
+                        return ignore::WalkState::Continue;
+                    }
+                    let Ok(rel) = path.strip_prefix(&root) else {
+                        return ignore::WalkState::Continue;
+                    };
+                    if rel.as_os_str().is_empty() {
+                        return ignore::WalkState::Continue;
+                    }
+                    let _ = tx.send((rel.to_path_buf(), ft.is_dir()));
+                    ignore::WalkState::Continue
+                })
+            });
+            drop(tx);
+            for (rel_path, is_dir) in rx {
+                index.insert(rel_path, is_dir);
             }
+        } else {
+            for entry in builder.build() {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
 
-            // Get file type
-            let file_type = match entry.file_type() {
-                Some(ft) => ft,
-                None => continue,
-            };
+                let path = entry.path();
 
-            // Only index files and directories
-            if !file_type.is_file() && !file_type.is_dir() {
-                continue;
+                if path == root_canonical {
+                    continue;
+                }
+
+                let file_type = match entry.file_type() {
+                    Some(ft) => ft,
+                    None => continue,
+                };
+
+                if !file_type.is_file() && !file_type.is_dir() {
+                    continue;
+                }
+
+                let rel_path = match path.strip_prefix(&root_canonical) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                if rel_path.as_os_str().is_empty() {
+                    continue;
+                }
+
+                index.insert(rel_path, file_type.is_dir());
             }
-
-            // Get relative path
-            let rel_path = match path.strip_prefix(&root_canonical) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Skip empty paths
-            if rel_path.as_os_str().is_empty() {
-                continue;
-            }
-
-            index.insert(rel_path, file_type.is_dir());
         }
 
         Ok(index)
