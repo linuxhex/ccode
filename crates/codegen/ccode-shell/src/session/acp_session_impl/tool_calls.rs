@@ -359,8 +359,8 @@ impl SessionActor {
                 } else {
                     None
                 };
-            if let Some(ref path) = read_cache_path {
-                if let Some(cached) = file_cache.get(path) {
+            if let Some(ref path) = read_cache_path
+                && let Some(cached) = file_cache.get(path) {
                     let is_unchanged = tokio::fs::metadata(path).await
                         .ok()
                         .and_then(|m| m.modified().ok())
@@ -388,7 +388,6 @@ impl SessionActor {
                         file_cache.remove(path);
                     }
                 }
-            }
 
             // === toolCallBudget 检查 ===
             if tool_call_budget == 0 {
@@ -571,15 +570,14 @@ impl SessionActor {
                         );
                         // ccore side effects: record_read for file-reading tools
                         // 投机执行跳过了 dispatch_tool，需补 record_read 维持读后写检查
-                        if matches!(prepared.tool_name.as_str(), "read_file" | "read" | "search" | "grep" | "glob" | "list_dir") {
-                            if let Some(path) = prepared.parsed_args.get("file_path")
+                        if matches!(prepared.tool_name.as_str(), "read_file" | "read" | "search" | "grep" | "glob" | "list_dir")
+                            && let Some(path) = prepared.parsed_args.get("file_path")
                                 .or_else(|| prepared.parsed_args.get("path"))
                                 .or_else(|| prepared.parsed_args.get("target_file"))
                                 .and_then(|v| v.as_str())
                             {
                                 ccore_state.record_read(path);
                             }
-                        }
                         // ccore side effects: route_reflex for sensory signals
                         if let Some(reflex_msg) = ccore_state.route_reflex(&prepared.tool_name, &entry.result.prompt_text, true) {
                             tracing::debug!(tool = %prepared.tool_name, "{}", reflex_msg);
@@ -2863,8 +2861,8 @@ impl SessionActor {
                     .map(|k| k.is_read_only())
                     .unwrap_or(false);
 
-                if is_read_only {
-                    if let Some(ref args) = raw_input {
+                if is_read_only
+                    && let Some(ref args) = raw_input {
                         let wops = self.workspace_ops.clone();
                         let cache = self.speculative_tool_results.clone();
                         let call_id = id.clone();
@@ -2916,7 +2914,6 @@ impl SessionActor {
                             }
                         });
                     }
-                }
 
                 let meta = self.stamp_tool_meta(None, name, None);
                 self.send_update(

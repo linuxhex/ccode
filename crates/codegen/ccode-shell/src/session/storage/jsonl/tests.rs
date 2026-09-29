@@ -2095,8 +2095,7 @@ fn fork_filter_consecutive_users_with_tool_calls() {
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "output"),
             ConversationItem::user("follow-up"),
@@ -2122,8 +2121,7 @@ fn fork_filter_preserves_complete_tool_turn() {
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "output"),
         ];
@@ -2145,8 +2143,7 @@ fn fork_filter_strips_incomplete_tool_turn() {
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             // Missing tool result — incomplete
         ];
@@ -2354,8 +2351,7 @@ fn fork_filter_keeps_multi_tool_cycle_turn_with_reasoning() {
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "output"),
             ConversationItem::Reasoning(ccode_sampling_types::synthesized_reasoning_item(
@@ -2400,8 +2396,7 @@ fn fork_filter_keeps_multi_tool_turn_with_reasoning_between_results() {
                     },
                 ],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "out1"),
             ConversationItem::Reasoning(ccode_sampling_types::synthesized_reasoning_item("mid")),

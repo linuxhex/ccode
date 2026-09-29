@@ -59,6 +59,7 @@ impl ThinkerNode {
                     token_count,
                     tool_name,
                     source_range: (idx, idx + 1),
+                    is_correction: false,
                 }
             })
             .collect();

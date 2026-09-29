@@ -987,8 +987,7 @@ mod compacted_history_shape_tests {
                     arguments: r#"{"target_file": "src/auth.rs"}"#.into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "fn login() { /* buggy code */ }"),
             ConversationItem::Assistant(AssistantItem {
@@ -999,8 +998,7 @@ mod compacted_history_shape_tests {
                     arguments: r#"{"file_path": "src/auth.rs", "old_string": "buggy", "new_string": "fixed"}"#.into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc2", "Successfully replaced text."),
         ];
@@ -1164,8 +1162,7 @@ mod compacted_history_shape_tests {
                     arguments: r#"{"target_file": "src/auth.rs"}"#.into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "fn login() { /* ... */ }"),
         ];

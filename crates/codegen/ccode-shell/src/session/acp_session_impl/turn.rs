@@ -2645,13 +2645,12 @@ impl SessionActor {
                 if tc.name == "write" || tc.name == "edit" {
                     self.current_turn_has_write_edit
                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                        if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        && let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
                             self.current_turn_edited_files
                                 .lock()
                                 .push(path.to_string());
                         }
-                    }
                 }
             }
             let step_signature = tool_calls

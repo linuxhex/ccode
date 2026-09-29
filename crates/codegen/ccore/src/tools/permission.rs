@@ -163,7 +163,7 @@ impl SideEffectScope {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_name(s: &str) -> Option<Self> {
         match s {
             "read-in-cwd" => Some(Self::ReadInCwd),
             "read-out-cwd" => Some(Self::ReadOutCwd),
@@ -221,7 +221,7 @@ impl PermissionChecker {
         let mut all_read_only = true;
 
         for scope_str in side_effects {
-            if let Some(scope) = SideEffectScope::from_str(scope_str) {
+            if let Some(scope) = SideEffectScope::parse_name(scope_str) {
                 if !scope.is_read_only() {
                     all_read_only = false;
                 }

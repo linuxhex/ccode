@@ -786,15 +786,9 @@ fn lerp_color(
 ///
 /// Falls back to `("Run", title, true)` for unrecognized tools.
 fn tool_action_prefix(title: &str) -> (&'static str, &str, bool) {
-    // File-path patterns: /foo/bar.rs, ./relative, ~/home
-    let is_path = title.starts_with('/')
-        || title.starts_with("./")
-        || title.starts_with("~/")
-        || title.starts_with("../");
-
     // Read / View tools
     if title.contains("read") || title.contains("view") || title.contains("cat") {
-        let detail = if is_path { title } else { title };
+        let detail = title;
         return ("Reading", detail, false);
     }
     // Edit / Write / Create tools

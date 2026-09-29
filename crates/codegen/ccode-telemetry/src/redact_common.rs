@@ -180,6 +180,7 @@ pub(crate) fn redact_secrets(input: &str) -> Cow<'_, str> {
 }
 
 /// Redact secrets in a JSON value, walking all string fields.
+#[allow(dead_code)]
 pub(crate) fn redact_json_string_values(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
@@ -196,15 +197,14 @@ pub(crate) fn redact_json_string_values(value: &mut serde_json::Value) {
 /// Reduce a URL to `scheme://host[:port]` — its path/query can carry user
 /// content. Unparseable values are returned unchanged.
 pub(crate) fn url_origin(value: &str) -> Cow<'_, str> {
-    if let Ok(url) = url::Url::parse(value) {
-        if let Some(host) = url.host_str() {
+    if let Ok(url) = url::Url::parse(value)
+        && let Some(host) = url.host_str() {
             let origin = match url.port() {
                 Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
                 None => format!("{}://{}", url.scheme(), host),
             };
             return Cow::Owned(origin);
         }
-    }
     Cow::Borrowed(value)
 }
 

@@ -105,17 +105,35 @@ class Provider:
 
         content = "".join(c.content for c in chunks if c.channel == StreamChannel.TEXT)
         reasoning = "".join(c.content for c in chunks if c.channel == StreamChannel.REASONING)
-        tool_calls = None
-        usage = None
         finish_reason = "stop"
+        usage = None
 
+        # Accumulate tool calls from streaming chunks
+        # Chunks arrive as: start {id, name, arguments:""} then deltas {arguments: "partial_json"}
+        tool_calls_map: dict[str, dict[str, Any]] = {}  # keyed by tool call id
         for chunk in chunks:
-            if chunk.tool_calls:
-                tool_calls = chunk.tool_calls
             if chunk.usage:
                 usage = chunk.usage
             if chunk.finish_reason:
                 finish_reason = chunk.finish_reason
+            if not chunk.tool_calls:
+                continue
+            for tc in chunk.tool_calls:
+                tc_id = tc.get("id", "")
+                if tc_id and tc_id not in tool_calls_map:
+                    # New tool call start
+                    tool_calls_map[tc_id] = {
+                        "id": tc_id,
+                        "name": tc.get("name", ""),
+                        "arguments": "",
+                    }
+                # Append partial arguments (delta chunks may not have id/name)
+                if tc.get("arguments"):
+                    target_id = tc_id or (list(tool_calls_map.keys())[-1] if tool_calls_map else None)
+                    if target_id and target_id in tool_calls_map:
+                        tool_calls_map[target_id]["arguments"] += tc["arguments"]
+
+        tool_calls = list(tool_calls_map.values()) if tool_calls_map else None
 
         return SampleResponse(
             content=content,

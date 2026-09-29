@@ -2785,8 +2785,7 @@ actual user question";
                     },
                 ],
                 model_id: Some("ccode-3".to_string()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             // [4] Tool result for call_1
             ConversationItem::tool_result(
@@ -2824,8 +2823,7 @@ actual user question";
                     },
                 ],
                 model_id: Some("ccode-3".to_string()),
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             // [9] Tool result for call_3
             ConversationItem::tool_result("call_3", "File edited successfully."),
@@ -3160,8 +3158,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 content: "response".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ]);
         assert_eq!(result.len(), 3);
@@ -3184,8 +3181,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 content: "response".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ]);
         assert_eq!(result.len(), 1, "reasoning sibling must be dropped");
@@ -3234,8 +3230,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "match found"),
         ]);
@@ -3277,8 +3272,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 content: "plain text response".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ]);
         assert_eq!(result.len(), 1);
@@ -3313,8 +3307,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "match"),
             ConversationItem::user("second turn"),
@@ -3323,8 +3316,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 content: "thinking only".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc2", "stray"),
             ConversationItem::user("third turn"),
@@ -3332,8 +3324,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                 content: "plain reply".into(),
                 tool_calls: vec![],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
         ]);
         assert_eq!(result.len(), 6);
@@ -3401,8 +3392,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
                     arguments: "{}".into(),
                 }],
                 model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
+                ..Default::default()
             }),
             ConversationItem::tool_result("tc1", "files"),
         ];

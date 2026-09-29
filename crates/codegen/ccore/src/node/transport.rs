@@ -331,7 +331,7 @@ impl NodeTransportHandle {
         let frames = FrameCodec::encode(msg)?;
 
         // 从内存池获取缓冲区（优先复用池中已有缓冲区，减少工作缓冲区分配）
-        let mut guard = BufferGuard::new(&*self.message_pool);
+        let mut guard = BufferGuard::new(&self.message_pool);
         let buf = guard.inner_mut();
 
         // 将所有帧连续写入池化缓冲区，记录每帧偏移量

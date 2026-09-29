@@ -33,6 +33,8 @@ dev-dependencies = [
     "mypy>=1.0.0",
     "ruff>=0.8.0",
     "maturin>=1.7.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
 ]
 
 [tool.ruff]

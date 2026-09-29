@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CCODE — Login</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .login-card { background: #16213e; border: 1px solid #0f3460; border-radius: 12px; padding: 32px; width: 100%; max-width: 420px; }
+  .login-card h1 { font-size: 20px; color: #e94560; margin-bottom: 8px; }
+  .login-card .subtitle { font-size: 13px; color: #888; margin-bottom: 24px; }
+  .form-group { margin-bottom: 16px; }
+  .form-group label { display: block; font-size: 13px; color: #aaa; margin-bottom: 6px; }
+  .form-group select, .form-group input {
+    width: 100%; background: #1a1a2e; color: #e0e0e0; border: 1px solid #0f3460;
+    border-radius: 8px; padding: 10px 14px; font-size: 14px; outline: none;
+  }
+  .form-group select:focus, .form-group input:focus { border-color: #e94560; }
+  .form-group .hint { font-size: 11px; color: #666; margin-top: 4px; }
+  .btn { width: 100%; background: #e94560; color: #fff; border: none; border-radius: 8px; padding: 12px; font-size: 14px; cursor: pointer; margin-top: 8px; }
+  .btn:hover { background: #c73e54; }
+  .btn:disabled { background: #555; cursor: not-allowed; }
+  .result { margin-top: 16px; padding: 12px; border-radius: 8px; font-size: 13px; display: none; }
+  .result.ok { display: block; background: #1a3d2e; color: #4ecca3; border: 1px solid #4ecca3; }
+  .result.err { display: block; background: #3d1a1a; color: #ff6b6b; border: 1px solid #e94560; }
+  .back-link { text-align: center; margin-top: 16px; }
+  .back-link a { color: #e94560; text-decoration: none; font-size: 13px; }
+  .back-link a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<div class="login-card">
+  <h1>CCODE Login</h1>
+  <div class="subtitle">Configure your LLM API key to start chatting</div>
+
+  <div class="form-group">
+    <label>Provider</label>
+    <select id="provider">
+      <option value="anthropic">Anthropic (Claude)</option>
+      <option value="openai">OpenAI (GPT)</option>
+      <option value="gemini">Google (Gemini)</option>
+    </select>
+  </div>
+
+  <div class="form-group">
+    <label>API Key</label>
+    <input type="password" id="api-key" placeholder="sk-..." autocomplete="off">
+    <div class="hint" id="key-hint">Anthropic: sk-ant-... | OpenAI: sk-... | Gemini: AIza...</div>
+  </div>
+
+  <button class="btn" id="submit-btn" onclick="doLogin()">Login</button>
+
+  <div class="result" id="result"></div>
+
+  <div class="back-link">
+    <a href="/">← Back to chat</a>
+  </div>
+</div>
+
+<script>
+const providerSelect = document.getElementById('provider');
+const keyHint = document.getElementById('key-hint');
+const resultEl = document.getElementById('result');
+const submitBtn = document.getElementById('submit-btn');
+
+const hints = {
+  anthropic: 'Anthropic: sk-ant-...',
+  openai: 'OpenAI: sk-...',
+  gemini: 'Gemini: AIza...',
+};
+providerSelect.addEventListener('change', () => {
+  keyHint.textContent = hints[providerSelect.value] || '';
+});
+
+async function doLogin() {
+  const provider = providerSelect.value;
+  const api_key = document.getElementById('api-key').value.trim();
+  if (!api_key) {
+    resultEl.className = 'result err';
+    resultEl.textContent = 'Please enter an API key';
+    return;
+  }
+
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Connecting...';
+  resultEl.className = 'result';
+
+  try {
+    const resp = await fetch('/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider, api_key }),
+    });
+    const data = await resp.json();
+    if (data.success) {
+      resultEl.className = 'result ok';
+      resultEl.textContent = `✓ ${provider} configured successfully. You can now chat!`;
+      submitBtn.textContent = 'Logged in';
+    } else {
+      resultEl.className = 'result err';
+      resultEl.textContent = `✗ ${data.error}`;
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Login';
+    }
+  } catch (err) {
+    resultEl.className = 'result err';
+    resultEl.textContent = `✗ Network error: ${err.message}`;
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Login';
+  }
+}
+
+document.getElementById('api-key').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') doLogin();
+});
+</script>
+</body>
+</html>

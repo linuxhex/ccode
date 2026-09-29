@@ -285,13 +285,11 @@ fn apply_word_highlights(
                 result.push(Span {
                     content: span.content[cursor..local_start].to_string().into(),
                     style: span.style,
-                    ..Default::default()
                 });
             }
             result.push(Span {
                 content: span.content[local_start..local_end].to_string().into(),
                 style: span.style.bg(highlight_bg),
-                ..Default::default()
             });
             cursor = local_end;
         }
@@ -299,7 +297,6 @@ fn apply_word_highlights(
             result.push(Span {
                 content: span.content[cursor..].to_string().into(),
                 style: span.style,
-                ..Default::default()
             });
         }
     }
@@ -647,21 +644,19 @@ pub fn render_diff_hunks_side_by_side(
             match line.tag {
                 ChangeTag::Equal => {
                     let text = expand_tabs(line.text.trim_end_matches('\n'));
-                    let style = side_highlight(&mut new_hl, &text, &syntect);
+                    let style = side_highlight(&mut new_hl, &text, syntect);
                     let left_gutter = format!("{:>w$} ", line.lo, w = gutter_w as usize - 1);
                     let right_gutter = format!("{:>w$} ", line.ln, w = gutter_w as usize - 1);
                     let left_content = truncate_or_pad(&text, content_w as usize);
                     let right_content = truncate_or_pad(&text, content_w as usize);
 
-                    let mut spans_out = Vec::new();
-                    spans_out.push(Span::styled(left_gutter, Style::default().fg(theme.gray_dim)));
-                    spans_out.push(Span::styled(left_content, style));
-                    spans_out.push(Span::styled(
-                        divider.to_string(),
-                        Style::default().fg(theme.gray_dim),
-                    ));
-                    spans_out.push(Span::styled(right_gutter, Style::default().fg(theme.gray_dim)));
-                    spans_out.push(Span::styled(right_content, style));
+                    let spans_out = vec![
+                        Span::styled(left_gutter, Style::default().fg(theme.gray_dim)),
+                        Span::styled(left_content, style),
+                        Span::styled(divider.to_string(), Style::default().fg(theme.gray_dim)),
+                        Span::styled(right_gutter, Style::default().fg(theme.gray_dim)),
+                        Span::styled(right_content, style),
+                    ];
 
                     lines.push(DiffLineOutput {
                         line: Line::from(spans_out),
@@ -732,21 +727,22 @@ pub fn render_diff_hunks_side_by_side(
                             .fg(theme.diff_insert_fg)
                             .bg(theme.diff_insert_bg);
 
-                        let mut spans_out = Vec::new();
-                        spans_out.push(Span::styled(
-                            del_gutter,
-                            Style::default().fg(theme.gray_dim).bg(theme.diff_delete_bg),
-                        ));
-                        spans_out.push(Span::styled(left_content, del_style));
-                        spans_out.push(Span::styled(
-                            divider.to_string(),
-                            Style::default().fg(theme.gray_dim),
-                        ));
-                        spans_out.push(Span::styled(
-                            ins_gutter,
-                            Style::default().fg(theme.gray_dim).bg(theme.diff_insert_bg),
-                        ));
-                        spans_out.push(Span::styled(right_content, ins_style));
+                        let spans_out = vec![
+                            Span::styled(
+                                del_gutter,
+                                Style::default().fg(theme.gray_dim).bg(theme.diff_delete_bg),
+                            ),
+                            Span::styled(left_content, del_style),
+                            Span::styled(
+                                divider.to_string(),
+                                Style::default().fg(theme.gray_dim),
+                            ),
+                            Span::styled(
+                                ins_gutter,
+                                Style::default().fg(theme.gray_dim).bg(theme.diff_insert_bg),
+                            ),
+                            Span::styled(right_content, ins_style),
+                        ];
 
                         let bg = del_bg.or(ins_bg);
                         let content_text = if del.is_some() {
@@ -766,19 +762,17 @@ pub fn render_diff_hunks_side_by_side(
                         });
 
                         // Advance the old-side highlighter for the delete.
-                        if del.is_some() {
-                            if let Some(hl) = old_hl.as_mut() {
+                        if del.is_some()
+                            && let Some(hl) = old_hl.as_mut() {
                                 let owned = format!("{}\n", del_text.trim_end());
                                 let _ = hl.highlight_line(&owned, &syntect.syntax_set);
                             }
-                        }
                         // Advance the new-side highlighter for the insert.
-                        if ins.is_some() {
-                            if let Some(hl) = new_hl.as_mut() {
+                        if ins.is_some()
+                            && let Some(hl) = new_hl.as_mut() {
                                 let owned = format!("{}\n", ins_text.trim_end());
                                 let _ = hl.highlight_line(&owned, &syntect.syntax_set);
                             }
-                        }
                     }
                     i = j;
                 }
@@ -792,21 +786,22 @@ pub fn render_diff_hunks_side_by_side(
                         .fg(theme.diff_insert_fg)
                         .bg(theme.diff_insert_bg);
 
-                    let mut spans_out = Vec::new();
-                    spans_out.push(Span::styled(
-                        " ".repeat(gutter_w as usize),
-                        Style::default().bg(theme.bg_base),
-                    ));
-                    spans_out.push(Span::styled(left_empty, Style::default()));
-                    spans_out.push(Span::styled(
-                        divider.to_string(),
-                        Style::default().fg(theme.gray_dim),
-                    ));
-                    spans_out.push(Span::styled(
-                        gutter,
-                        Style::default().fg(theme.gray_dim).bg(theme.diff_insert_bg),
-                    ));
-                    spans_out.push(Span::styled(right_content, ins_style));
+                    let spans_out = vec![
+                        Span::styled(
+                            " ".repeat(gutter_w as usize),
+                            Style::default().bg(theme.bg_base),
+                        ),
+                        Span::styled(left_empty, Style::default()),
+                        Span::styled(
+                            divider.to_string(),
+                            Style::default().fg(theme.gray_dim),
+                        ),
+                        Span::styled(
+                            gutter,
+                            Style::default().fg(theme.gray_dim).bg(theme.diff_insert_bg),
+                        ),
+                        Span::styled(right_content, ins_style),
+                    ];
 
                     lines.push(DiffLineOutput {
                         line: Line::from(spans_out),

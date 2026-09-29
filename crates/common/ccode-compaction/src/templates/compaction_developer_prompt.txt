@@ -34,6 +34,11 @@ Before providing your final summary, wrap your analysis in <analysis> tags to or
      - render components used (if any)
    - Errors encountered (tool failures, code exec errors, search limitations, reasoning issues) and how they were diagnosed/fixed
    - Pay special attention to specific user feedback, especially if the user told you to do something differently, corrected facts, or changed direction.
+   - CORRECTION PRESERVATION (HARD CONSTRAINT): When the user corrects the assistant:
+     a) Preserve the correction pair verbatim — both the original error context and the user's correction.
+     b) Prefix any retracted assistant statements with [RETRACTED] so future turns do not treat them as valid.
+     c) Never summarize retracted content as if it were correct knowledge.
+     d) Explicitly note what was wrong and what the correct information is.
 2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.
 
 Your summary should include the following sections:

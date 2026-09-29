@@ -8,6 +8,7 @@ from ccode.reasoning.sampler.provider import (
     StreamChunk,
     StreamChannel,
     ThinkingConfig,
+    ToolDefinition,
 )
 from ccode.reasoning.sampler.router import ProviderRouter
 from ccode.reasoning.sampler.openai import OpenAIProvider
@@ -22,6 +23,7 @@ __all__ = [
     "StreamChunk",
     "StreamChannel",
     "ThinkingConfig",
+    "ToolDefinition",
     "ProviderRouter",
     "OpenAIProvider",
     "ClaudeProvider",

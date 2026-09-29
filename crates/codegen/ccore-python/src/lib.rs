@@ -1,5 +1,7 @@
 //! Python bindings for ccore via PyO3
 
+#![allow(clippy::useless_conversion)]
+
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyAny};
 use std::collections::HashMap;
@@ -22,8 +24,7 @@ fn execute_tool(py: Python<'_>, tool_id: &str, params: &Bound<'_, PyDict>) -> Py
         rust_params.insert(key_str, value_json);
     }
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let rt = tokio::runtime::Runtime::new()?;
 
     let result = rt.block_on(async {
         execute_tool_async(tool_id, rust_params).await
@@ -42,38 +43,33 @@ fn execute_tool(py: Python<'_>, tool_id: &str, params: &Bound<'_, PyDict>) -> Py
 /// 读取文件
 #[pyfunction]
 fn read_file(path: &str) -> PyResult<String> {
-    std::fs::read_to_string(path)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    Ok(std::fs::read_to_string(path)?)
 }
 
 /// 写入文件
 #[pyfunction]
 fn write_file(path: &str, content: &str) -> PyResult<()> {
-    std::fs::write(path, content)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    Ok(std::fs::write(path, content)?)
 }
 
 /// 列出目录
 #[pyfunction]
 fn list_dir(py: Python<'_>, path: &str) -> PyResult<PyObject> {
-    let entries = std::fs::read_dir(path)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let entries = std::fs::read_dir(path)?;
 
     let result = PyDict::new_bound(py);
     let mut entry_list = Vec::new();
 
-    for entry in entries {
-        if let Ok(entry) = entry {
-            let entry_dict = PyDict::new_bound(py);
-            let name = entry.file_name().to_string_lossy().to_string();
-            let metadata = entry.metadata().ok();
+    for entry in entries.flatten() {
+        let entry_dict = PyDict::new_bound(py);
+        let name = entry.file_name().to_string_lossy().to_string();
+        let metadata = entry.metadata().ok();
 
-            entry_dict.set_item("name", name).ok();
-            entry_dict.set_item("is_dir", metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false)).ok();
-            entry_dict.set_item("size", metadata.as_ref().map(|m| m.len()).unwrap_or(0)).ok();
+        entry_dict.set_item("name", name).ok();
+        entry_dict.set_item("is_dir", metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false)).ok();
+        entry_dict.set_item("size", metadata.as_ref().map(|m| m.len()).unwrap_or(0)).ok();
 
-            entry_list.push(entry_dict);
-        }
+        entry_list.push(entry_dict);
     }
 
     result.set_item("entries", entry_list)?;

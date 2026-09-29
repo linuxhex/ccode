@@ -111,7 +111,7 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
 /// 返回顺序为 **root → cwd**（越靠后越具体）。
 pub fn discover_project_docs(start_dir: &Path) -> Vec<ProjectDoc> {
     // 尽量用规范化路径：向上遍历依赖 parent()，`./sub` 这类相对路径会提前断链
-    let start = std::fs::canonicalize(start_dir).unwrap_or_else(|_| start_dir.to_path_buf());
+    let start = dunce::canonicalize(start_dir).unwrap_or_else(|_| start_dir.to_path_buf());
 
     // 构造 root → cwd 的目录链
     let chain: Vec<PathBuf> = match find_project_root(&start) {

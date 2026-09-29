@@ -86,21 +86,19 @@ impl ToolStabilityTracker {
 
         if is_stable {
             self.stable_count += 1;
-        } else {
-            if self.last_hash.is_some() {
-                self.change_count += 1;
-                let reason = if count != self.last_tool_count {
-                    format!("tool count changed ({} → {})", self.last_tool_count, count)
-                } else {
-                    "schema content changed (same count)".to_string()
-                };
-                tracing::debug!(
-                    hash = %hash,
-                    prev_hash = ?self.last_hash,
-                    reason = %reason,
-                    "tool schema changed — prompt cache will miss"
-                );
-            }
+        } else if self.last_hash.is_some() {
+            self.change_count += 1;
+            let reason = if count != self.last_tool_count {
+                format!("tool count changed ({} → {})", self.last_tool_count, count)
+            } else {
+                "schema content changed (same count)".to_string()
+            };
+            tracing::debug!(
+                hash = %hash,
+                prev_hash = ?self.last_hash,
+                reason = %reason,
+                "tool schema changed — prompt cache will miss"
+            );
         }
 
         self.last_hash = Some(hash);

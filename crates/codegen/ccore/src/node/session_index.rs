@@ -259,7 +259,7 @@ pub fn resolve(root: &Path, target: &ResumeTarget, cwd: &str) -> anyhow::Result<
 }
 
 fn canonical_string(p: &str) -> String {
-    std::fs::canonicalize(p)
+    dunce::canonicalize(p)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| p.to_string())
 }

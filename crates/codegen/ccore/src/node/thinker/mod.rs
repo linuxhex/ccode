@@ -515,7 +515,7 @@ impl ThinkerNode {
             if task.is_empty() {
                 return Some(0.5); // 默认中等力度
             }
-            let difficulty = self.meta_cognitive.assess_difficulty(&task, &std::collections::HashMap::new());
+            let difficulty = self.meta_cognitive.assess_difficulty(task, &std::collections::HashMap::new());
             difficulty.to_reasoning_effort()
         });
 
@@ -2076,7 +2076,7 @@ impl Node for ThinkerNode {
                             .filter(|w| w.starts_with('/') && w.contains('.') && w.len() < 200)
                             .take(10)
                             .collect();
-                        let state_dir = format!(".ccode/state");
+                        let state_dir = ".ccode/state".to_string();
                         let _ = std::fs::create_dir_all(&state_dir);
                         let full_path = format!("{}/subagent-{}.md", state_dir, subagent_id);
                         let _ = std::fs::write(&full_path, output);

@@ -135,14 +135,13 @@ impl ReadTracker {
         })?;
 
         // 如果有戳记信息，检查文件是否被外部修改
-        if stamp.mtime.is_some() || stamp.len > 0 {
-            if !stamp.matches_current(path) {
+        if (stamp.mtime.is_some() || stamp.len > 0)
+            && !stamp.matches_current(path) {
                 return Err(anyhow::anyhow!(
                     "文件 {} 在读取后被外部修改。\n请重新读取文件以获取最新内容。",
                     path.display()
                 ));
             }
-        }
 
         Ok(())
     }

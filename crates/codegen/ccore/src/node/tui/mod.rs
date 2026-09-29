@@ -262,10 +262,9 @@ pub async fn run_tui_node(
                                         Topic::sys_shutdown(),
                                         node_id.as_str(),
                                         &serde_json::json!({}),
-                                    ).and_then(|msg| {
+                                    ).map(|msg| {
                                         let h = handle.clone();
                                         tokio::spawn(async move { h.send_message(&msg).await });
-                                        Ok(())
                                     });
                                     break;
                                 }
@@ -615,6 +614,7 @@ impl TUINode {
 
 // ── 对话区渲染 ──
 
+#[allow(clippy::too_many_arguments)]
 fn render_conversation(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -889,6 +889,7 @@ fn truncate_str(s: &str, max: usize) -> String {
 
 // ── 状态栏 ──
 
+#[allow(clippy::too_many_arguments)]
 fn render_status_bar(
     f: &mut ratatui::Frame,
     area: Rect,

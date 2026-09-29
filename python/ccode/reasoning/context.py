@@ -15,9 +15,22 @@ class ContextManager:
         """Add a user message to the context."""
         self.messages.append({"role": "user", "content": content})
 
-    def add_assistant_message(self, content: str) -> None:
+    def add_assistant_message(self, content: str, tool_calls: Any = None) -> None:
         """Add an assistant message to the context."""
-        self.messages.append({"role": "assistant", "content": content})
+        msg: dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            msg["tool_calls"] = [
+                {
+                    "id": tc.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": tc.get("name", ""),
+                        "arguments": tc.get("arguments", "{}"),
+                    },
+                }
+                for tc in tool_calls
+            ]
+        self.messages.append(msg)
 
     def add_tool_result(self, tool_id: str, result: Any) -> None:
         """Add a tool result to the context."""
@@ -30,6 +43,10 @@ class ContextManager:
     def get_messages(self) -> list[dict[str, Any]]:
         """Get the current message list for API calls."""
         return self.messages.copy()
+
+    def set_messages(self, messages: list[dict[str, Any]]) -> None:
+        """Replace the message list (used after compaction)."""
+        self.messages = messages
 
     def clear(self) -> None:
         """Clear the conversation history."""

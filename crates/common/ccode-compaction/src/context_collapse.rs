@@ -206,8 +206,11 @@ pub fn compaction_quality_score(original: &str, summary: &str) -> f64 {
 /// 摘要 prompt 模板：指示 LLM 保留决策/纠正/约束、丢弃闲聊/试错。
 pub const COLLAPSE_PROMPT: &str = "\
 Summarize the following earlier conversation turns for context continuity.
-PRESERVE: key decisions, error corrections, constraints, ruled-out approaches, project facts.
+PRESERVE (in priority order):
+1. User corrections and retracted content — mark retracted assistant statements with [RETRACTED] prefix.
+2. Key decisions, constraints, ruled-out approaches, project facts.
 DROP: chitchat, trial-and-error, repeated content, raw tool output.
+Never summarize retracted content as valid knowledge.
 Be concise and factual. Output only the summary.";
 
 /// 增量摘要 prompt 模板 — 基于前次摘要 + 新增轮次生成更新摘要
@@ -219,9 +222,11 @@ all still-relevant information from the previous summary.
 RULES:
 - If the previous summary is marked with <conversation_summary> tags, treat it as \
   authoritative for early history and carry its still-relevant information forward.
-- PRESERVE: key decisions, error corrections, constraints, ruled-out approaches, \
+- PRESERVE (in priority order): user corrections and retracted content (mark with \
+  [RETRACTED] prefix), key decisions, constraints, ruled-out approaches, \
   file paths, project facts, pending tasks.
 - DROP: information that is no longer relevant after the new turns.
+- Never summarize retracted content as valid knowledge.
 - Be concise and factual. Output only the updated summary.";
 
 /// 增量摘要 — 仅摘要新增轮次 + 前次摘要，而非重新摘要全部对话
@@ -248,7 +253,7 @@ pub async fn incremental_summary<S: CollapseSampler>(
     );
 
     let summary = sampler.summarize(&input, config.max_summary_tokens).await
-        .map_err(|e| CollapseError::Sampler(e))?;
+        .map_err(CollapseError::Sampler)?;
 
     if is_degenerate(&summary) {
         return Err(CollapseError::Degenerate);

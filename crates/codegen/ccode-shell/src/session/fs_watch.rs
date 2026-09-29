@@ -380,7 +380,7 @@ impl ClientNotify {
             FileIndex::from_walk_with_options(&cwd_clone, WalkOptions::default())
         })
         .await
-        .unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
         let build_elapsed_ms = start.elapsed().as_millis() as u64;
         let index = match index_res {
             Ok(idx) => idx,
