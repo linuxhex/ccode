@@ -88,6 +88,15 @@ pub struct EpisodicMemoryStore {
     insertion_order: RwLock<Vec<MemoryId>>,
 }
 
+/// 序列化快照 DTO（RwLock 字段不可直接序列化，索引加载时重建）。
+/// 注意：Rust 不允许在 `impl` 块内定义 struct，因此放在模块作用域。
+#[derive(Serialize, Deserialize)]
+struct EpisodicSnapshot {
+    nodes: Vec<MemoryNode>,
+    insertion_order: Vec<MemoryId>,
+    counter: u64,
+}
+
 impl Default for EpisodicMemoryStore {
     fn default() -> Self {
         Self::new()
@@ -107,6 +116,36 @@ impl EpisodicMemoryStore {
             max_memories: Self::DEFAULT_MAX_MEMORIES,
             insertion_order: RwLock::new(Vec::new()),
         }
+    }
+
+    /// 创建带磁盘恢复的存储：启动时从默认路径加载上一会话的长期记忆。
+    /// 文件不存在（首次运行）或损坏时静默降级为空存储。
+    pub fn new_persistent() -> Self {
+        let store = Self::new();
+        // edition 2021 不支持 let-chains，展开为嵌套 if-let
+        if let Some(path) = Self::default_persist_path() {
+            if path.exists() {
+                match store.load_from_path(&path) {
+                    Ok(n) => {
+                        tracing::info!(
+                            target: "ccore::episodic",
+                            count = n,
+                            "EpisodicMemoryStore 启动恢复：{} 条长期记忆",
+                            n
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "ccore::episodic",
+                            path = %path.display(),
+                            error = %e,
+                            "长期记忆加载失败，使用空存储"
+                        );
+                    }
+                }
+            }
+        }
+        store
     }
 
     /// 创建指定容量的情景记忆存储
@@ -199,6 +238,9 @@ impl EpisodicMemoryStore {
             links = related.len(),
             "memory encoded with bidirectional links"
         );
+
+        // 落盘（L2）：保证跨会话存活
+        self.persist_to_default_path();
 
         id
     }
@@ -386,6 +428,18 @@ impl EpisodicMemoryStore {
                 }
             }
 
+            // 反向关键词匹配：检索 query 命中已存记忆的关键词。
+            // 中文无分词，query 与存储内容的 trigram 相似度在短偏好类记忆上
+            // 常低于阈值；双向命中可显著提升召回（对 encode 期的关联发现
+            // 同样是合法的双向信号）。
+            if node
+                .keywords
+                .iter()
+                .any(|k| !k.is_empty() && content.contains(k.as_str()))
+            {
+                score += 0.3;
+            }
+
             // trigram 相似度
             score += self.trigram_similarity(content, &node.content) * 0.7;
 
@@ -422,6 +476,112 @@ impl EpisodicMemoryStore {
             .filter(|n| n.memory_type == MemoryType::Procedural)
             .count();
         (semantic, episodic, procedural)
+    }
+
+    // ── 跨会话持久化（L2 冷区）───────────────────────────────────────────
+    //
+    // EpisodicMemoryStore 原本只存在于进程内存：每个新进程都从空存储开始，
+    // 上一会话写入的长期记忆全部丢失。这里把节点图落盘为 JSON（关键词/类型
+    // 索引在加载时重建），使记忆跨进程（跨会话）存活。
+
+    /// 默认持久化路径：`$HOME/.ccode/memory/episodic_memory.json`。
+    /// 长期记忆（用户偏好等）是用户级资产，放全局目录而非项目目录。
+    pub fn default_persist_path() -> Option<std::path::PathBuf> {
+        std::env::var("HOME")
+            .ok()
+            .map(|home| {
+                std::path::PathBuf::from(home)
+                    .join(".ccode")
+                    .join("memory")
+                    .join("episodic_memory.json")
+            })
+    }
+
+    /// 把当前全部记忆写入 `path`（全量覆盖写；节点数受 max_memories 约束，
+    /// 通常 ≤1000 条，写入成本低）。
+    pub fn save_to_path(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let snapshot = EpisodicSnapshot {
+            nodes: self
+                .nodes
+                .read()
+                .expect("episodic RwLock poisoned")
+                .values()
+                .cloned()
+                .collect(),
+            insertion_order: self
+                .insertion_order
+                .read()
+                .expect("episodic RwLock poisoned")
+                .clone(),
+            counter: self.counter.load(Ordering::Relaxed),
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// 从 `path` 加载记忆并重建关键词/类型索引。返回加载的记忆条数。
+    /// 文件不存在或损坏时返回 Err / 0，调用方降级为空存储即可。
+    pub fn load_from_path(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        let json = std::fs::read_to_string(path)?;
+        let snapshot: EpisodicSnapshot = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        {
+            let mut nodes = self.nodes.write().expect("episodic RwLock poisoned");
+            nodes.clear();
+            for node in snapshot.nodes {
+                // 重建关键词索引
+                for keyword in &node.keywords {
+                    self.keyword_index
+                        .write()
+                        .expect("episodic RwLock poisoned")
+                        .entry(keyword.clone())
+                        .or_default()
+                        .push(node.id.clone());
+                }
+                // 重建类型索引
+                self.type_index
+                    .write()
+                    .expect("episodic RwLock poisoned")
+                    .entry(node.memory_type.clone())
+                    .or_default()
+                    .push(node.id.clone());
+                nodes.insert(node.id.clone(), node);
+            }
+        }
+        *self
+            .insertion_order
+            .write()
+            .expect("episodic RwLock poisoned") = snapshot.insertion_order;
+        self.counter
+            .store(snapshot.counter, Ordering::Relaxed);
+
+        let loaded = self.nodes.read().expect("episodic RwLock poisoned").len();
+        tracing::info!(
+            target: "ccore::episodic",
+            path = %path.display(),
+            loaded,
+            "长期记忆已从磁盘加载"
+        );
+        Ok(loaded)
+    }
+
+    /// 写入后落盘到默认路径（best-effort：失败只告警，不影响记忆写入主流程）。
+    fn persist_to_default_path(&self) {
+        if let Some(path) = Self::default_persist_path() {
+            if let Err(e) = self.save_to_path(&path) {
+                tracing::warn!(
+                    target: "ccore::episodic",
+                    path = %path.display(),
+                    error = %e,
+                    "长期记忆落盘失败"
+                );
+            }
+        }
     }
 }
 

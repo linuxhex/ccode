@@ -441,13 +441,17 @@ impl PermissionChecker {
             risks.push(ShellRisk::NullByte);
         }
 
-        // 9. 分号命令链接
-        if command.contains(';') && !command.starts_with("echo") {
-            risks.push(ShellRisk::CommandChaining);
-        }
+        // 9. 分号命令链接：`cmd1; cmd2` 是合法的普通用法（`ls x; cat x` 等），
+        // 各片段的危险模式（危险命令、敏感重定向等）已被其余规则对整条命令
+        // 检测覆盖，不再把链本身作为拒绝理由。
 
-        // 10. 后台执行
-        if command.contains('&') && !command.contains("&&") {
+        // 10. 后台执行：仅当 & 是真正的后台操作符时才标记。
+        // `2>&1` / `&>` / `>&` 是重定向写法，不是后台执行，不能误判。
+        let without_redirect = command
+            .replace("2>&1", "")
+            .replace("&>", "")
+            .replace(">&", "");
+        if without_redirect.contains('&') && !command.contains("&&") {
             risks.push(ShellRisk::BackgroundExec);
         }
 
@@ -466,11 +470,17 @@ impl PermissionChecker {
             risks.push(ShellRisk::ProcessSubstitution);
         }
 
-        // 14. 解释器黑名单
-        let first_word = command.split_whitespace().next().unwrap_or("");
+        // 14. 解释器黑名单：仅拦截「解释器 -c 内联代码」这种注入向量。
+        // 运行脚本文件（bash t.sh / python x.py）是正常用法；bash 工具本身就是
+        // shell，拦截 `bash t.sh` 会把合法脚本执行全部拒绝。
+        let mut tokens = command.split_whitespace();
+        let first_word = tokens.next().unwrap_or("");
         let base = first_word.split('/').next_back().unwrap_or(first_word);
+        let second_token = tokens.next().unwrap_or("");
+        let inline_code =
+            second_token == "-c" || second_token.strip_prefix('-').map(|s| s.starts_with('c') && s.len() > 1).unwrap_or(false);
         for interp in INTERPRETER_BLACKLIST {
-            if base == *interp {
+            if base == *interp && inline_code {
                 risks.push(ShellRisk::BlacklistedInterpreter((*interp).to_string()));
                 break;
             }

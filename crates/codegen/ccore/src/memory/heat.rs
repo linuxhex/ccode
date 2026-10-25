@@ -125,6 +125,7 @@ mod tests {
             recall_count: 0,
             is_tool_result: false,
             tool_importance: 0.0,
+            is_correction: false,
         };
         let heat = compute_heat(&input, &HeatWeights::default());
         assert!(heat > 0.5, "最近的消息应该是热的，实际: {}", heat);
@@ -138,6 +139,7 @@ mod tests {
             recall_count: 0,
             is_tool_result: false,
             tool_importance: 0.0,
+            is_correction: false,
         };
         let heat = compute_heat(&input, &HeatWeights::default());
         assert!(heat < 0.3, "很旧的消息应该是冷的，实际: {}", heat);
@@ -152,6 +154,7 @@ mod tests {
             recall_count: 0,
             is_tool_result: false,
             tool_importance: 0.0,
+            is_correction: false,
         };
         let tool = HeatInput {
             is_tool_result: true,

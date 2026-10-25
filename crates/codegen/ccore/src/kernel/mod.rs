@@ -76,7 +76,8 @@ pub struct KernelConfig {
     pub router_addr: String,
     /// PUB socket 绑定地址
     pub pub_addr: String,
-    /// 心跳超时（秒）
+    /// 心跳超时（秒）。注意：LLM 采样（经代理）常见 30~90s 的静默期，
+    /// 超时必须显著大于单次采样耗时，否则节点会在等待模型响应时被误判死亡并重启
     pub heartbeat_timeout_secs: u64,
     /// 最大子 Agent 数量
     pub max_subagents: usize,
@@ -102,7 +103,7 @@ impl Default for KernelConfig {
         Self {
             router_addr: "ipc:///tmp/ccode-router".into(),
             pub_addr: "ipc:///tmp/ccode-pub".into(),
-            heartbeat_timeout_secs: 30,
+            heartbeat_timeout_secs: 300,
             max_subagents: 10,
             health_check_interval_secs: 10,
             working_dir: std::env::current_dir()
@@ -293,7 +294,7 @@ impl Kernel {
             experience_log,
             config_watcher,
             config_event_rx,
-            episodic_memory: Arc::new(EpisodicMemoryStore::new()),
+            episodic_memory: Arc::new(EpisodicMemoryStore::new_persistent()),
             erl: std::sync::OnceLock::new(),
             coordinator: std::sync::OnceLock::new(),
             meta_cognitive: std::sync::OnceLock::new(),
@@ -393,6 +394,19 @@ impl Kernel {
     ///    - 处理 Node spawn 请求
     pub async fn run(&mut self) -> Result<()> {
         self.running = true;
+
+        // 将进程 cwd 切到配置的 working_dir：内置 bash/read/write 等工具的
+        // 相对路径解析依赖进程 cwd，--work-dir 语义要求工具在 work-dir 下执行
+        if !self.config.working_dir.is_empty() {
+            let dir = std::path::PathBuf::from(&self.config.working_dir);
+            if dir.is_dir()
+                && std::env::current_dir().map(|p| p != dir).unwrap_or(true)
+            {
+                if let Err(e) = std::env::set_current_dir(&dir) {
+                    tracing::warn!("切换 working_dir 失败（{}）：{}", dir.display(), e);
+                }
+            }
+        }
 
         tracing::info!(
             "Kernel 启动：router={}, pub={}, working_dir={}",

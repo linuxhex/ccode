@@ -37,7 +37,9 @@ pub struct SampleRequest {
     /// 工具选择策略
     pub tool_choice: Option<ToolChoice>,
     /// Prompt cache key（复用 API 侧 KV cache）
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// 注意：不可加 `skip_serializing_if`——总线用 bincode（按序无字段名），
+    /// 跳过字段会导致两端元素数不一致（invalid length 17 vs 18）。
     pub prompt_cache_key: Option<String>,
     /// 是否为 GoalLoop 子任务验证请求（SamplerNode 识别后走验证闭环，
     /// 流式收集完整响应并解析 JSON，结果发到 cortex/goal_verify_result）
@@ -54,7 +56,6 @@ pub struct SampleRequest {
     pub extra_headers: std::collections::HashMap<String, String>,
     /// 流空闲超时（秒），超过此时间无新 chunk 则返回超时错误。
     /// None 时使用 DEFAULT_IDLE_TIMEOUT_SECS（300s）。
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_timeout_secs: Option<u64>,
 }
 
@@ -108,7 +109,9 @@ pub struct ChatMessage {
     /// API 侧 prompt cache 断点标记（类似 Claude Code cache_edits）
     /// 插入在 system prompt 末尾和最近 N 轮对话之前，
     /// 让 API 复用已计算的前缀 KV cache
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    ///
+    /// 不可 skip——随 SampleRequest 过 bincode 总线，跳过会错位。
+    #[serde(default)]
     pub cache_control: Option<CacheControl>,
 }
 

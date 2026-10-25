@@ -399,29 +399,60 @@ impl Node for StateNode {
         match msg.topic.as_str() {
             "state/persist" => {
                 let payload: serde_json::Value = FrameCodec::decode_payload(&msg)?;
-                let role = payload["role"].as_str().unwrap_or("user");
-                let content = payload["content"].as_str().unwrap_or("");
-                let token_count = payload["token_count"].as_u64().unwrap_or(0) as u32;
-                let is_tool = payload["is_tool_call"].as_bool().unwrap_or(false);
-                self.short_term.store(
-                    role.to_string(),
-                    content.to_string(),
-                    token_count,
-                    is_tool,
-                );
 
-                // JSONL 追加写入
-                let entry = JsonlEntry {
-                    entry_type: if is_tool { "tool_result".into() } else { role.into() },
-                    role: Some(role.into()),
-                    content: Some(content.into()),
-                    tool_call_id: payload["tool_call_id"].as_str().map(|s| s.into()),
-                    tool_name: payload["tool_name"].as_str().map(|s| s.into()),
-                    success: payload["success"].as_bool(),
-                    token_count: Some(token_count),
-                    ts: chrono::Utc::now().to_rfc3339(),
+                // ThinkerNode 在每轮结束后发的是批量格式
+                // `{"entries": [{role, content, tokens}, ...]}`（见 thinker/mod.rs
+                // 的 turn 结束持久化）；旧的逐条格式 `{role, content, ...}` 也保留
+                // 兼容。此前只读单条字段，批量格式的 role/content 全部落到
+                // `unwrap_or` 的默认值上，持久化出来的是一串空 user 行 ——
+                // `-c`/`--resume` 读回的 transcript 因此永远是空的。
+                let batch: Vec<serde_json::Value> = match payload.get("entries").and_then(|v| v.as_array()) {
+                    Some(entries) => entries.clone(),
+                    None => vec![payload.clone()],
                 };
-                self.append_jsonl(entry);
+
+                for item in batch {
+                    let role = item["role"].as_str().unwrap_or("user");
+                    // 批量格式的 role 来自 `format!("{:?}", MessageRole)`，
+                    // 是首字母大写的 "User"/"Assistant"/"System"，统一小写，
+                    // 保证 read_transcript 的角色匹配能认出来。
+                    let role = match role {
+                        "User" | "USER" => "user",
+                        "Assistant" | "ASSISTANT" => "assistant",
+                        "System" | "SYSTEM" => "system",
+                        "Warm" => "system",
+                        other => other,
+                    };
+                    let content = item["content"].as_str().unwrap_or("");
+                    if content.is_empty() {
+                        continue;
+                    }
+                    let token_count = item["tokens"]
+                        .as_u64()
+                        .or_else(|| item["token_count"].as_u64())
+                        .unwrap_or(0) as u32;
+                    let is_tool = item["is_tool_call"].as_bool().unwrap_or(false);
+
+                    self.short_term.store(
+                        role.to_string(),
+                        content.to_string(),
+                        token_count,
+                        is_tool,
+                    );
+
+                    // JSONL 追加写入
+                    let entry = JsonlEntry {
+                        entry_type: if is_tool { "tool_result".into() } else { role.into() },
+                        role: Some(role.into()),
+                        content: Some(content.into()),
+                        tool_call_id: item["tool_call_id"].as_str().map(|s| s.into()),
+                        tool_name: item["tool_name"].as_str().map(|s| s.into()),
+                        success: item["success"].as_bool(),
+                        token_count: Some(token_count),
+                        ts: chrono::Utc::now().to_rfc3339(),
+                    };
+                    self.append_jsonl(entry);
+                }
 
                 // 不在这里写 conversation.json。
                 //

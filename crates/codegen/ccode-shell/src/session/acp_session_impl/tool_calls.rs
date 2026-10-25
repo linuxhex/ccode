@@ -2961,6 +2961,25 @@ impl SessionActor {
                         }
                     }
                 }
+                // A `Completed` arriving after the turn ended (user stop /
+                // stop-gate force stop) is silently discarded — the turn
+                // loop that would commit it is gone. Surface the drop in the
+                // transcript instead of letting output vanish without a trace.
+                if !self
+                    .session_turn_active
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let mut cap = self.streaming_turn_capture.lock();
+                    let dropped_bytes = cap.reasoning_text.len() + cap.response_text.len();
+                    let note = if dropped_bytes > 0 {
+                        format!("已停止，后续约 {dropped_bytes} 字符输出被丢弃")
+                    } else {
+                        "已停止，后续部分输出被丢弃".to_string()
+                    };
+                    cap.clear_current_segment();
+                    drop(cap);
+                    self.send_hook_annotation(&note).await;
+                }
                 self.streaming_turn_capture.lock().clear_current_segment();
                 self.record_api_request_time();
                 self.signals_handle().record_inference_metrics(metrics);

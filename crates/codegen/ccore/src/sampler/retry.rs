@@ -148,6 +148,20 @@ pub fn classify_sampler_error(
 
     // Check error message patterns
     let msg_lower = error_message.to_lowercase();
+    // 认证错误（消息模式兜底：部分 Provider 的错误文案不含可解析的 "HTTP 401" 前缀）
+    // 认证错误绝不可重试——重试只会原地打转，headless 下表现为假死
+    if msg_lower.contains("401") || msg_lower.contains("403")
+        || msg_lower.contains("unauthorized") || msg_lower.contains("forbidden")
+        || msg_lower.contains("invalid api key") || msg_lower.contains("认证失败")
+    {
+        tracing::debug!(
+            target: "ccore::retry",
+            error_class = "AuthError",
+            retryable = false,
+            "error classified (message pattern)"
+        );
+        return RetryDecision::Fatal(format!("认证失败：{}", error_message));
+    }
     if msg_lower.contains("context") && (msg_lower.contains("too long") || msg_lower.contains("overflow")) {
         tracing::debug!(
             target: "ccore::retry",

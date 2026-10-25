@@ -870,7 +870,9 @@ pub async fn run_single_turn(
         cli_subagents: None,
         cli_web_search_model: None,
         cli_session_summary_model: None,
-        cli_experimental_memory: false,
+        // 长期记忆默认开启（去实验性 gate）：记忆应开箱即用，
+        // 无需 --experimental-memory；--no-memory 仍可显式关闭。
+        cli_experimental_memory: true,
         cli_no_memory: false,
         disable_web_search: options.disable_web_search,
         todo_gate: false,

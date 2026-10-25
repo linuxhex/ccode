@@ -3069,7 +3069,9 @@ impl MvpAgent {
             .as_ref()
             .and_then(|m| m.get("ccode.dev/incrementalBashOutput"))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            // Default ON: streamed bash output is the expected TUI behavior;
+            // clients opt out by sending `false` explicitly.
+            .unwrap_or(true);
         let no_color = init
             .client_capabilities
             .meta

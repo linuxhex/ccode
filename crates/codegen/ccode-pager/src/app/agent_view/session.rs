@@ -31,6 +31,7 @@ impl AgentView {
             self.last_seen_event_id = None;
             self.last_applied_event_seq = None;
             self.last_applied_ccode_event_seq = None;
+            self.dedup_dropped_updates = 0;
             self.clear_minimal_btw_lifecycle();
         }
         self.session.session_id = Some(session_id);
@@ -98,6 +99,7 @@ impl AgentView {
             last_seen_event_id: None,
             session_reload: None,
             unexpected_replay_drops: 0,
+            dedup_dropped_updates: 0,
             replayed_terminal_prompts: HashSet::new(),
             active_pane: ActivePane::Prompt,
             prompt_mode: PromptMode::Normal,

@@ -175,6 +175,17 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 .is_some_and(|last| seq <= last)
         })
     {
+        agent.dedup_dropped_updates = agent.dedup_dropped_updates.saturating_add(1);
+        // Same visibility rule as the ACP-stream dedup in `acp_handler::handle`:
+        // one scrollback line on the first drop, then every 10th.
+        if agent.dedup_dropped_updates == 1 || agent.dedup_dropped_updates % 10 == 0 {
+            use crate::scrollback::block::RenderBlock;
+            let message = format!(
+                "已丢弃 {} 条重复更新（去重）",
+                agent.dedup_dropped_updates
+            );
+            agent.scrollback.push_block(RenderBlock::system(message));
+        }
         tracing::debug!(
             session_id = session_notif.session_id.0.as_ref(),
             event_seq = meta.event_seq,

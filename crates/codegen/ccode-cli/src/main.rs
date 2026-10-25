@@ -204,6 +204,11 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     // Kernel 已 shutdown，直接退出进程（避免残留 task 阻止 runtime drop）
+    // 运行期发生过致命错误（如认证失败）时以非零码退出，
+    // 让 headless 调用方（脚本/CI）能感知失败
+    if ccore::has_fatal_error() {
+        std::process::exit(1);
+    }
     std::process::exit(0);
 }
 

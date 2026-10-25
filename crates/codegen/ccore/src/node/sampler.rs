@@ -66,6 +66,7 @@ impl SamplerNode {
         // 第一次尝试：主 Provider
         let model = &request.model;
         let mut failed_provider_name: Option<String> = None;
+        let mut failed_error: Option<String> = None;
         if let Some(provider_name) = self.router.find_provider_name(model) {
             let name = provider_name.clone();
             let provider = self.router.get_provider_mut(&provider_name)
@@ -75,6 +76,7 @@ impl SamplerNode {
                 Err(e) => {
                     tracing::warn!("Provider {} 采样失败：{}, 尝试 fallback", name, e);
                     failed_provider_name = Some(name);
+                    failed_error = Some(format!("{}", e));
                 }
             }
         }
@@ -95,7 +97,13 @@ impl SamplerNode {
             }
         }
 
-        Err(anyhow::anyhow!("未找到模型 {} 的可用 Provider", model))
+        // 无 fallback 可用（或 fallback 也失败）：把首次失败的原始错误上抛，
+        // 不能吞成笼统的「未找到可用 Provider」——认证失败等关键原因会丢失
+        Err(anyhow::anyhow!(
+            "未找到模型 {} 的可用 Provider（最近一次失败：{}）",
+            model,
+            failed_error.unwrap_or_else(|| "无".into())
+        ))
     }
 
     /// 将流式 chunk 通过消息总线逐个发送（优先走数据面 PUB）
@@ -521,7 +529,11 @@ impl SamplerNode {
                             transport.send_message(&err_msg).await?;
                             // 清理取消句柄
                             self.cancel_handles.remove(&request_id);
-                            return Err(e);
+                            // 错误已经通过 stream topic 投递给 Thinker，正常返回。
+                            // 若在这里返回 Err 会导致整个 Sampler Node 退出（消息循环
+                            // 对 handle_message 的错误执行 `?` 直接 break），
+                            // 随后触发心跳超时误判与无意义重启。
+                            return Ok(());
                         }
                     }
                 }

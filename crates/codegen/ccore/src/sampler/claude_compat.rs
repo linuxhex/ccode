@@ -130,6 +130,22 @@ impl ClaudeCompatProvider {
 
     /// 将 SampleRequest 转换为 Anthropic Messages API 请求体
     fn build_request_body(&self, request: &SampleRequest) -> serde_json::Value {
+        // 排障开关：CCODE_DEBUG_SAMPLES=1 时把发送给模型的消息尾部打到日志，
+        // 用于验证「工具输出是否真的进入了下一轮请求」。
+        if std::env::var("CCODE_DEBUG_SAMPLES").as_deref() == Ok("1") {
+            let tail: Vec<String> = request
+                .messages
+                .iter()
+                .rev()
+                .take(3)
+                .map(|m| format!("[{}] {}", m.role, m.content.chars().take(200).collect::<String>()))
+                .collect();
+            let tool_names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+            tracing::info!(
+                target: "ccore::debug_samples",
+                "采样请求消息尾部（倒序3条）：{:?}；tools={:?}", tail, tool_names
+            );
+        }
         // 先剔除 system 条目（Anthropic 的 messages 只接受 user/assistant），
         // 再合并连续同角色（要求严格交替）——顺序不能反：先剔除才能让原本被
         // system 条目隔开的两条同角色消息正确合并。
@@ -567,6 +583,15 @@ impl Provider for ClaudeCompatProvider {
         request: SampleRequest,
         cancel: CancellationHandle,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+        // 空/空白 api_key 快速失败：不发起网络请求，直接返回认证错误。
+        // 否则请求会以空 x-api-key 发出，即使服务端返回 401，
+        // 错误也要经过 thinker 等待链路才能浮出，headless 下表现为假死。
+        if self.config.api_key.trim().is_empty() {
+            return Err(anyhow!(
+                "认证失败（HTTP 401）：Provider {} 的 api_key 为空，请检查配置",
+                self.config.name
+            ));
+        }
         let body = self.build_request_body(&request);
         let request_id = request.request_id.clone();
 
@@ -699,6 +724,12 @@ impl Provider for ClaudeCompatProvider {
     }
 
     async fn sample(&self, request: SampleRequest) -> Result<SampleResponse> {
+        if self.config.api_key.trim().is_empty() {
+            return Err(anyhow!(
+                "认证失败（HTTP 401）：Provider {} 的 api_key 为空，请检查配置",
+                self.config.name
+            ));
+        }
         let mut body = self.build_request_body(&request);
         body["stream"] = serde_json::json!(false);
 

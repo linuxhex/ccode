@@ -231,7 +231,7 @@ pub struct HealthCheckConfig {
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
-            heartbeat_timeout_secs: 30,
+            heartbeat_timeout_secs: 300,
             max_error_rate: 0.1,  // 10%
             max_latency_ms: 5000.0,  // 5 秒
             min_throughput: 1,  // 至少 1 msg/s

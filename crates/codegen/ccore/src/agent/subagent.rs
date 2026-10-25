@@ -99,6 +99,9 @@ pub struct PendingToolCall {
     pub tool_call_id: String,
     pub tool_name: String,
     pub arguments: serde_json::Value,
+    /// 流式累积的原始参数 JSON 片段（与 ThinkerNode 对齐，见 node/agent.rs）
+    #[serde(default)]
+    pub arguments_raw: String,
 }
 
 /// SubAgentNode - 子代理在消息总线上的运行时
@@ -267,28 +270,59 @@ impl SubAgentNode {
             }
             StreamChannel::ToolCall => {
                 self.state = AgentState::ToolCalling;
-                let tool_call = if let Some(tc) = &chunk.tool_call {
-                    PendingToolCall {
-                        tool_call_id: tc.tool_call_id.clone(),
-                        tool_name: tc.tool_name.clone(),
-                        arguments: serde_json::from_str(&tc.arguments)
-                            .unwrap_or(serde_json::Value::Null),
+                // input_json_delta 增量到达：按 tool_call_id 累积 arguments_raw，
+                // 分发时整体解析（同 ThinkerNode，避免部分 JSON 解析失败得到 Null 参数）
+                if let Some(tc) = &chunk.tool_call {
+                    let entry = self
+                        .pending_tool_calls
+                        .entry(tc.tool_call_id.clone())
+                        .or_insert_with(|| PendingToolCall {
+                            tool_call_id: tc.tool_call_id.clone(),
+                            tool_name: tc.tool_name.clone(),
+                            arguments: serde_json::Value::Null,
+                            arguments_raw: String::new(),
+                        });
+                    if !tc.tool_name.is_empty() && entry.tool_name != tc.tool_name {
+                        entry.tool_name = tc.tool_name.clone();
+                    }
+                    entry.arguments_raw.push_str(&tc.arguments);
+                } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&chunk.content) {
+                    let tool_call_id = v["tool_call_id"]
+                        .as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    let entry = self
+                        .pending_tool_calls
+                        .entry(tool_call_id.clone())
+                        .or_insert_with(|| PendingToolCall {
+                            tool_call_id,
+                            tool_name: v["tool_name"]
+                                .as_str()
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            arguments: v["arguments"].clone(),
+                            arguments_raw: String::new(),
+                        });
+                    if let Some(name) = v["tool_name"].as_str() {
+                        if !name.is_empty() && name != "unknown" {
+                            entry.tool_name = name.to_string();
+                        }
+                    }
+                    match v["arguments"].as_str() {
+                        Some(raw) => entry.arguments_raw.push_str(raw),
+                        None => {
+                            if !v["arguments"].is_null() {
+                                entry.arguments = v["arguments"].clone();
+                            }
+                        }
                     }
                 } else {
-                    serde_json::from_str(&chunk.content).unwrap_or_else(|_| PendingToolCall {
-                        tool_call_id: uuid::Uuid::new_v4().to_string(),
-                        tool_name: "unknown".into(),
-                        arguments: serde_json::Value::Null,
-                    })
-                };
+                    tracing::warn!("子代理收到无法解析的 tool_call chunk：content={:?}", chunk.content);
+                    return Ok(());
+                }
 
-                // 记录到 Doom Loop 检测器
-                let args_hash = Self::hash_tool_args(&tool_call.arguments);
-                self.doom_loop_detector
-                    .record(tool_call.tool_name.clone(), args_hash);
-
-                self.pending_tool_calls
-                    .insert(tool_call.tool_call_id.clone(), tool_call);
+                // 注意：Doom Loop 检测不在逐 chunk 处记录（一次调用的参数拆成多个
+                // chunk 会误判为重复 N 次）；与 ThinkerNode 对齐，跳过逐 chunk 记录。
             }
         }
         Ok(())
@@ -470,13 +504,19 @@ impl Node for SubAgentNode {
                             self.pending_tool_calls.drain().collect();
                         for (tool_call_id, pending) in tool_calls {
                             self.pending_tool_results.insert(tool_call_id.clone());
+                            let arguments = if !pending.arguments_raw.trim().is_empty() {
+                                serde_json::from_str::<serde_json::Value>(&pending.arguments_raw)
+                                    .unwrap_or(pending.arguments.clone())
+                            } else {
+                                pending.arguments.clone()
+                            };
                             let tool_call_msg = FrameCodec::new_message(
                                 Topic::subagent_tool_call(self.id.as_str()),
                                 self.id.as_str(),
                                 &serde_json::json!({
                                     "tool_call_id": tool_call_id,
                                     "tool_name": pending.tool_name,
-                                    "arguments": pending.arguments,
+                                    "arguments": arguments,
                                     "agent_id": self.id.to_string(),
                                 }),
                             )?;

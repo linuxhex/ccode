@@ -103,9 +103,6 @@ anstyle = { workspace = true }
 ccode-tools = { path = "../ccode-tools" }
 ccode-tools-api = { path = "../ccode-tools-api" }
 
-# 进阶模块（编译为 cdylib，运行时加载）
-ccore-advanced = { path = "../ccore-advanced" }
-
 
 # Dashboard HTTP 服务器 + MCP SSE 传输
 axum = { workspace = true }

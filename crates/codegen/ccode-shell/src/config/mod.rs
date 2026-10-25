@@ -10,9 +10,9 @@ pub use ccode_config_types::{
 /// Full configuration for the memory system.
 ///
 /// Parsed from the `[memory]` section of `~/.ccode/config.toml` or
-/// `.ccode/config.toml`. Disabled by default; enabled via
-/// `--experimental-memory` CLI flag or `CCODE_MEMORY=1` env var.
-/// Force-disabled via `CCODE_MEMORY=0` (overrides TOML and remote settings).
+/// `.ccode/config.toml`. Enabled by default (headless and TUI alike);
+/// disable via `[memory] enabled = false`, `CCODE_MEMORY=0`, or `--no-memory`.
+/// `CCODE_MEMORY=0` overrides TOML and remote settings.
 ///
 /// All sub-configs are pre-populated with production-ready defaults so that
 /// later PRs (indexing, search, flush, pruning) can read them without any
@@ -61,7 +61,7 @@ pub struct MemoryConfig {
 impl MemoryConfig {
     /// Resolve the final memory config from all sources (in priority order):
     /// 1. CLI flag `--no-memory` (absolute highest — always disables, overrides all)
-    /// 2. CLI flag `--experimental-memory` (enables, but overridden by --no-memory)
+    /// 2. CLI flag `--experimental-memory` (legacy opt-in; memory is now default-on)
     /// 3. `CCODE_MEMORY` env var: `1`/`true` enables, `0`/`false` force-disables
     /// 4. Config file `[memory]` / `[compaction]` sections
     /// 5. Remote settings from `/v1/settings`
@@ -204,7 +204,9 @@ impl MemoryConfig {
             result.enabled,
             config.get("memory").is_some(),
             remote.and_then(|r| r.memory_enabled),
-            false,
+            // 记忆默认开启：headless 与 TUI 均不再要求 --experimental-memory。
+            // 仍可通过 [memory] enabled=false、CCODE_MEMORY=0 或 --no-memory 关闭。
+            true,
         );
         result.enabled = resolved.value;
         if no_memory {

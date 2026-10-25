@@ -34,8 +34,8 @@ pub struct NotificationBridgeConfig {
     /// Persistence handle for FIFO ordinary writes and durable tombstone barriers.
     pub persistence: PersistenceHandle,
     /// When true, send incremental `output_delta` instead of full `output`
-    /// in bash streaming updates. The client must opt in via the
-    /// `ccode.dev/incrementalBashOutput` capability.
+    /// in bash streaming updates. Defaults to true; a client can opt out via
+    /// the `ccode.dev/incrementalBashOutput` capability set to `false`.
     pub incremental_bash_output: bool,
     /// Plan mode tracker shared with the session actor.
     /// Used to transition state on `PlanModeEntered` / `PlanModeExited`
@@ -182,6 +182,33 @@ async fn handle_scheduled_task_removed(
         }
     }
 }
+/// Forward a terminal bash notification (timeout / spawn failure) to the TUI
+/// as a failed `ToolCallUpdate`, and persist it so session replay keeps it.
+async fn forward_bash_terminal_update(
+    config: &NotificationBridgeConfig,
+    tool_call_id: &str,
+    message: String,
+) {
+    let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+        acp::ToolCallId::new(tool_call_id.to_string()),
+        acp::ToolCallUpdateFields::new()
+            .status(Some(acp::ToolCallStatus::Failed))
+            .content(Some(vec![acp::ToolCallContent::from(
+                acp::ContentBlock::Text(acp::TextContent::new(message)),
+            )])),
+    ));
+    let mut notification = acp::SessionNotification::new(config.session_id.clone(), update);
+    stamp_event_id(config, &mut notification.meta);
+    let _ = config.persistence.tx.send(PersistenceMsg::Update(
+        crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
+    ));
+    if config
+        .gateway_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let _ = config.gateway.session_notification(notification).await;
+    }
+}
 /// Create a `ToolNotificationHandle` and spawn a bridge task that
 /// translates notifications into shell-native systems.
 pub fn spawn_notification_bridge(config: NotificationBridgeConfig) -> ToolNotificationHandle {
@@ -302,15 +329,31 @@ async fn handle_notification(
             tracing::debug!(
                 tool_call_id = %timeout.base.tool_call_id,
                 elapsed = ?timeout.elapsed,
-                "Bash execution timeout notification received"
+                "Bash execution timeout notification received — forwarding to TUI"
             );
+            forward_bash_terminal_update(
+                &config,
+                &timeout.base.tool_call_id,
+                format!(
+                    "Command timed out after {}s: `{}`",
+                    timeout.elapsed.as_secs(),
+                    timeout.base.command
+                ),
+            )
+            .await;
         }
         ToolNotification::BashExecutionFailed(failed) => {
             tracing::warn!(
                 tool_call_id = %failed.tool_call_id,
                 error = %failed.error,
-                "Bash execution failed notification received"
+                "Bash execution failed notification received — forwarding to TUI"
             );
+            forward_bash_terminal_update(
+                &config,
+                &failed.tool_call_id,
+                format!("Command failed: `{}`: {}", failed.command, failed.error),
+            )
+            .await;
         }
         ToolNotification::BashExecutionBackgrounded(bg) => {
             tracing::debug!(

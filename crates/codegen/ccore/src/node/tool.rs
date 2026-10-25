@@ -193,10 +193,19 @@ impl ToolNode {
 
             let result = bridge.execute(&request).await;
 
+            // 注意：必须用 json!（map）而非结构体直传 —— rmp_serde::to_vec 对结构体
+            // 默认按数组（positional）编码，Thinker/子代理按 payload["output"] 取值
+            // 会拿到空串，表现为"工具输出全为空"。
             let tool_result_msg = FrameCodec::new_message(
                 Topic::agent_tool_result(&request.agent_id),
                 node_id.as_str(),
-                &result,
+                &serde_json::json!({
+                    "tool_call_id": result.tool_call_id,
+                    "output": result.output,
+                    "success": result.success,
+                    "duration_ms": result.duration_ms,
+                    "is_partial": result.is_partial,
+                }),
             );
 
             if let Ok(msg) = tool_result_msg {
@@ -223,6 +232,10 @@ impl ToolNode {
         request: ToolCallRequest,
         transport: &NodeTransportHandle,
     ) -> anyhow::Result<()> {
+        let working_dir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
         // ── 只读工具并发快速路径（借鉴 Claude Code 并发策略）──
         // 只读工具不修改状态，可安全并发执行，跳过信号量和内联执行路径。
         // 信号量许可在 spawned 任务内部获取，避免此处浪费许可。
@@ -255,9 +268,7 @@ impl ToolNode {
                 tool_name: request.tool_name.clone(),
                 input: request.arguments.clone(),
                 agent_id: request.agent_id.clone(),
-                working_dir: std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                working_dir: working_dir.clone(),
             };
             match self.hook_dispatcher.pre_tool_use(&ctx).await {
                 HookDecision::Allow => None,
@@ -297,10 +308,7 @@ impl ToolNode {
         // 使用 HookDispatcher 可能改写过的参数作为初始值
         let mut effective_input = hook_dispatcher_input.unwrap_or_else(|| request.arguments.clone());
         if let Some(ref registry) = self.hook_registry {
-            let cwd = std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            let cwd = working_dir.clone();
             let envelope = ccode_hooks::event::HookEventEnvelope {
                 hook_event_name: ccode_hooks::event::HookEventName::PreToolUse,
                 session_id: request.agent_id.clone(),
@@ -583,19 +591,14 @@ impl ToolNode {
                 tool_name: effective_request.tool_name.clone(),
                 input: effective_request.arguments.clone(),
                 agent_id: effective_request.agent_id.clone(),
-                working_dir: std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                working_dir: working_dir.clone(),
             };
             self.hook_dispatcher.post_tool_use(&ctx, &result.output, result.success).await;
         }
 
         // ── 阶段 4：PostToolUse Hook ──
         if let Some(ref registry) = self.hook_registry {
-            let cwd = std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            let cwd = working_dir.clone();
             let payload = if result.success {
                 ccode_hooks::event::HookPayload::PostToolUse {
                     tool_name: effective_request.tool_name.clone(),
@@ -651,10 +654,17 @@ impl ToolNode {
         // 将结果封装为消息，通过控制面发送
         // 注意：topic 含通配符（agent/*/tool_result），数据面 PUB/SUB 直连会过滤掉通配符 topic，
         // 必须走控制面（Kernel ROUTER 路由），否则 Thinker 永远收不到 tool_result
+        // 同上：json!（map）编码，避免 msgpack 数组编码导致 Thinker 取不到 output
         let tool_result_msg = FrameCodec::new_message(
             Topic::agent_tool_result(&effective_request.agent_id),
             self.id.as_str(),
-            &result,
+            &serde_json::json!({
+                "tool_call_id": result.tool_call_id,
+                "output": result.output,
+                "success": result.success,
+                "duration_ms": result.duration_ms,
+                "is_partial": result.is_partial,
+            }),
         )?;
         tracing::info!(
             "ToolNode 发送 tool_result：target_agent={}, tool_call_id={}, success={}, payload_len={}, payload_bytes={:?}",
@@ -708,7 +718,17 @@ impl Node for ToolNode {
                 self.handle_permission_response(response).await?;
             }
             "sys/spawn" => {
-                // 收到 Node 上线广播，广播工具列表给 Agent
+                // 收到 Node 上线广播，广播工具列表给 Agent。
+                // 只对 Thinker/Agent 类型的 spawn 广播：内核启动时会对全部 6 个 Node
+                // 各广播一次 sys/spawn，若每次都全量重发工具注册，
+                // Thinker 会重复收到 N 次相同列表（日志中同一毫秒重复 6 次的现象）。
+                let spawn_type = FrameCodec::decode_payload::<serde_json::Value>(&msg)
+                    .ok()
+                    .and_then(|p| p.get("node_type").and_then(|v| v.as_str()).map(String::from))
+                    .unwrap_or_default();
+                if spawn_type != "thinker" && spawn_type != "agent" {
+                    return Ok(());
+                }
                 let tool_defs: Vec<crate::sampler::provider::ToolDefinition> = self.bridge
                     .tool_definitions()
                     .iter()

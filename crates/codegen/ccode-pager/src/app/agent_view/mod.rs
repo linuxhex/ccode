@@ -841,6 +841,12 @@ pub struct AgentView {
     /// drop log to one `warn!` per incident (a late replay is one line per
     /// event — thousands for a large transcript).
     pub(crate) unexpected_replay_drops: u32,
+    /// Live dedup drops since this session was bound: updates whose
+    /// `eventId` highwater already covered them (re-delivered live
+    /// duplicates). Surfaced in the scrollback so repeated drops are not
+    /// fully silent. Not reset on replay (replay is exempt from the
+    /// highwater, so it can never contribute to this counter).
+    pub(crate) dedup_dropped_updates: u64,
     /// Prompt ids whose durable `TurnCompleted` terminal arrived during THIS
     /// load's replay window (`loading_replay`). The running turn is not adopted
     /// until replay finishes, so a terminal seen mid-replay can't be finalized

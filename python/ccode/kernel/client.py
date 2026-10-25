@@ -1,6 +1,7 @@
 """ZMQ client for ROS-style communication with Rust kernel."""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -17,6 +18,8 @@ from ccode.kernel.protocol import (
     ToolCallPayload,
     ToolResultPayload,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class KernelClient:
@@ -35,24 +38,37 @@ class KernelClient:
         """Connect to the kernel."""
         self._ctx = zmq.asyncio.Context()
 
+        sub_addr = self._derive_sub_addr(self.kernel_addr)
         self._sub = self._ctx.socket(zmq.SUB)
-        self._sub.connect(self.kernel_addr.replace("5555", "5556"))
+        self._sub.connect(sub_addr)
         self._sub.setsockopt_string(zmq.SUBSCRIBE, "")
 
         self._dealer = self._ctx.socket(zmq.DEALER)
         self._dealer.setsockopt_string(zmq.IDENTITY, str(self.node_id))
         self._dealer.connect(self.kernel_addr)
 
-        asyncio.create_task(self._receive_loop())
+        self._receive_task = asyncio.create_task(self._receive_loop())
 
     async def disconnect(self) -> None:
         """Disconnect from the kernel."""
+        if hasattr(self, "_receive_task") and self._receive_task:
+            self._receive_task.cancel()
         if self._sub:
             self._sub.close()
         if self._dealer:
             self._dealer.close()
         if self._ctx:
             self._ctx.term()
+
+    @staticmethod
+    def _derive_sub_addr(addr: str) -> str:
+        """Derive SUB socket address by incrementing the port by 1."""
+        try:
+            base, port_str = addr.rsplit(":", 1)
+            port = int(port_str)
+            return f"{base}:{port + 1}"
+        except (ValueError, TypeError):
+            return addr
 
     async def _receive_loop(self) -> None:
         """Background loop to receive messages."""
@@ -69,8 +85,10 @@ class KernelClient:
                         callback(msg)
             except zmq.Again:
                 continue
+            except asyncio.CancelledError:
+                return
             except Exception:
-                continue
+                logger.exception("kernel receive loop error")
 
     async def publish(self, topic: Topic, payload: dict[str, Any]) -> None:
         """Publish a message to a topic."""

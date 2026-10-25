@@ -1,6 +1,6 @@
 """Tool execution client - Calls Rust kernel, FFI, or Python fallback."""
 
-import subprocess
+import asyncio
 from pathlib import Path
 from typing import Any, Callable
 
@@ -91,20 +91,22 @@ class ToolExecutor:
         timeout = params.get("timeout", 30)
 
         try:
-            result = subprocess.run(
+            proc = await asyncio.create_subprocess_shell(
                 command,
-                shell=True,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout,
             )
             return {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "exit_code": result.returncode,
+                "stdout": stdout.decode(errors="replace"),
+                "stderr": stderr.decode(errors="replace"),
+                "exit_code": proc.returncode or 0,
             }
-        except subprocess.TimeoutExpired:
+        except asyncio.TimeoutError:
+            proc.kill()
             return {"error": "Command timed out", "exit_code": -1}
         except Exception as e:
             return {"error": str(e), "exit_code": -1}

@@ -54,20 +54,47 @@ impl SlidingWindow {
         summarizer: Option<&dyn crate::memory::working::LlmSummarizer>,
     ) -> Vec<WorkingEntry> {
         if let Some(summarizer) = summarizer {
-            let summarize = |msg: &MessageMeta| async {
-                let prompt = if msg.is_correction {
-                    "Summarize preserving the user's corrections. \
-                     Note what was wrong and what the correct information is:"
-                } else {
-                    "Summarize this conversation message in 2-3 sentences, \
-                     preserving key facts and decisions:"
+            let scored = self.score_and_sort(messages);
+            let mut entries = Vec::new();
+            let mut used_tokens = 0u32;
+
+            for (_heat_score, temp, msg) in &scored {
+                let entry = match temp {
+                    Temperature::Hot => WorkingEntry::Hot {
+                        role: MessageRole::try_from(msg.role.as_str()).unwrap_or(MessageRole::User),
+                        content: msg.content.clone(),
+                        token_count: msg.token_count,
+                        tool_name: msg.tool_name.clone(),
+                        created_at: std::time::Instant::now(),
+                    },
+                    Temperature::Warm => {
+                        let prompt = if msg.is_correction {
+                            "Summarize preserving the user's corrections. \
+                             Note what was wrong and what the correct information is:"
+                        } else {
+                            "Summarize this conversation message in 2-3 sentences, \
+                             preserving key facts and decisions:"
+                        };
+                        let summary = match summarizer.summarize(prompt, &msg.content).await {
+                            Ok(s) => s,
+                            Err(_) => fallback_truncate(&msg.content, 200),
+                        };
+                        let token_count = estimate_tokens(&summary);
+                        WorkingEntry::Warm { summary, token_count, source_range: msg.source_range }
+                    }
+                    Temperature::Cold => Self::cold_placeholder(msg.source_range),
                 };
-                match summarizer.summarize(prompt, &msg.content).await {
-                    Ok(s) => s,
-                    Err(_) => fallback_truncate(&msg.content, 200),
+                let entry_tokens = entry.token_count();
+                if used_tokens + entry_tokens <= self.max_tokens {
+                    used_tokens += entry_tokens;
+                    entries.push(entry);
+                } else {
+                    entries.push(Self::cold_placeholder(msg.source_range));
                 }
-            };
-            self.fill_entries_async(messages, summarize).await
+            }
+
+            Self::sort_by_chronology(&mut entries);
+            entries
         } else {
             self.fill_entries(messages, |msg| fallback_truncate(&msg.content, 200))
         }
@@ -79,7 +106,7 @@ impl SlidingWindow {
         messages: &[MessageMeta],
         warm_summary: impl Fn(&MessageMeta) -> String,
     ) -> Vec<WorkingEntry> {
-        let mut scored = self.score_and_sort(messages);
+        let scored = self.score_and_sort(messages);
         let mut entries = Vec::new();
         let mut used_tokens = 0u32;
 
@@ -98,56 +125,10 @@ impl SlidingWindow {
         entries
     }
 
-    /// Async 版本，warm_summary 为 async 闭包
-    async fn fill_entries_async<F, Fut>(
+    fn score_and_sort<'a>(
         &self,
-        messages: &[MessageMeta],
-        warm_summary: F,
-    ) -> Vec<WorkingEntry>
-    where
-        F: Fn(&MessageMeta) -> Fut,
-        Fut: std::future::Future<Output = String>,
-    {
-        let scored = self.score_and_sort(messages);
-        let mut entries = Vec::new();
-        let mut used_tokens = 0u32;
-
-        for (_heat_score, temp, msg) in &scored {
-            let entry = match temp {
-                Temperature::Hot => WorkingEntry::Hot {
-                    role: MessageRole::try_from(msg.role.as_str()).unwrap_or(MessageRole::User),
-                    content: msg.content.clone(),
-                    token_count: msg.token_count,
-                    tool_name: msg.tool_name.clone(),
-                    created_at: std::time::Instant::now(),
-                },
-                Temperature::Warm => {
-                    let summary = warm_summary(msg).await;
-                    WorkingEntry::Warm {
-                        summary,
-                        token_count: estimate_tokens(&summary),
-                        source_range: msg.source_range,
-                    }
-                }
-                Temperature::Cold => Self::cold_placeholder(msg.source_range),
-            };
-            let entry_tokens = entry.token_count();
-            if used_tokens + entry_tokens <= self.max_tokens {
-                used_tokens += entry_tokens;
-                entries.push(entry);
-            } else {
-                entries.push(Self::cold_placeholder(msg.source_range));
-            }
-        }
-
-        Self::sort_by_chronology(&mut entries);
-        entries
-    }
-
-    fn score_and_sort(
-        &self,
-        messages: &[MessageMeta],
-    ) -> Vec<(f64, Temperature, &MessageMeta)> {
+        messages: &'a [MessageMeta],
+    ) -> Vec<(f64, Temperature, &'a MessageMeta)> {
         let mut scored: Vec<(f64, Temperature, &MessageMeta)> = messages
             .iter()
             .map(|msg| {
@@ -184,9 +165,10 @@ impl SlidingWindow {
             },
             Temperature::Warm => {
                 let summary = warm_summary(msg);
+                let token_count = estimate_tokens(&summary);
                 WorkingEntry::Warm {
                     summary,
-                    token_count: estimate_tokens(&summary),
+                    token_count,
                     source_range: msg.source_range,
                 }
             }

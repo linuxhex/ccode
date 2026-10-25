@@ -258,6 +258,22 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
 
                     // Extract Plan updates before passing to tracker (tracker skips them).
                     let mutated = if dedup_drop {
+                        agent.dedup_dropped_updates =
+                            agent.dedup_dropped_updates.saturating_add(1);
+                        // Make repeated drops visible: one scrollback line on
+                        // the first drop, then every 10th, so a duplicate
+                        // burst is noticed without spamming the transcript.
+                        let mut pushed_notice = false;
+                        if agent.dedup_dropped_updates == 1
+                            || agent.dedup_dropped_updates % 10 == 0
+                        {
+                            let message = format!(
+                                "已丢弃 {} 条重复更新（去重）",
+                                agent.dedup_dropped_updates
+                            );
+                            agent.scrollback.push_block(RenderBlock::system(message));
+                            pushed_notice = true;
+                        }
                         tracing::debug!(
                             session_id = notif.request.session_id.0.as_ref(),
                             event_seq = meta.event_seq,
@@ -266,8 +282,9 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                             "load-race: session/update DROPPED by dedup highwater (event_seq <= last_applied)"
                         );
                         // Already-applied event delivered again — drop it (do not
-                        // re-render). Not a mutation, so no redraw.
-                        false
+                        // re-render). The notice line, when pushed, still needs
+                        // a redraw.
+                        pushed_notice
                     } else if let acp::SessionUpdate::Plan(plan) = notif.request.update {
                         let items: Vec<_> = plan
                             .entries

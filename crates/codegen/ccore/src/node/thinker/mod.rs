@@ -122,6 +122,10 @@ pub struct ThinkerNode {
     memory_bridge: Box<dyn MemoryBridge>,
     /// 等待中的工具调用（tool_call_id → PendingToolCall）
     pending_tool_calls: HashMap<String, PendingToolCall>,
+    /// 启动竞态缓冲：tool/register 广播未到达时收到的首批输入。
+    /// Thinker 初始只有合成的 task 工具，若在 tool/register 到达前就发送
+    /// 采样请求，模型会看不到 bash 等工具（表现为"我没有 bash 工具"）。
+    pending_first_input: Option<String>,
     /// 正在执行中的工具调用（tool_call_id → (tool_name, started_at)，等待结果返回）
     pending_tool_results: HashMap<String, (String, std::time::Instant)>,
     /// 当前 LLM 采样请求 ID
@@ -228,7 +232,10 @@ impl ThinkerNode {
             working_memory: WorkingMemory::new(max_tokens),
             short_term_memory: ShortTermMemory::new(),
             orchestrator: Orchestrator::new(10),
-            doom_loop_detector: DoomLoopDetector::new(10, 3),
+            // 阈值 5：重复 3 次的相同调用可能是模型的合法重试验证（尤其成功且
+            // 有输出的命令），阈值过低会把正常行为误判为 doom loop 并禁用工具，
+            // 导致模型拿不到结果就 turn 结束
+            doom_loop_detector: DoomLoopDetector::new(10, 5),
             disabled_tool_next_round: None,
             sliding_window: SlidingWindow::new(max_tokens),
             compaction_config: CompactionConfig::default(),
@@ -236,6 +243,7 @@ impl ThinkerNode {
             memory_bridge: Box::new(memory_bridge::NoopMemoryBridge),
             config,
             pending_tool_calls: HashMap::new(),
+            pending_first_input: None,
             pending_tool_results: HashMap::new(),
             current_sample_request_id: None,
             inference_start: None,
@@ -570,6 +578,18 @@ impl ThinkerNode {
         }
     }
 
+    /// 解析待分发工具调用的最终参数：
+    /// 优先整体解析流式累积的 arguments_raw；失败时回退到 arguments 字段
+    /// （非流式路径直接带完整对象）。
+    fn parse_pending_arguments(pending: &PendingToolCall) -> serde_json::Value {
+        if !pending.arguments_raw.trim().is_empty() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pending.arguments_raw) {
+                return v;
+            }
+        }
+        pending.arguments.clone()
+    }
+
     /// 处理 LLM 流式返回的 chunk
     async fn handle_stream_chunk(
         &mut self,
@@ -605,32 +625,72 @@ impl ThinkerNode {
             }
             StreamChannel::ToolCall => {
                 self.state = AgentState::ToolCalling;
-                let tool_call = if let Some(tc) = &chunk.tool_call {
-                    PendingToolCall {
-                        tool_call_id: tc.tool_call_id.clone(),
-                        tool_name: tc.tool_name.clone(),
-                        arguments: serde_json::from_str(&tc.arguments)
-                            .unwrap_or(serde_json::Value::Null),
+                // input_json_delta 是增量到达的：同一 tool_call_id 会收到多个 chunk，
+                // 每个只含参数 JSON 的一段。必须按 id 累积 arguments_raw，分发时整体
+                // 解析；逐 chunk 覆盖/解析会因部分 JSON 非法得到 Null 参数，
+                // 导致 bash 等工具报"缺少 command 参数"。
+                if let Some(tc) = &chunk.tool_call {
+                    let entry = self
+                        .pending_tool_calls
+                        .entry(tc.tool_call_id.clone())
+                        .or_insert_with(|| PendingToolCall {
+                            tool_call_id: tc.tool_call_id.clone(),
+                            tool_name: tc.tool_name.clone(),
+                            arguments: serde_json::Value::Null,
+                            arguments_raw: String::new(),
+                        });
+                    if !tc.tool_name.is_empty() && entry.tool_name != tc.tool_name {
+                        entry.tool_name = tc.tool_name.clone();
+                    }
+                    entry.arguments_raw.push_str(&tc.arguments);
+                } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&chunk.content) {
+                    let tool_call_id = v["tool_call_id"]
+                        .as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    let entry = self
+                        .pending_tool_calls
+                        .entry(tool_call_id.clone())
+                        .or_insert_with(|| PendingToolCall {
+                            tool_call_id,
+                            tool_name: v["tool_name"]
+                                .as_str()
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            arguments: v["arguments"].clone(),
+                            arguments_raw: String::new(),
+                        });
+                    if let Some(name) = v["tool_name"].as_str() {
+                        if !name.is_empty() && name != "unknown" {
+                            entry.tool_name = name.to_string();
+                        }
+                    }
+                    match v["arguments"].as_str() {
+                        Some(raw) => entry.arguments_raw.push_str(raw),
+                        None => {
+                            if !v["arguments"].is_null() {
+                                entry.arguments = v["arguments"].clone();
+                            }
+                        }
                     }
                 } else {
-                    serde_json::from_str(&chunk.content)
-                        .unwrap_or_else(|_| PendingToolCall {
-                            tool_call_id: uuid::Uuid::new_v4().to_string(),
-                            tool_name: "unknown".into(),
-                            arguments: serde_json::Value::Null,
-                        })
-                };
+                    tracing::warn!(
+                        "Thinker 收到无法解析的 tool_call chunk：content={:?}",
+                        chunk.content
+                    );
+                    return Ok(());
+                }
 
-                tracing::info!(
-                    "Thinker 收到 tool_call chunk：tool_call_id={}, tool_name={}",
-                    tool_call.tool_call_id, tool_call.tool_name
-                );
-
-                let args_hash = Self::hash_tool_args(&tool_call.arguments);
-                self.doom_loop_detector.record(tool_call.tool_name.clone(), args_hash);
-                self.loop_state_machine.record_step("tool_call", &tool_call.tool_name);
-
-                self.pending_tool_calls.insert(tool_call.tool_call_id.clone(), tool_call);
+                if let Some(tc) = &chunk.tool_call {
+                    tracing::info!(
+                        "Thinker 收到 tool_call chunk：tool_call_id={}, tool_name={}",
+                        tc.tool_call_id, tc.tool_name
+                    );
+                    self.loop_state_machine.record_step("tool_call", &tc.tool_name);
+                }
+                // 注意：Doom Loop 检测不在逐 chunk 处记录 —— 一次工具调用的参数会
+                // 拆成多个 input_json_delta chunk，逐 chunk 记录会把单次调用
+                // 误判为"重复 N 次"触发假的 Doom Loop。改为在分派时统一记录。
             }
         }
         Ok(())
@@ -1222,6 +1282,27 @@ impl Node for ThinkerNode {
                 self.inference_start = Some(std::time::Instant::now());
                 tracing::info!("Thinker 开始 agentic session，准备发送采样请求");
 
+                // 用户输入立即写入长期记忆（L2 落盘）。不能只依赖会话结束时的
+                // stop() 提取：kernel 关闭流程在广播 sys/shutdown 后会 abort 所有
+                // Node task，stop() 的提取存在竞态可能不执行（headless 单轮尤甚）。
+                // stop() 侧会跳过 User 条目，避免同一内容重复入库。
+                if !content.trim().is_empty() {
+                    self.memory_bridge
+                        .extract_and_store(&[("User".into(), content.to_string())]);
+                }
+
+                // 启动竞态防护：ToolNode 的 tool/register 广播可能比用户输入晚到。
+                // 若当前只有本地合成的 task 工具（len<=1），暂存输入，
+                // 等 tool/register 处理后再开始首轮采样，避免模型看不到 bash 等工具。
+                if self.config.tools.len() <= 1 {
+                    self.pending_first_input = Some(content.to_string());
+                    tracing::info!(
+                        "Thinker 工具注册尚未到达（当前 {} 个工具），暂存输入等待 tool/register",
+                        self.config.tools.len()
+                    );
+                    return Ok(());
+                }
+
                 // 请求预算和熔断器检查
                 if !self.check_budget_and_circuit(transport).await {
                     tracing::warn!("Thinker 预算或熔断器拒绝，跳过本次 LLM 调用");
@@ -1240,6 +1321,15 @@ impl Node for ThinkerNode {
                 }
                 tracing::info!("Thinker 预算检查通过，构建采样请求");
 
+                // 长期记忆检索必须在首轮采样请求【之前】注入工作记忆：
+                // build_sample_request 从 working_memory 组装 messages，若在发送后才
+                // 注入，[长期记忆] 只会出现在下一轮 —— max-turns=1 的 headless 单轮
+                // 会话将永远看不到检索结果（表现为"新会话不知道长期记忆"）。
+                // 检索是纯内存关键词匹配，开销可忽略，不会阻塞首请求。
+                if !content.is_empty() {
+                    self.listen_enrichment(content);
+                }
+
                 let request = self.build_sample_request();
                 tracing::info!("Thinker 采样请求构建完成，通过控制面发送");
                 let sample_msg = FrameCodec::new_message(
@@ -1249,12 +1339,6 @@ impl Node for ThinkerNode {
                 )?;
                 transport.send_message(&sample_msg).await?;
                 tracing::info!("采样请求通过控制面发送成功");
-
-                // 慢路径：长期记忆搜索 + 意图扩展，结果注入工作记忆供后续轮次使用
-                // 放在 sampler 请求发送之后，不阻塞首次 LLM 请求
-                if !content.is_empty() {
-                    self.listen_enrichment(content);
-                }
             }
 
             // sampler/*/stream — 收到 LLM 流式返回
@@ -1334,7 +1418,7 @@ impl Node for ThinkerNode {
                     let llm_tool_calls: Vec<(String, String, serde_json::Value)> = self
                         .pending_tool_calls
                         .iter()
-                        .map(|(id, tc)| (id.clone(), tc.tool_name.clone(), tc.arguments.clone()))
+                        .map(|(id, tc)| (id.clone(), tc.tool_name.clone(), Self::parse_pending_arguments(tc)))
                         .collect();
                     let llm_action = self.loop_state_machine.transition(LoopEvent::LLMResponse {
                         stop_reason: llm_stop_reason.to_string(),
@@ -1357,6 +1441,17 @@ impl Node for ThinkerNode {
                             tool_calls.len()
                         );
                         for (tool_call_id, pending) in tool_calls {
+                            let arguments = Self::parse_pending_arguments(&pending);
+                            if arguments.is_null() {
+                                tracing::warn!(
+                                    "工具 {} ({}) 的参数解析失败：raw={:?}",
+                                    pending.tool_name, tool_call_id, pending.arguments_raw
+                                );
+                            }
+                            // Doom Loop 检测：每个调用只记录一次（参数完整后）
+                            let args_hash = Self::hash_tool_args(&arguments);
+                            self.doom_loop_detector
+                                .record(pending.tool_name.clone(), args_hash);
                             tracing::info!(
                                 "Thinker 分派工具调用：tool_call_id={}, tool_name={}",
                                 tool_call_id, pending.tool_name
@@ -1375,7 +1470,7 @@ impl Node for ThinkerNode {
                                 &serde_json::json!({
                                     "tool_call_id": tool_call_id,
                                     "tool_name": pending.tool_name,
-                                    "arguments": pending.arguments,
+                                    "arguments": arguments,
                                     "agent_id": self.id.as_str(),
                                 }),
                             )?;
@@ -1659,16 +1754,44 @@ impl Node for ThinkerNode {
 
                 // 检查是否为错误消息
                 if raw_value.get("error").is_some() {
-                    tracing::error!(
-                        "Thinker {} 收到采样错误：{:?}",
-                        self.id,
-                        raw_value.get("error")
-                    );
+                    let error_text = raw_value
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("未知采样错误")
+                        .to_string();
+                    tracing::error!("Thinker {} 收到采样错误：{}", self.id, error_text);
                     self.inference_start = None;
                     AgentMetrics::global().record_error("sampler_error");
                     self.circuit_breaker.record_failure();
                     self.current_sample_request_id = None;
                     self.state = AgentState::Error;
+
+                    // 错误必须上抛，不能只改内部状态：
+                    // 1) output 通道让 headless/TUI 把错误文本呈现给用户
+                    let output_msg = FrameCodec::new_message(
+                        Topic::agent_output(self.id.as_str()),
+                        self.id.as_str(),
+                        &serde_json::json!({
+                            "channel": "error",
+                            "content": error_text,
+                        }),
+                    );
+                    if let Ok(msg) = output_msg {
+                        if let Err(e) = transport.send_message(&msg).await {
+                            tracing::warn!("发送错误 output 失败：{}", e);
+                        }
+                    }
+                    // 2) event 通道置 error 状态，headless 据此打印并退出（非零码）
+                    let error_event = FrameCodec::new_message(
+                        Topic::agent_event(self.id.as_str()),
+                        self.id.as_str(),
+                        &serde_json::json!({ "state": "error", "error": error_text }),
+                    );
+                    if let Ok(msg) = error_event {
+                        if let Err(e) = transport.send_message(&msg).await {
+                            tracing::warn!("发送 error 事件失败：{}", e);
+                        }
+                    }
                     return Ok(());
                 }
 
@@ -2001,6 +2124,32 @@ impl Node for ThinkerNode {
                 let tools: Vec<SamplerToolDefinition> = FrameCodec::decode_payload(&msg)?;
                 self.config.tools = tools;
                 tracing::info!("Thinker {} 收到工具注册，共 {} 个工具", self.id, self.config.tools.len());
+
+                // 启动竞态：tool/register 晚于首批输入到达时，现在才开始首轮采样
+                if let Some(content) = self.pending_first_input.take() {
+                    tracing::info!("Thinker 工具注册就绪，处理暂存的输入并开始 agentic session");
+                    self.agentic_session_active = true;
+                    AgentMetrics::global().record_loop_count(1);
+                    self.inference_start = Some(std::time::Instant::now());
+                    if self.check_budget_and_circuit(transport).await {
+                        // 同首轮路径：长期记忆注入必须在采样请求之前，
+                        // 否则 max-turns=1 的 headless 会话看不到检索结果。
+                        if !content.is_empty() {
+                            self.listen_enrichment(&content);
+                        }
+                        let request = self.build_sample_request();
+                        let sample_msg = FrameCodec::new_message(
+                            Topic::sampler_request(),
+                            self.id.as_str(),
+                            &request,
+                        )?;
+                        transport.send_message(&sample_msg).await?;
+                        tracing::info!("采样请求通过控制面发送成功（tool/register 触发）");
+                    } else {
+                        self.agentic_session_active = false;
+                        self.state = AgentState::Idle;
+                    }
+                }
             }
 
             // sys/shutdown — 收到系统 shutdown 信号
@@ -2271,6 +2420,8 @@ impl Node for ThinkerNode {
 
     async fn stop(&mut self) -> anyhow::Result<()> {
         // 会话结束时提取关键知识并持久化（热区→冷区）
+        // 注意：User 条目已在输入到达时即时入库（见 agentic session 启动路径），
+        // 这里跳过以避免同一内容重复编码。
         let messages: Vec<(String, String)> = self.working_memory.entries().iter().map(|e| {
             match e {
                 crate::memory::working::WorkingEntry::Hot { role, content, .. } => {
@@ -2283,7 +2434,9 @@ impl Node for ThinkerNode {
                     ("cold".into(), placeholder.clone())
                 }
             }
-        }).collect();
+        })
+        .filter(|(role, _)| role != "User")
+        .collect();
         if !messages.is_empty() {
             self.memory_bridge.extract_and_store(&messages);
             tracing::info!("会话结束：已提取 {} 条消息到长期记忆", messages.len());
@@ -2334,6 +2487,7 @@ mod tests {
             tool_call_id: "tc-1".into(),
             tool_name: "Bash".into(),
             arguments: serde_json::json!({}),
+            arguments_raw: String::new(),
         });
 
         assert_eq!(thinker.pending_tool_calls.len(), 1);
@@ -2356,11 +2510,13 @@ mod tests {
             tool_call_id: "tc-1".into(),
             tool_name: "read_file".into(),
             arguments: serde_json::json!({"path": "src/main.rs"}),
+            arguments_raw: String::new(),
         });
         thinker.pending_tool_calls.insert("tc-2".into(), PendingToolCall {
             tool_call_id: "tc-2".into(),
             tool_name: "grep".into(),
             arguments: serde_json::json!({"pattern": "fn main"}),
+            arguments_raw: String::new(),
         });
 
         // 收集取消前的工具信息（与 cancel handler 逻辑一致）

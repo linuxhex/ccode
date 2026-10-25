@@ -23,6 +23,17 @@
 //! - cdylib：供 ccode-cli 通过 FFI 调用
 //! - rlib：供其他 Rust crate 直接依赖
 
+/// 进程级致命错误标记（headless 退出码用）
+///
+/// TUI Node 在 headless 模式收到 `state=error` 事件时置位，
+/// ccode-cli main 据此以非零码退出（否则错误会被静默吞掉、退出码恒为 0）。
+pub static FATAL_ERROR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 是否发生过致命错误（headless 主循环据此决定退出码）
+pub fn has_fatal_error() -> bool {
+    FATAL_ERROR.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub mod kernel;
 pub mod node;
 pub mod message;

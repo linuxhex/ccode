@@ -3277,7 +3277,6 @@ dependencies = [
  "ccode-textarea",
  "ccode-tools",
  "ccode-tools-api",
- "ccore-advanced",
  "chrono",
  "crossbeam-queue",
  "crossterm",
@@ -3311,34 +3310,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "ccore-advanced"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "crossbeam-queue",
- "futures",
- "metrics",
- "metrics-exporter-prometheus",
- "notify 6.1.1",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "urlencoding",
-]
-
-[[package]]
 name = "ccore-python"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ccore",
  "pyo3",
  "serde_json",
  "tokio",

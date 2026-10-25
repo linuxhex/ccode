@@ -5,15 +5,12 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyAny};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
-/// 执行工具
-///
-/// # Arguments
-/// * `tool_id` - 工具标识符
-/// * `params` - 工具参数（Python dict）
-///
-/// # Returns
-/// 工具执行结果（Python dict）
+static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Runtime::new().expect("failed to create shared Tokio runtime")
+});
+
 #[pyfunction]
 fn execute_tool(py: Python<'_>, tool_id: &str, params: &Bound<'_, PyDict>) -> PyResult<PyObject> {
     let mut rust_params: HashMap<String, serde_json::Value> = HashMap::new();
@@ -24,11 +21,7 @@ fn execute_tool(py: Python<'_>, tool_id: &str, params: &Bound<'_, PyDict>) -> Py
         rust_params.insert(key_str, value_json);
     }
 
-    let rt = tokio::runtime::Runtime::new()?;
-
-    let result = rt.block_on(async {
-        execute_tool_async(tool_id, rust_params).await
-    });
+    let result = RUNTIME.block_on(execute_tool_async(tool_id, rust_params));
 
     match result {
         Ok(res) => json_to_python(py, &res),
@@ -40,43 +33,6 @@ fn execute_tool(py: Python<'_>, tool_id: &str, params: &Bound<'_, PyDict>) -> Py
     }
 }
 
-/// 读取文件
-#[pyfunction]
-fn read_file(path: &str) -> PyResult<String> {
-    Ok(std::fs::read_to_string(path)?)
-}
-
-/// 写入文件
-#[pyfunction]
-fn write_file(path: &str, content: &str) -> PyResult<()> {
-    Ok(std::fs::write(path, content)?)
-}
-
-/// 列出目录
-#[pyfunction]
-fn list_dir(py: Python<'_>, path: &str) -> PyResult<PyObject> {
-    let entries = std::fs::read_dir(path)?;
-
-    let result = PyDict::new_bound(py);
-    let mut entry_list = Vec::new();
-
-    for entry in entries.flatten() {
-        let entry_dict = PyDict::new_bound(py);
-        let name = entry.file_name().to_string_lossy().to_string();
-        let metadata = entry.metadata().ok();
-
-        entry_dict.set_item("name", name).ok();
-        entry_dict.set_item("is_dir", metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false)).ok();
-        entry_dict.set_item("size", metadata.as_ref().map(|m| m.len()).unwrap_or(0)).ok();
-
-        entry_list.push(entry_dict);
-    }
-
-    result.set_item("entries", entry_list)?;
-    Ok(result.into())
-}
-
-/// 异步执行工具（内部实现）
 async fn execute_tool_async(
     tool_id: &str,
     params: HashMap<String, serde_json::Value>,
@@ -157,7 +113,6 @@ async fn execute_tool_async(
     }
 }
 
-/// Python 值转 JSON
 fn python_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     if value.is_none() {
         Ok(serde_json::Value::Null)
@@ -182,7 +137,6 @@ fn python_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     }
 }
 
-/// JSON 转 Python 值
 fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     use pyo3::conversion::ToPyObject;
     match value {
@@ -215,12 +169,8 @@ fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObjec
     }
 }
 
-/// Python 模块定义
 #[pymodule]
 fn ccore_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(execute_tool, m)?)?;
-    m.add_function(wrap_pyfunction!(read_file, m)?)?;
-    m.add_function(wrap_pyfunction!(write_file, m)?)?;
-    m.add_function(wrap_pyfunction!(list_dir, m)?)?;
     Ok(())
 }

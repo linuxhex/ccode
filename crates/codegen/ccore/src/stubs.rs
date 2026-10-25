@@ -113,6 +113,17 @@ pub mod meta_cognitive {
         Extreme,
     }
 
+    impl DifficultyLevel {
+        pub fn to_reasoning_effort(&self) -> Option<f64> {
+            match self {
+                Self::Trivial => Some(0.2),
+                Self::Moderate => Some(0.5),
+                Self::Complex => Some(0.8),
+                Self::Extreme => Some(1.0),
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub enum ExecutionStrategy {
         Direct,
@@ -449,26 +460,21 @@ pub mod performance {
             pub fn available(&self) -> usize { 0 }
         }
 
-        pub struct BufferGuard<'a> {
-            buf: &'a mut Vec<u8>,
+        pub struct BufferGuard {
+            buf: Vec<u8>,
         }
 
-        impl<'a> BufferGuard<'a> {
-            pub fn new(_pool: &'a MessagePool) -> Self {
-                // 使用 leaked 静态缓冲区避免生命周期问题
-                static mut STUB_BUF: Vec<u8> = Vec::new();
-                Self {
-                    // SAFETY: STUB_BUF is only accessed through this single BufferGuard instance
-                    buf: unsafe { &mut *(&raw mut STUB_BUF) },
-                }
+        impl BufferGuard {
+            pub fn new(_pool: &MessagePool) -> Self {
+                Self { buf: Vec::new() }
             }
 
-            pub fn as_mut(&mut self) -> &mut Vec<u8> {
-                self.buf
+            pub fn inner_mut(&mut self) -> &mut Vec<u8> {
+                &mut self.buf
             }
 
-            pub fn as_ref(&self) -> &Vec<u8> {
-                self.buf
+            pub fn inner(&self) -> &Vec<u8> {
+                &self.buf
             }
         }
     }

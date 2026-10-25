@@ -1109,6 +1109,25 @@ impl Node for TUINode {
                             });
                         }
                     }
+                    // Headless 模式：致命错误（如认证失败）——打印到 stderr、
+                    // 置进程级错误标记（main 据此非零码退出）并立即关闭，
+                    // 不允许静默吞掉错误干等（假死）。
+                    if state == "error" && self.terminal.is_none() {
+                        let error_text = payload["error"].as_str().unwrap_or("未知错误");
+                        eprintln!("ccode: 错误：{}", error_text);
+                        crate::FATAL_ERROR.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::info!("Headless 模式：Agent 报错，发送关闭信号");
+                        if let Ok(shutdown_msg) = FrameCodec::new_message(
+                            Topic::sys_shutdown(),
+                            self.id.as_str(),
+                            &serde_json::json!({}),
+                        ) {
+                            let handle = _transport.clone();
+                            tokio::spawn(async move {
+                                let _ = handle.send_message(&shutdown_msg).await;
+                            });
+                        }
+                    }
                 }
                 if let Some(input_tokens) = payload["input_tokens"].as_u64() {
                     self.total_input_tokens += input_tokens as usize;
